@@ -191,7 +191,7 @@ function renderStatus(box, s) {
     </div>
     <div class="hint">
       <span class="hint-icon" aria-hidden="true">↻</span>
-      <div><strong>New scan?</strong> Run a full scan in Auctionator, then type <code>/reload</code> or log out – WoW then writes the data to disk and the tool updates itself within a few seconds.
+      <div><strong>New scan?</strong> At the Auction House, scan with Auctionator (prices) and click <em>Full Scan</em> on the AH Tool strip or type <code>/ahtl scan</code> (all listings and sales; once per 15 min). Then type <code>/reload</code> or log out – WoW then writes the data to disk and the tool updates itself within a few seconds.
       ${warn.length ? `<div class="hint-warn">⚠ ${warn.map(esc).join(' · ')}</div>` : ''}</div>
     </div>`;
 }

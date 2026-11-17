@@ -17,9 +17,16 @@ Double-click `start.bat` (or run `python run.py`). Your browser opens http://loc
 The first start downloads item and recipe data and may take a few minutes.
 
 ## Getting new data
-1. Run a full scan in Auctionator in game.
-2. Type `/reload` (or log out). WoW only writes the file to disk then.
+1. At the Auction House, scan:
+   - **Auctionator** (its *Full Scan* or a normal Auctionator scan) – updates prices and price history.
+   - **AH Tool Logger** – click *Full Scan* on the strip under the AH window, or type `/ahtl scan`. Stores every
+     auction for Market Activity, listings, real cost and sales estimates. The server allows one full scan every
+     15 minutes; the button counts down. An Auctionator *Full Scan* is also picked up by the logger.
+2. Type `/reload` (or log out). WoW only writes the files to disk then. The logger keeps the last 3 scans, so
+   `/reload` at least every third scan.
 3. The tool detects the change within ~5 seconds and the page refreshes itself.
+
+In-game commands: `/ahtl` shows the logger status, `/ahtl scan` starts a full scan (Auction House must be open).
 
 ## Pages
 - **Overview** – status, best deals now, most profitable crafts.
