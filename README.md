@@ -5,8 +5,21 @@ Reads your Auctionator scans, keeps the price history forever (SQLite) and shows
 Built for the Forever realm (Classic Era based) with Auctionator, but should work with Classic Era Auctionator data in
 general.
 
+## Requirements
+
+| What | Needed? | Used for |
+|---|---|---|
+| Python 3.12+ (Windows) | **Required** | Runs the app – standard library only, no `pip install` |
+| [Auctionator](https://www.curseforge.com/wow/addons/auctionator) addon | **Required** | All prices and price history come from Auctionator's scans (`SavedVariables/Auctionator.lua`) |
+| [AtlasLootClassic](https://www.curseforge.com/wow/addons/atlaslootclassic) addon | **Required for Professions, Leveling Guide and Shopping List** | Recipe data (`AtlasLootClassic/Data/Profession.lua`). Without it the price pages still work |
+| AH Tool Logger addon (in this repo, `addon/AHToolLogger`) | Optional | Full scans of every auction: Market Activity, My Sales, listings, real cost, sales estimates |
+| Polestar_ItemDB addon | Optional | Better item tooltips for custom Forever items |
+| Internet on first start | Required once | Downloads item and spell names from wago.tools; tooltips load icons from wow.zamimg.com |
+
+Note: this is for **Auctionator**, not Auctioneer – Auctioneer data is not read.
+
 ## Setup
-1. Install Python 3.12 or newer – no extra packages are needed.
+1. Install Python 3.12 or newer and the addons above in WoW, and log in once with Auctionator enabled.
 2. Copy `config.example.json` to `config.json` and set:
    - `savedvariables` – your `...\WTF\Account\<ACCOUNT>\SavedVariables\Auctionator.lua`
    - `addons_dir` – your `...\Interface\AddOns` folder (recipes are read from AtlasLootClassic there).
