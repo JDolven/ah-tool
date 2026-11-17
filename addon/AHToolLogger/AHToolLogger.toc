@@ -5,5 +5,7 @@
 ## Author: AH Tool
 ## SavedVariables: AHToolLoggerDB
 ## OptionalDeps: Auctionator
+## X-License: AGPL-3.0-or-later
+## X-Website: https://github.com/JDolven/ah-tool
 
 AHToolLogger.lua

@@ -109,3 +109,9 @@ newer scan while it still had time left is counted as *sold*. If it could have r
 shorter than the gap) it counts as *expired*, and if the same seller posted that item again it counts as *relisted*.
 Cancelled auctions look like sales, so the numbers are estimates – several scans a day give the best results.
 Raw auctions are kept for the newest `logger_keep_raw_scans` (6) scans; per-item summaries and sales are kept forever.
+
+## License
+AH Tool (the app and the AH Tool Logger addon) is free software under the
+[GNU Affero General Public License v3.0](LICENSE). You may use, change and share it, but any copy or modified
+version you distribute – or run as a service for others over a network – must also be released under the AGPL-3.0
+with its source code.
