@@ -1,0 +1,16 @@
+# local settings and data
+config.json
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.pyc
+
+# editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

@@ -1,0 +1,111 @@
+# AH Tool
+
+Reads your Auctionator scans, keeps the price history forever (SQLite) and shows everything in your browser.
+
+Built for the Forever realm (Classic Era based) with Auctionator, but should work with Classic Era Auctionator data in
+general.
+
+## Setup
+1. Install Python 3.12 or newer – no extra packages are needed.
+2. Copy `config.example.json` to `config.json` and set:
+   - `savedvariables` – your `...\WTF\Account\<ACCOUNT>\SavedVariables\Auctionator.lua`
+   - `addons_dir` – your `...\Interface\AddOns` folder (recipes are read from AtlasLootClassic there).
+3. Optional: copy `addon/AHToolLogger` into `Interface/AddOns` for full scans and sales estimates (see below).
+
+## Start
+Double-click `start.bat` (or run `python run.py`). Your browser opens http://localhost:8642/.
+The first start downloads item and recipe data and may take a few minutes.
+
+## Getting new data
+1. Run a full scan in Auctionator in game.
+2. Type `/reload` (or log out). WoW only writes the file to disk then.
+3. The tool detects the change within ~5 seconds and the page refreshes itself.
+
+## Pages
+- **Overview** – status, best deals now, most profitable crafts.
+- **Deals** – items below market price (median of the last 14 days), under vendor price, and cheap reagents.
+- **Professions** – all recipes per profession with cost, sell value, profit (after the 5% AH cut) and margin.
+- **Item** – price chart, history, recipes, your own auctions.
+- **Statistics** – the market broken down by quality/class, biggest movers.
+- **My auctions** – what you have posted, compared with the current price.
+
+## Item tooltips
+Hover any item name to see an in-game style tooltip (stats, effects, sell price, icon) plus the AH price, market
+price, discount and recipe info. Stats come from the Classic Era client tables (wago.tools), with Forever changes from
+`Polestar_ItemDB` (`Forever.lua` wins) and the game's hotfix cache. Custom Forever items without data show a short
+tooltip. Icons are loaded from wow.zamimg.com.
+
+## Files
+- `config.json` – your local settings (not in git; start from `config.example.json`): path to `Auctionator.lua`, port, deal threshold (`deal_threshold`), AH cut.
+- `data/ah.db` – all history. Back this up if you want to keep your data.
+- `python -m ahtool.ingest --force` – re-import manually. `--rebuild-static` re-fetches item names/recipes.
+
+## Limitations
+- Auctionator stores one lowest price per item per scan and daily min/max – not every individual auction.
+- Some custom Forever items/recipes have no name and show up as "Item #id" / "Spell #id".
+- Vendor reagents (vials, thread, etc.) are priced from what you have actually paid at vendors (Auctionator's cache).
+
+## v2: My professions, shopping list, watchlist and alerts
+
+- **My professions** (`#/my`): choose professions and skill. A recipe is "craftable" if its profession is yours and
+  (you marked it known, or it has no override and its min skill <= your skill). Known/unknown overrides per recipe.
+  `/api/mycrafts` lists craftable recipes by profit; deals are flagged `for_my_crafts`.
+- **Shopping list** (`#/shopping`): add recipes with quantities; reagents are aggregated (AH vs vendor) with totals.
+  `auctionator_import` is a string for Auctionator (Shopping -> Import -> paste), e.g.
+  `AH Tool^"Linen Cloth";;0;0;0;0;0;0;0;0.0023;;;;20`. Items whose names contain `"` or `^`, or that have no name, are
+  listed in `unexportable`. Max price = max(AH price, baseline) x (1 + `shopping_max_markup`).
+- **Watchlist and alerts** (`#/watchlist`): watch items with a max price (or any deal when no max price is set).
+  After every Auctionator import (file watcher and `POST /api/ingest`) alerts are evaluated: an alert fires when the
+  condition becomes true, when the price drops below the last alerted price, or after 24 h; it resets when the
+  condition turns false. Optional rules: vendor flips (`notify_vendor_flip_min`) and deals on reagents for your
+  crafts (`notify_my_reagents`). One Windows toast per ingest (PowerShell/WinRT; disable with `notify_windows`).
+  `POST /api/notify/test` sends a test toast; `POST /api/alerts/evaluate` forces an evaluation.
+- User data lives in the same SQLite DB (new tables are created automatically; existing data is kept).
+
+## Outlier handling and confidence (v4)
+
+Auctionator stores only one minimum price per scan, so a thin market (one item listed at an absurd price) can
+distort a day. The AH Tool cleans this before computing anything:
+
+- **Daily outliers**: each day is compared to the median of the other days within +-7 days (Hampel filter, needs 5+
+  points). A day is dropped when it is far outside the usual spread (3.5 x scaled MAD), differs by more than 50 %,
+  and also differs by more than 50 % from both neighbouring days (so real level shifts are kept). Dropped days are
+  excluded from baseline, averages, min/max, trends and profit history; the item chart shows them as hollow red points.
+- **Thin current price**: with <= 2 listed, the current price is `thin_high` when it is above 2x baseline (treated as
+  the baseline for crafting cost and sell value) or `thin_low` when it is below 0.5x baseline (a valid deal, but flagged).
+  Crafted output is also never valued above 1.25x its baseline.
+- **Confidence** (`high`/`medium`/`low`): high needs 7+ days of data, an average of 5+ listed over 14 days and
+  volatility < 0.5; low means < 3 days, an average of < 2 listed, or a thin_high price. A recipe's confidence is the
+  worst of its reagents and its product. Low-confidence `below_baseline` deals are hidden unless `?include_low=1`.
+- Thresholds live in `config.json` (`outlier_mad_k`, `outlier_min_rel`, `thin_qty`, `thin_high_factor`,
+  `conf_min_days`, `conf_min_avg_qty`, `trend_min_profit`).
+
+## AH Tool Logger addon (v5): full scans, real market depth and estimated sales
+
+Auctionator only stores the lowest price and the max quantity per day. The small addon in `addon/AHToolLogger`
+records the raw data instead:
+
+- **Every full scan** – Auctionator's *Full Scan* button is picked up automatically, or type `/ahtl scan` at the
+  Auction House (the server allows one full scan every 15 minutes). Each auction is stored with stack size, buyout,
+  bid, time left and seller. `/ahtl` shows what is stored.
+- **Your own auctions** – whenever the Auctions tab is opened.
+- **AH mail** – sold, bought, expired and cancelled auctions, when the mailbox is opened.
+
+Install: copy `addon/AHToolLogger` into `Interface/AddOns` and enable it on the
+character screen. Data reaches the app on `/reload` or logout, same as Auctionator (`SavedVariables/AHToolLogger.lua`).
+
+What the app does with it:
+
+- **Item page → Live market:** all listings, market-depth chart, "cost to buy N" (buys whole stacks from the cheapest
+  up), estimated sold per day, average sold price and sell-through.
+- **Market Activity:** best-selling items, days of supply, the biggest sellers on the AH and the list of full scans.
+- **My Sales:** your active auctions (undercut / lowest / sold), earnings after the AH cut, purchases, sell-through and
+  the full AH mail log.
+- **Shopping List:** a "Real cost" column that walks the listings of the latest full scan (only when it is less than
+  `logger_max_age_h` = 24 hours old) and warns when not enough is listed.
+
+**How sales are estimated:** two full scans less than 48 hours apart are compared. An auction that is gone in the
+newer scan while it still had time left is counted as *sold*. If it could have run out (its time-left category is
+shorter than the gap) it counts as *expired*, and if the same seller posted that item again it counts as *relisted*.
+Cancelled auctions look like sales, so the numbers are estimates – several scans a day give the best results.
+Raw auctions are kept for the newest `logger_keep_raw_scans` (6) scans; per-item summaries and sales are kept forever.

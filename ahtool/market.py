@@ -1,0 +1,645 @@
+"""AH Tool Logger data: full scans, market depth, estimated sales, own auctions and AH mail.
+
+The in-game addon (addon/AHToolLogger) writes AHToolLoggerDB to SavedVariables/AHToolLogger.lua:
+  scans = [{t, realm, faction, char, src, total, n, d="itemId,suffix,count,buyout,minBid,bid,timeLeft,owner;..."}]
+  owned = {"realm-char": {t, realm, faction, char, d="...,saleStatus;..."}}
+  mail  = {key: {t, type=sold|bought|expired|cancelled, item, itemId?, player, price, buyout, deposit, fee, count, char}}
+
+Sales are estimated by diffing consecutive full scans: an auction that is gone in the next scan while it still had
+time left was most likely bought (or cancelled). Auctions that could have run out are counted as expired, and auctions
+whose seller posted the same item again are counted as relisted.
+"""
+import datetime
+import os
+import threading
+import time
+from collections import Counter, defaultdict
+
+from . import luaparse
+
+# Max remaining seconds for GetAuctionItemTimeLeft categories (1 short, 2 medium, 3 long, 4 very long).
+# Legacy AH: long = 2-8h. Modern AH (C_AuctionHouse, used by the Forever client): long = 2-12h. Very long is capped by
+# the longest posting duration (24h on Forever).
+TIME_LEFT_MAX = {1: 30 * 60, 2: 2 * 3600, 3: 12 * 3600, 4: 24 * 3600}
+TIME_LEFT_TEXT = {1: "< 30m", 2: "30m - 2h", 3: "2h - 12h", 4: "12h - 24h"}
+MAX_DIFF_GAP = 48 * 3600
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS ah_scans(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, realm TEXT, faction TEXT,
+    char TEXT, source TEXT, total INTEGER, n INTEGER, partial INTEGER NOT NULL DEFAULT 0,
+    raw_kept INTEGER NOT NULL DEFAULT 1, diffed INTEGER NOT NULL DEFAULT 0, UNIQUE(realm, faction, ts));
+CREATE TABLE IF NOT EXISTS ah_auctions(scan_id INTEGER, item_id INTEGER, suffix INTEGER, count INTEGER,
+    buyout INTEGER, min_bid INTEGER, bid INTEGER, time_left INTEGER, owner TEXT);
+CREATE INDEX IF NOT EXISTS idx_ah_auctions ON ah_auctions(scan_id, item_id);
+CREATE TABLE IF NOT EXISTS ah_scan_items(scan_id INTEGER, item_id INTEGER, auctions INTEGER, qty INTEGER,
+    min_unit INTEGER, median_unit INTEGER, sellers INTEGER, PRIMARY KEY(scan_id, item_id));
+CREATE INDEX IF NOT EXISTS idx_ah_scan_items_item ON ah_scan_items(item_id, scan_id);
+CREATE TABLE IF NOT EXISTS ah_sales(scan_id INTEGER, prev_scan_id INTEGER, ts INTEGER, item_id INTEGER,
+    suffix INTEGER, count INTEGER, unit_price INTEGER, owner TEXT, kind TEXT);
+CREATE INDEX IF NOT EXISTS idx_ah_sales_item ON ah_sales(item_id, ts);
+CREATE INDEX IF NOT EXISTS idx_ah_sales_ts ON ah_sales(ts);
+CREATE TABLE IF NOT EXISTS my_mail(key TEXT PRIMARY KEY, ts INTEGER, kind TEXT, item_name TEXT, item_id INTEGER,
+    count INTEGER, price INTEGER, buyout INTEGER, deposit INTEGER, fee INTEGER, player TEXT, char TEXT, realm TEXT);
+CREATE INDEX IF NOT EXISTS idx_my_mail_ts ON my_mail(ts);
+CREATE TABLE IF NOT EXISTS my_auctions(char_key TEXT, ts INTEGER, char TEXT, realm TEXT, item_id INTEGER,
+    suffix INTEGER, count INTEGER, buyout INTEGER, min_bid INTEGER, bid INTEGER, time_left INTEGER,
+    sale_status INTEGER);
+"""
+
+_lock = threading.Lock()
+
+
+def ensure_schema(conn):
+    conn.executescript(SCHEMA)
+
+
+def logger_path(cfg):
+    p = cfg.get("logger_savedvariables")
+    if p:
+        return p
+    sv = cfg.get("savedvariables") or ""
+    return os.path.join(os.path.dirname(sv), "AHToolLogger.lua") if sv else ""
+
+
+def addon_installed(cfg):
+    ad = cfg.get("addons_dir") or ""
+    return bool(ad) and os.path.isfile(os.path.join(ad, "AHToolLogger", "AHToolLogger.toc"))
+
+
+def _cfg(cfg, key, default):
+    try:
+        v = (cfg or {}).get(key, default)
+        return type(default)(v) if v is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _s(v):
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8", "replace")
+    return "" if v is None else str(v)
+
+
+def _i(v, default=0):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return default
+
+
+def _seq(v):
+    if isinstance(v, list):
+        return v
+    if isinstance(v, dict):
+        return [v[k] for k in sorted(v, key=lambda k: (not isinstance(k, int), k if isinstance(k, int) else 0))]
+    return []
+
+
+def parse_rows(d, with_status=False):
+    """Compact scan string -> [(item_id, suffix, count, buyout, min_bid, bid, time_left, owner[, sale_status])]."""
+    out = []
+    for row in _s(d).split(";"):
+        if not row:
+            continue
+        mult = 1
+        star = row.find("*")
+        if 0 < star < row.find(","):
+            try:
+                mult = int(row[:star])
+            except ValueError:
+                continue
+            row = row[star + 1:]
+        f = row.split(",")
+        if len(f) < 8:
+            continue
+        try:
+            r = (int(f[0]), int(f[1]), int(f[2]), int(f[3]), int(f[4]), int(f[5]), int(f[6]), f[7])
+        except ValueError:
+            continue
+        if r[0] <= 0 or r[2] <= 0:
+            continue
+        if with_status:
+            r = r + (_i(f[8]) if len(f) > 8 else 0,)
+        out.extend([r] * mult)
+    return out
+
+
+# ---------------------------------------------------------------- sales estimation
+
+def diff_scans(prev_rows, cur_rows, gap):
+    """-> [(item_id, suffix, count, unit_price, owner, kind)] for auctions present in prev but gone in cur.
+
+    kind: sold (gone while it still had time left), expired (could have run out), relisted (seller posted the same
+    item again, i.e. probably cancelled + reposted).
+    """
+    def full(r):
+        return (r[0], r[1], r[2], r[3], r[4], r[7])
+
+    def loose(r):
+        return (r[0], r[1], r[2], r[3], r[4])
+
+    cur_full = Counter(full(r) for r in cur_rows)
+    cur_loose = Counter(loose(r) for r in cur_rows)
+    cur_blank = Counter(loose(r) for r in cur_rows if not r[7])
+
+    groups = defaultdict(list)
+    for r in prev_rows:
+        groups[full(r)].append(r)
+    gone = []
+    for k, rows in groups.items():
+        m = min(len(rows), cur_full.get(k, 0))
+        if m:
+            cur_full[k] -= m
+            cur_loose[k[:5]] -= m
+        if len(rows) > m:
+            rows.sort(key=lambda r: r[6])  # the ones closest to expiring are the ones that disappeared
+            gone.extend(rows[:len(rows) - m])
+
+    # pass 2: owner name missing in one of the scans
+    really_gone = []
+    for r in gone:
+        lk = loose(r)
+        if not r[7] and cur_loose.get(lk, 0) > 0:
+            cur_loose[lk] -= 1
+            continue
+        if r[7] and cur_blank.get(lk, 0) > 0 and cur_loose.get(lk, 0) > 0:
+            cur_blank[lk] -= 1
+            cur_loose[lk] -= 1
+            continue
+        really_gone.append(r)
+
+    # new auctions per (item, owner) in cur -> relist detection
+    prev_full = Counter(full(r) for r in prev_rows)
+    new_by_owner = Counter()
+    for k, n in Counter(full(r) for r in cur_rows).items():
+        extra = n - prev_full.get(k, 0)
+        if extra > 0 and k[5]:
+            new_by_owner[(k[0], k[5])] += extra
+
+    out = []
+    for r in really_gone:
+        iid, suffix, count, buyout, min_bid, bid, tl, owner = r[:8]
+        could_expire = gap >= TIME_LEFT_MAX.get(tl, 24 * 3600)
+        if owner and new_by_owner.get((iid, owner), 0) > 0:
+            new_by_owner[(iid, owner)] -= 1
+            kind = "relisted"
+        elif bid > 0:
+            kind = "sold"
+        elif could_expire or buyout <= 0:
+            kind = "expired"
+        else:
+            kind = "sold"
+        if kind == "sold" and (could_expire or buyout <= 0) and bid > 0:
+            price = bid
+        else:
+            price = buyout if buyout > 0 else bid
+        unit = int(round(price / count)) if price > 0 else 0
+        out.append((iid, suffix, count, unit, owner, kind))
+    return out
+
+
+# ---------------------------------------------------------------- ingest
+
+def _scan_item_rows(scan_id, rows):
+    per = defaultdict(list)
+    for r in rows:
+        per[r[0]].append(r)
+    out = []
+    for iid, rs in per.items():
+        units = [r[3] / r[2] for r in rs if r[3] > 0]
+        qty = sum(r[2] for r in rs)
+        min_u = int(min(units)) if units else None
+        # quantity-weighted median of the unit buyout
+        med = None
+        if units:
+            pairs = sorted((r[3] / r[2], r[2]) for r in rs if r[3] > 0)
+            half, acc = sum(q for _, q in pairs) / 2.0, 0
+            for u, q in pairs:
+                acc += q
+                if acc >= half:
+                    med = int(round(u))
+                    break
+        out.append((scan_id, iid, len(rs), qty, min_u, med, len({r[7] for r in rs if r[7]})))
+    return out
+
+
+def _load_rows(conn, scan_id):
+    return [tuple(r) for r in conn.execute(
+        "SELECT item_id, suffix, count, buyout, min_bid, bid, time_left, owner FROM ah_auctions WHERE scan_id=?",
+        (scan_id,))]
+
+
+def _diff_pending(conn):
+    """Diff every not-yet-diffed scan against the previous complete scan of the same realm/faction."""
+    n_sales = 0
+    todo = conn.execute("SELECT id, ts, realm, faction FROM ah_scans WHERE diffed=0 AND partial=0 AND raw_kept=1 "
+                        "ORDER BY ts").fetchall()
+    for sid, ts, realm, faction in todo:
+        prev = conn.execute("SELECT id, ts FROM ah_scans WHERE realm=? AND faction=? AND ts<? AND partial=0 "
+                            "ORDER BY ts DESC LIMIT 1", (realm, faction, ts)).fetchone()
+        conn.execute("UPDATE ah_scans SET diffed=1 WHERE id=?", (sid,))
+        if not prev or ts - prev[1] > MAX_DIFF_GAP:
+            continue
+        prev_rows = _load_rows(conn, prev[0])
+        if not prev_rows:
+            continue
+        sales = diff_scans(prev_rows, _load_rows(conn, sid), ts - prev[1])
+        conn.executemany("INSERT INTO ah_sales VALUES(?,?,?,?,?,?,?,?,?)",
+                         [(sid, prev[0], ts) + s for s in sales])
+        n_sales += sum(1 for s in sales if s[5] == "sold")
+    return n_sales
+
+
+def _name_map(conn):
+    m = {}
+    for iid, name in conn.execute("SELECT id, name FROM items WHERE name IS NOT NULL ORDER BY id DESC"):
+        m[name.lower()] = iid
+    return m
+
+
+def ingest(conn, cfg, force=False):
+    """AHToolLogger.lua -> SQLite. Returns a summary dict ({"skipped": True} when unchanged)."""
+    path = logger_path(cfg)
+    if not path or not os.path.isfile(path):
+        return {"skipped": True, "missing": True}
+    mtime = int(os.stat(path).st_mtime)
+    with _lock:
+        ensure_schema(conn)
+        r = conn.execute("SELECT value FROM meta WHERE key='logger_mtime'").fetchone()
+        if not force and r and r[0] == str(mtime):
+            return {"skipped": True}
+        data = luaparse.parse_file(path).get("AHToolLoggerDB") or {}
+        if not isinstance(data, dict):
+            data = {}
+        keep_raw = max(2, _cfg(cfg, "logger_keep_raw_scans", 6))
+        new_scans = new_mail = 0
+        cur = conn.cursor()
+        try:
+            cur.execute("BEGIN IMMEDIATE")
+            for s in sorted((x for x in _seq(data.get("scans")) if isinstance(x, dict)), key=lambda x: _i(x.get("t"))):
+                ts, realm, faction = _i(s.get("t")), _s(s.get("realm")), _s(s.get("faction"))
+                if not ts or cur.execute("SELECT 1 FROM ah_scans WHERE realm=? AND faction=? AND ts=?",
+                                         (realm, faction, ts)).fetchone():
+                    continue
+                rows = parse_rows(s.get("d"))
+                # GetReplicateItemTimeLeft may return 0-based bands; normalise to 1..4
+                if rows and min(r[6] for r in rows) == 0 and max(r[6] for r in rows) <= 3:
+                    rows = [r[:6] + (r[6] + 1,) + r[7:] for r in rows]
+                prev = cur.execute("SELECT n FROM ah_scans WHERE realm=? AND faction=? AND partial=0 AND ts<? "
+                                   "ORDER BY ts DESC LIMIT 1", (realm, faction, ts)).fetchone()
+                partial = 1 if (prev and prev[0] and len(rows) < 0.6 * prev[0]) or not rows else 0
+                cur.execute("INSERT INTO ah_scans(ts,realm,faction,char,source,total,n,partial) VALUES(?,?,?,?,?,?,?,?)",
+                            (ts, realm, faction, _s(s.get("char")), _s(s.get("src")), _i(s.get("total")),
+                             len(rows), partial))
+                sid = cur.lastrowid
+                cur.executemany("INSERT INTO ah_auctions VALUES(?,?,?,?,?,?,?,?,?)", [(sid,) + r for r in rows])
+                cur.executemany("INSERT INTO ah_scan_items VALUES(?,?,?,?,?,?,?)", _scan_item_rows(sid, rows))
+                new_scans += 1
+            sold = _diff_pending(conn)
+            # keep raw auctions only for the newest scans per realm/faction
+            for realm, faction in cur.execute("SELECT DISTINCT realm, faction FROM ah_scans").fetchall():
+                old = [x[0] for x in cur.execute(
+                    "SELECT id FROM ah_scans WHERE realm=? AND faction=? AND raw_kept=1 ORDER BY ts DESC LIMIT -1 "
+                    "OFFSET ?", (realm, faction, keep_raw)).fetchall()]
+                for sid in old:
+                    cur.execute("DELETE FROM ah_auctions WHERE scan_id=?", (sid,))
+                    cur.execute("UPDATE ah_scans SET raw_kept=0, diffed=1 WHERE id=?", (sid,))
+
+            names = None
+            mail = data.get("mail")
+            for key, m in (mail.items() if isinstance(mail, dict) else []):
+                if not isinstance(m, dict):
+                    continue
+                if cur.execute("SELECT 1 FROM my_mail WHERE key=?", (str(key),)).fetchone():
+                    continue
+                item = _s(m.get("item"))
+                iid = _i(m.get("itemId"), None)
+                if not iid and item:
+                    if names is None:
+                        names = _name_map(conn)
+                    iid = names.get(item.lower())
+                cur.execute("INSERT INTO my_mail VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (str(key), _i(m.get("t")), _s(m.get("type")), item, iid, _i(m.get("count"), 1),
+                             _i(m.get("price")), _i(m.get("buyout")), _i(m.get("deposit")), _i(m.get("fee")),
+                             _s(m.get("player")), _s(m.get("char")), _s(m.get("realm"))))
+                new_mail += 1
+
+            owned = data.get("owned")
+            n_owned = 0
+            for key, o in (owned.items() if isinstance(owned, dict) else []):
+                if not isinstance(o, dict):
+                    continue
+                ts = _i(o.get("t"))
+                old = cur.execute("SELECT MAX(ts) FROM my_auctions WHERE char_key=?", (str(key),)).fetchone()[0]
+                if old is not None and old >= ts:
+                    continue
+                cur.execute("DELETE FROM my_auctions WHERE char_key=?", (str(key),))
+                rows = parse_rows(o.get("d"), with_status=True)
+                cur.executemany("INSERT INTO my_auctions VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                                [(str(key), ts, _s(o.get("char")), _s(o.get("realm")), r[0], r[1], r[2], r[3], r[4],
+                                  r[5], r[6], r[8]) for r in rows])
+                n_owned += len(rows)
+            cur.execute("INSERT OR REPLACE INTO meta VALUES('logger_mtime', ?)", (str(mtime),))
+            cur.execute("INSERT OR REPLACE INTO meta VALUES('logger_ingest_ts', ?)", (str(int(time.time())),))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return {"skipped": False, "scans": new_scans, "sold": sold, "mail": new_mail, "owned": n_owned}
+
+
+# ---------------------------------------------------------------- queries
+
+def _realm_filter(conn, realm):
+    """Logger realm names come from GetRealmName(); fall back to all scans when they don't match Auctionator's key."""
+    if realm and conn.execute("SELECT 1 FROM ah_scans WHERE realm=? LIMIT 1", (realm,)).fetchone():
+        return realm
+    return None
+
+
+def latest_scan(conn, realm=None):
+    ensure_schema(conn)
+    realm = _realm_filter(conn, realm)
+    q = "SELECT * FROM ah_scans WHERE partial=0 AND raw_kept=1"
+    args = ()
+    if realm:
+        q += " AND realm=?"
+        args = (realm,)
+    r = conn.execute(q + " ORDER BY ts DESC LIMIT 1", args).fetchone()
+    return dict(r) if r else None
+
+
+def _scan_info(scan):
+    if not scan:
+        return None
+    return {"id": scan["id"], "ts": scan["ts"], "age_s": int(time.time()) - scan["ts"], "auctions": scan["n"],
+            "realm": scan["realm"], "faction": scan["faction"], "char": scan["char"]}
+
+
+def buy_cost(stacks, qty):
+    """stacks: [(unit, count)] with buyout. Buys whole stacks from the cheapest up until qty is covered."""
+    need = max(0, int(qty))
+    total = bought = 0
+    max_unit = None
+    for unit, count in sorted(stacks):
+        if bought >= need:
+            break
+        total += unit * count
+        bought += count
+        max_unit = unit
+    return {"qty": need, "bought": bought, "total": int(round(total)),
+            "avg_unit": round(total / bought, 1) if bought else None,
+            "max_unit": round(max_unit, 1) if max_unit is not None else None,
+            "short": max(0, need - bought), "extra": max(0, bought - need)}
+
+
+def _stacks(conn, scan_id, item_id):
+    return [(b / c, c) for b, c in conn.execute(
+        "SELECT buyout, count FROM ah_auctions WHERE scan_id=? AND item_id=? AND buyout>0", (scan_id, item_id))]
+
+
+def cost_for(conn, cfg, needs, realm=None):
+    """{item_id: qty} -> {item_id: buy_cost} from the latest full scan (only when it is fresh enough)."""
+    scan = latest_scan(conn, realm)
+    if not scan:
+        return None, {}
+    if time.time() - scan["ts"] > _cfg(cfg, "logger_max_age_h", 24.0) * 3600:
+        return _scan_info(scan), {}
+    return _scan_info(scan), {iid: buy_cost(_stacks(conn, scan["id"], iid), q) for iid, q in needs.items()}
+
+
+def _day(ts):
+    return datetime.date.fromtimestamp(ts).isoformat()
+
+
+def _since(days):
+    return int(time.time()) - int(days) * 86400
+
+
+def _scan_coverage(conn, realm, since):
+    q = "SELECT COUNT(*), MIN(ts), MAX(ts) FROM ah_scans WHERE partial=0 AND ts>=?"
+    args = [since]
+    if realm:
+        q += " AND realm=?"
+        args.append(realm)
+    n, a, b = conn.execute(q, args).fetchone()
+    pairs = conn.execute("SELECT COUNT(DISTINCT scan_id) FROM ah_sales WHERE ts>=?", (since,)).fetchone()[0]
+    days = len({_day(t) for (t,) in conn.execute("SELECT DISTINCT ts FROM ah_sales WHERE ts>=?", (since,))})
+    return {"scans": n or 0, "scan_pairs": pairs or 0, "days_observed": days, "first_ts": a, "last_ts": b}
+
+
+def item_market(conn, cfg, item_id, qty=None, days=14, realm=None):
+    ensure_schema(conn)
+    realm = _realm_filter(conn, realm)
+    scan = latest_scan(conn, realm)
+    out = {"item_id": item_id, "scan": _scan_info(scan), "installed": addon_installed(cfg),
+           "listings": [], "summary": None, "depth": [], "cost": None}
+    if scan:
+        rows = conn.execute("SELECT count, buyout, min_bid, bid, time_left, owner, suffix FROM ah_auctions "
+                            "WHERE scan_id=? AND item_id=?", (scan["id"], item_id)).fetchall()
+        grouped = Counter()
+        for c, b, mb, bid, tl, owner, suf in rows:
+            grouped[(round(b / c, 2) if b > 0 else None, c, b, owner, tl, bid > 0)] += 1
+        listings = [{"unit": k[0], "count": k[1], "buyout": k[2], "owner": k[3] or None, "time_left": k[4],
+                     "time_left_text": TIME_LEFT_TEXT.get(k[4]), "has_bid": k[5], "auctions": n}
+                    for k, n in grouped.items()]
+        listings.sort(key=lambda x: (x["unit"] is None, x["unit"] or 0, x["count"]))
+        out["listings"] = listings
+        stacks = [(b / c, c) for c, b, *_ in rows if b > 0]
+        qty_all = sum(r[0] for r in rows)
+        units = sorted(stacks)
+        cum, depth = 0, []
+        for u, c in units:
+            cum += c
+            if depth and abs(depth[-1]["unit"] - u) < 1e-9:
+                depth[-1]["cum_qty"] = cum
+            else:
+                depth.append({"unit": round(u, 2), "cum_qty": cum})
+        out["depth"] = depth
+        if rows:
+            si = conn.execute("SELECT median_unit FROM ah_scan_items WHERE scan_id=? AND item_id=?",
+                              (scan["id"], item_id)).fetchone()
+            out["summary"] = {"auctions": len(rows), "qty": qty_all,
+                              "sellers": len({r[5] for r in rows if r[5]}),
+                              "min_unit": round(units[0][0], 2) if units else None,
+                              "median_unit": si[0] if si else None,
+                              "value": int(sum(u * c for u, c in stacks))}
+        if qty:
+            out["cost"] = buy_cost(stacks, qty)
+    out["sales"] = item_sales(conn, item_id, days, realm)
+    hist = conn.execute(
+        "SELECT s.ts, i.qty, i.min_unit, i.median_unit, i.auctions, i.sellers FROM ah_scan_items i "
+        "JOIN ah_scans s ON s.id=i.scan_id WHERE i.item_id=? AND s.partial=0 AND s.ts>=? "
+        + ("AND s.realm=? " if realm else "") + "ORDER BY s.ts",
+        (item_id, _since(days)) + ((realm,) if realm else ())).fetchall()
+    out["supply"] = [{"ts": r[0], "qty": r[1], "min_unit": r[2], "median_unit": r[3], "auctions": r[4],
+                      "sellers": r[5]} for r in hist]
+    return out
+
+
+def item_sales(conn, item_id, days=14, realm=None):
+    since = _since(days)
+    per = defaultdict(lambda: {"sold": 0, "expired": 0, "relisted": 0, "value": 0})
+    for ts, count, unit, kind in conn.execute(
+            "SELECT ts, count, unit_price, kind FROM ah_sales WHERE item_id=? AND ts>=? ORDER BY ts",
+            (item_id, since)):
+        d = per[_day(ts)]
+        d[kind] = d.get(kind, 0) + count
+        if kind == "sold":
+            d["value"] += unit * count
+    series = []
+    for day in sorted(per):
+        d = per[day]
+        series.append({"date": day, "sold": d["sold"], "expired": d["expired"], "relisted": d["relisted"],
+                       "value": d["value"], "avg_unit": round(d["value"] / d["sold"], 1) if d["sold"] else None})
+    cov = _scan_coverage(conn, realm, since)
+    sold = sum(d["sold"] for d in series)
+    expired = sum(d["expired"] for d in series)
+    value = sum(d["value"] for d in series)
+    return {"days": days, "series": series, "coverage": cov,
+            "totals": {"sold": sold, "expired": expired, "value": value,
+                       "avg_unit": round(value / sold, 1) if sold else None,
+                       "per_day": round(sold / cov["days_observed"], 1) if cov["days_observed"] else None,
+                       "sell_through": round(sold / (sold + expired), 3) if sold + expired else None}}
+
+
+def activity(conn, cfg, days=7, limit=100, realm=None):
+    """Market-wide: best selling items, sellers in the latest scan, scan coverage."""
+    ensure_schema(conn)
+    realm = _realm_filter(conn, realm)
+    since = _since(days)
+    cov = _scan_coverage(conn, realm, since)
+    dobs = max(1, cov["days_observed"])
+    rows = conn.execute(
+        "SELECT a.item_id, SUM(CASE WHEN kind='sold' THEN count ELSE 0 END) AS sold, "
+        "SUM(CASE WHEN kind='sold' THEN count*unit_price ELSE 0 END) AS value, "
+        "SUM(CASE WHEN kind='expired' THEN count ELSE 0 END) AS expired, "
+        "COUNT(DISTINCT CASE WHEN kind='sold' THEN owner END) AS sellers, i.name, i.quality "
+        "FROM ah_sales a LEFT JOIN items i ON i.id=a.item_id WHERE a.ts>=? GROUP BY a.item_id "
+        "HAVING sold>0 ORDER BY value DESC LIMIT ?", (since, int(limit))).fetchall()
+    scan = latest_scan(conn, realm)
+    supply = {}
+    if scan:
+        supply = {r[0]: (r[1], r[2]) for r in conn.execute(
+            "SELECT item_id, qty, min_unit FROM ah_scan_items WHERE scan_id=?", (scan["id"],))}
+    items = []
+    for r in rows:
+        sold, exp = r["sold"], r["expired"]
+        sup = supply.get(r["item_id"])
+        items.append({"item_id": r["item_id"], "name": r["name"], "quality": r["quality"] if r["quality"] is not None else 1,
+                      "sold": sold, "value": r["value"], "avg_unit": round(r["value"] / sold, 1) if sold else None,
+                      "per_day": round(sold / dobs, 1), "expired": exp,
+                      "sell_through": round(sold / (sold + exp), 3) if sold + exp else None,
+                      "sellers": r["sellers"], "listed_now": sup[0] if sup else 0,
+                      "min_unit_now": sup[1] if sup else None,
+                      "days_of_supply": round(sup[0] / (sold / dobs), 1) if sup and sold else None})
+    sellers = []
+    if scan:
+        for r in conn.execute(
+                "SELECT owner, COUNT(*) AS auctions, COUNT(DISTINCT item_id) AS items, SUM(buyout) AS value "
+                "FROM ah_auctions WHERE scan_id=? AND owner<>'' GROUP BY owner ORDER BY value DESC LIMIT 50",
+                (scan["id"],)):
+            sellers.append({"owner": r[0], "auctions": r[1], "items": r[2], "value": r[3] or 0})
+    totals = conn.execute("SELECT SUM(CASE WHEN kind='sold' THEN count*unit_price ELSE 0 END), "
+                          "SUM(CASE WHEN kind='sold' THEN 1 ELSE 0 END), SUM(CASE WHEN kind='expired' THEN 1 ELSE 0 END), "
+                          "SUM(CASE WHEN kind='relisted' THEN 1 ELSE 0 END) FROM ah_sales WHERE ts>=?",
+                          (since,)).fetchone()
+    scans = [{"ts": r[0], "auctions": r[1], "partial": bool(r[2]), "char": r[3], "source": r[4]}
+             for r in conn.execute("SELECT ts, n, partial, char, source FROM ah_scans ORDER BY ts DESC LIMIT 30")]
+    return {"days": days, "coverage": cov, "scan": _scan_info(scan), "installed": addon_installed(cfg),
+            "totals": {"value": totals[0] or 0, "sold_auctions": totals[1] or 0, "expired_auctions": totals[2] or 0,
+                       "relisted_auctions": totals[3] or 0},
+            "items": items, "sellers": sellers, "scans": scans}
+
+
+def my_market(conn, cfg, days=30, realm=None):
+    """Own AH mail (sales, purchases, expired) + own auctions vs the latest scan."""
+    ensure_schema(conn)
+    since = _since(days)
+    cut = _cfg(cfg, "ah_cut", 0.05)
+    mail = conn.execute("SELECT m.*, i.quality FROM my_mail m LEFT JOIN items i ON i.id=m.item_id "
+                        "WHERE m.ts>=? ORDER BY m.ts DESC", (since,)).fetchall()
+    per = {}
+    tot = {"sold_value": 0, "sold_net": 0, "fees": 0, "bought_value": 0, "sold": 0, "bought": 0, "expired": 0,
+           "cancelled": 0}
+    log = []
+    for m in mail:
+        kind = m["kind"]
+        key = m["item_id"] or m["item_name"]
+        e = per.setdefault(key, {"item_id": m["item_id"], "name": m["item_name"], "quality": m["quality"] or 1,
+                                 "sold": 0, "sold_value": 0, "sold_net": 0, "bought": 0, "bought_value": 0,
+                                 "expired": 0, "cancelled": 0, "last_ts": m["ts"]})
+        cnt = m["count"] or 1
+        if kind == "sold":
+            net = m["price"] - m["fee"]
+            e["sold"] += cnt
+            e["sold_value"] += m["price"]
+            e["sold_net"] += net
+            tot["sold_value"] += m["price"]
+            tot["sold_net"] += net
+            tot["fees"] += m["fee"]
+            tot["sold"] += 1
+        elif kind == "bought":
+            e["bought"] += cnt
+            e["bought_value"] += m["price"]
+            tot["bought_value"] += m["price"]
+            tot["bought"] += 1
+        elif kind in ("expired", "cancelled"):
+            e[kind] += cnt
+            tot[kind] += 1
+        log.append({"ts": m["ts"], "kind": kind, "item_id": m["item_id"], "name": m["item_name"],
+                    "quality": m["quality"] or 1, "count": cnt, "price": m["price"],
+                    "unit": round(m["price"] / cnt, 1) if m["price"] else None,
+                    "fee": m["fee"], "player": m["player"] or None, "char": m["char"]})
+    items = []
+    for e in per.values():
+        posted = e["sold"] + e["expired"] + e["cancelled"]
+        e["sell_through"] = round(e["sold"] / posted, 3) if posted else None
+        e["avg_sold_unit"] = round(e["sold_value"] / e["sold"], 1) if e["sold"] else None
+        items.append(e)
+    items.sort(key=lambda e: -e["sold_net"])
+
+    scan = latest_scan(conn, realm)
+    mine = conn.execute("SELECT a.*, i.name, i.quality FROM my_auctions a LEFT JOIN items i ON i.id=a.item_id "
+                        "ORDER BY i.name").fetchall()
+    my_names = {r["char"] for r in mine if r["char"]}
+    auctions = []
+    for a in mine:
+        unit = a["buyout"] / a["count"] if a["buyout"] > 0 and a["count"] else None
+        lowest = None
+        cheaper = 0
+        if scan:
+            q = ("SELECT buyout, count, owner FROM ah_auctions WHERE scan_id=? AND item_id=? AND buyout>0")
+            others = [(b / c, c) for b, c, o in conn.execute(q, (scan["id"], a["item_id"]))
+                      if not (o and o.split("-")[0] in my_names)]
+            if others:
+                lowest = min(u for u, _ in others)
+                if unit is not None:
+                    cheaper = sum(c for u, c in others if u < unit - 1e-9)
+        status = None
+        if a["sale_status"] == 1:
+            status = "sold"
+        elif unit is not None and lowest is not None:
+            status = "undercut" if lowest < unit - 1e-9 else "lowest"
+        auctions.append({"item_id": a["item_id"], "name": a["name"], "quality": a["quality"] or 1,
+                         "char": a["char"], "count": a["count"], "buyout": a["buyout"],
+                         "unit": round(unit, 1) if unit is not None else None, "bid": a["bid"],
+                         "time_left": a["time_left"], "time_left_text": TIME_LEFT_TEXT.get(a["time_left"]),
+                         "lowest_other": round(lowest, 1) if lowest is not None else None,
+                         "cheaper_qty": cheaper, "status": status, "ts": a["ts"],
+                         "net_if_sold": int(a["buyout"] * (1 - cut)) if a["buyout"] else None})
+    owned_ts = max((a["ts"] for a in auctions), default=None)
+    return {"days": days, "installed": addon_installed(cfg), "totals": tot, "items": items, "log": log[:500],
+            "auctions": auctions, "auctions_ts": owned_ts, "scan": _scan_info(scan)}
+
+
+def logger_status(conn, cfg):
+    ensure_schema(conn)
+    n, last = conn.execute("SELECT COUNT(*), MAX(ts) FROM ah_scans WHERE partial=0").fetchone()
+    nm = conn.execute("SELECT COUNT(*) FROM my_mail").fetchone()[0]
+    path = logger_path(cfg)
+    return {"installed": addon_installed(cfg), "file_exists": bool(path) and os.path.isfile(path),
+            "scans": n or 0, "last_scan_ts": last, "mail_records": nm}

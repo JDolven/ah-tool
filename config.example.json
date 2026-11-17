@@ -1,0 +1,16 @@
+{
+  "savedvariables": "C:\\Path\\To\\World of Warcraft\\_forever_\\WTF\\Account\\YOURACCOUNT\\SavedVariables\\Auctionator.lua",
+  "addons_dir": "C:\\Path\\To\\World of Warcraft\\_forever_\\Interface\\AddOns",
+  "wago_build": "1.15.8.63829",
+  "port": 8642,
+  "ah_cut": 0.05,
+  "deal_threshold": 0.25,
+  "baseline_days": 14,
+  "outlier_mad_k": 3.5,
+  "outlier_min_rel": 0.5,
+  "thin_qty": 2,
+  "thin_high_factor": 2.0,
+  "conf_min_days": 7,
+  "conf_min_avg_qty": 5,
+  "trend_min_profit": 1000
+}
