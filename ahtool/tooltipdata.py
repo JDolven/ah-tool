@@ -21,7 +21,7 @@ import sys
 
 csv.field_size_limit(10 ** 8)
 
-VERSION = "4"
+VERSION = "5"
 ICON_URL = "https://wow.zamimg.com/images/wow/icons/medium/%s.jpg"
 FALLBACK_ICON = "inv_misc_questionmark"
 
@@ -648,6 +648,7 @@ def build(conn, cfg, download):
     rows = []
     stat = {"items": 0, "csv": 0, "items_lua": 0, "forever": 0, "hotfix": 0, "with_icon": 0, "with_effects": 0}
     quality_updates = []
+    new_items = []
     for iid in all_ids:
         b = base.get(iid)
         if b is None:
@@ -706,16 +707,27 @@ def build(conn, cfg, download):
         stat["items"] += 1
         rows.append((iid, icon_name, json.dumps(data, ensure_ascii=False, separators=(",", ":"))))
         nd = names_db.get(iid)
+        # Hotfix name/sell price is what the Forever server sends, so it wins over the wago CSV in list views too.
+        sell = h["sell"] if h and "sell" in h else None
+        name = data.get("name") if (h and h.get("name")) or not (nd and nd[0]) else None
         if nd and (fv or h) and (nd[1] != data["quality"] or nd[2] != data["item_level"] or
-                                 (not nd[0] and data.get("name"))):
-            quality_updates.append((data["quality"], data["item_level"], data.get("name"), iid))
+                                 (name and name != nd[0]) or (sell is not None and sell != nd[6])):
+            quality_updates.append((data["quality"], data["item_level"], name, sell, iid))
+        elif not nd and (h or fv) and data.get("name"):
+            new_items.append((iid, data["name"], data["quality"], data["item_level"], b.get("class"),
+                              b.get("subclass"), b.get("icon"), sell))
     conn.execute("DELETE FROM item_tooltip")
     conn.executemany("INSERT INTO item_tooltip(id, icon, data) VALUES(?,?,?)", rows)
-    # Keep the list views consistent with the tooltip: Forever/hotfix quality, item level and missing names.
-    conn.executemany("UPDATE items SET quality=?, item_level=?, name=COALESCE(name, ?) WHERE id=?", quality_updates)
+    # Keep the list views consistent with the tooltip: Forever/hotfix quality, item level, name and vendor sell price.
+    conn.executemany("UPDATE items SET quality=?, item_level=?, name=COALESCE(?, name), "
+                     "vendor_sell=COALESCE(?, vendor_sell) WHERE id=?", quality_updates)
+    # Items known only from the hotfix cache / Forever.lua get an items row so lists show their name.
+    conn.executemany("INSERT OR IGNORE INTO items(id, name, quality, item_level, class_id, subclass_id, icon, "
+                     "vendor_sell) VALUES(?,?,?,?,?,?,?,?)", new_items)
     conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('tooltip_version', ?)", (VERSION,))
     conn.commit()
     stat["items_table_updates"] = len(quality_updates)
+    stat["items_table_inserts"] = len(new_items)
     log("tooltips:", stat)
     return stat
 
