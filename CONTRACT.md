@@ -346,3 +346,19 @@ Auctionator only gives one min price per scan + daily max quantity, so outliers 
   `/api/shopping` reagents gain `listing` (buy_cost or null), totals gain `listing_cost`, `listing_short_items`, plus `listing_scan`, `listing_scan_fresh`.
 - Config: `logger_savedvariables` (default: next to Auctionator.lua), `logger_keep_raw_scans` 6, `logger_max_age_h` 24.
 - UI: item page "Live market" (web/js/market.js), `#/market` Market Activity, `#/sales` My Sales, shopping "Real cost".
+
+---
+# v6: Daily Market Report (`ahtool/report.py`, `#/report`)
+- `report.daily(conn, cfg, date=None, realm=None)`: window = 24 h ending at the last full scan of `date` (local ISO date;
+  default the latest scan), "the day before" = the 24 h before that. Unknown date -> ValueError (API: 404).
+- `GET /api/market/report?date=YYYY-MM-DD` -> `{installed, dates:[iso desc], date, realm, faction,
+   window:{start,end,scans,prev_scans,first_ts,covered_s,prev_covered_s} | null (no scans),
+   listings:[{ts,auctions}], peak/low/latest:{ts,auctions}, gone:{auctions,of,pct,from_ts,to_ts,sold,expired,relisted}|null,
+   totals:{gold_day,gold_observed,units_day,units_observed,sold_auctions,items_sold,gold_change,sell_through},
+   top_gold/top_units:[{item_id,name,quality,icon_url,sold,value,sold_day,value_day,avg_unit}],
+   most_listed:[{item_id,...,qty,auctions,sellers,min_unit}], price_source:"scans"|"auctionator", price_items, cheaper, pricier,
+   up/down:[{item_id,...,pct,before,now}], groups:[{key,label,items,pct,cheaper,pricier}],
+   swing:{item_id,...,ratio,low,low_ts,high,high_ts}|null, deal:{item_id,...,price,baseline,discount}|null, generated_ts}`
+- Sales come from scan pairs ending in the window, scaled to 24 h by the seconds those pairs cover. Prices: median of the
+  per-scan median unit buyout per window (Auctionator daily price when the day before has no scans). Busy item = 10+
+  listed in both periods; +-0.5 % = no change; a group needs 3+ busy items.

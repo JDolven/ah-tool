@@ -15,6 +15,7 @@ import * as watchlist from './js/pages/watchlist.js';
 import * as leveling from './js/pages/leveling.js';
 import * as activity from './js/pages/activity.js';
 import * as sales from './js/pages/sales.js';
+import * as report from './js/pages/report.js';
 import { toast, installGlobalActions, alertKindBadge, closePopover } from './js/ui.js';
 import * as browserNotify from './js/notify.js';
 
@@ -32,6 +33,7 @@ const ROUTES = [
   { re: /^\/watchlist\/?$/, nav: 'watchlist', title: 'Watchlist & Alerts', fn: watchlist.render },
   { re: /^\/item\/(\d+)\/?$/, nav: null, title: 'Item', fn: item.render },
   { re: /^\/market\/?$/, nav: 'market', title: 'Market Activity', fn: activity.render },
+  { re: /^\/report\/?$/, nav: 'report', title: 'Market Report', fn: report.render },
   { re: /^\/sales\/?$/, nav: 'sales', title: 'My Sales', fn: sales.render },
   { re: /^\/stats\/?$/, nav: 'stats', title: 'Statistics', fn: stats.render },
   { re: /^\/postings\/?$/, nav: 'postings', title: 'My auctions', fn: postings.render },

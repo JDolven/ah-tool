@@ -1310,6 +1310,7 @@ export function mockApi(method, fullPath, body) {
   if ((m = p.match(/^\/api\/item\/(\d+)\/market$/))) return mockItemMarket(Number(m[1]));
   if (p === '/api/market/activity') return mockActivity(Number(q.get('days')) || 7);
   if (p === '/api/market/my') return mockMy(Number(q.get('days')) || 30);
+  if (p === '/api/market/report') return mockReport(q.get('date') || '');
   if (p === '/api/trending-crafts') return trendingCrafts(Number(q.get('limit')) || 20, q.get('mine') === '1', q.get('include_low') === '1');
   if ((m = p.match(/^\/api\/leveling\/(\d+)$/))) {
     q.set('_prof', m[1]);
@@ -1382,4 +1383,75 @@ function mockMy(days) {
   const items = ids.map((id) => ({ item_id: id, name: name(id), quality: 1, sold: 20, sold_value: cp(id) * 20, sold_net: cp(id) * 19, bought: 0, bought_value: 0, expired: 5, cancelled: 0, sell_through: 0.8, avg_sold_unit: cp(id) }));
   const sum = (k) => items.reduce((a, b) => a + b[k], 0);
   return { days, installed: true, totals: { sold_value: sum('sold_value'), sold_net: sum('sold_net'), fees: sum('sold_value') - sum('sold_net'), bought_value: 0, sold: 6, bought: 2, expired: 4, cancelled: 0 }, items, log, auctions, auctions_ts: NOW_S() - 3600, scan: MOCK_SCAN() };
+}
+
+// Daily market report: 20 hourly-ish scans over the last 24 hours, movers from the mock price history.
+function mockReport(date) {
+  const day = (ts) => new Date(ts * 1000).toISOString().slice(0, 10);
+  const end0 = NOW_S() - 1800;
+  const dates = [0, 1, 2, 3].map((d) => day(end0 - d * 86400));
+  const back = Math.max(0, dates.indexOf(date));
+  const end = end0 - back * 86400;
+  const start = end - 86400;
+  const r = rng(77 + back);
+  const listings = Array.from({ length: 20 }, (_, i) => {
+    const ts = start + 3600 + Math.round(i * (86400 - 3600) / 19);
+    const h = new Date(ts * 1000).getHours();
+    const wave = Math.sin(((h - 9) / 24) * Math.PI * 2);
+    return { ts, auctions: Math.round(21000 + wave * 2600 + (r() - 0.5) * 700) };
+  });
+  const peak = listings.reduce((a, b) => (b.auctions > a.auctions ? b : a));
+  const low = listings.reduce((a, b) => (b.auctions < a.auctions ? b : a));
+  const latest = listings[listings.length - 1];
+  const info = (id) => {
+    const it = ITEMS.get(id);
+    const icon = MOCK_ICONS[id];
+    return { name: it ? it.name : null, quality: it ? it.quality : 1, icon_url: icon ? `https://wow.zamimg.com/images/wow/icons/medium/${icon}.jpg` : null };
+  };
+  const ids = [...CURRENT.keys()];
+  const sold = ids.map((id, i) => {
+    const units = Math.round(20 + r() * 900 / (1 + i % 9));
+    const unit = CURRENT.get(id).price;
+    return { item_id: id, ...info(id), sold: units, value: units * unit, sold_day: Math.round(units * 1.2), value_day: Math.round(units * unit * 1.2), avg_unit: unit };
+  });
+  const top_gold = [...sold].sort((a, b) => b.value - a.value).slice(0, 5);
+  const top_units = [...sold].sort((a, b) => b.sold - a.sold).slice(0, 5);
+  const changes = ids.map((id) => {
+    const h = DAILY.get(id) || [];
+    const a = h[h.length - 2];
+    const b = h[h.length - 1];
+    if (!a || !b) return null;
+    const before = a.low || a.high;
+    const now = b.low || b.high;
+    return { item_id: id, ...info(id), before, now, pct: Math.round((now / before - 1) * 10000) / 10000 };
+  }).filter(Boolean);
+  changes.sort((a, b) => b.pct - a.pct);
+  const up = changes.filter((c) => c.pct > 0.005).slice(0, 3);
+  const down = changes.filter((c) => c.pct < -0.005).slice(-3).reverse();
+  const groupDefs = [['all', 'All busy goods', () => true], ['herbs', 'Herbs', (it) => it.class_id === 7 && it.subclass_id === 9], ['cloth', 'Cloth', (it) => it.class_id === 7 && it.subclass_id === 5], ['metal', 'Metal & Stone', (it) => it.class_id === 7 && it.subclass_id === 7], ['consumables', 'Consumables', (it) => it.class_id === 0]];
+  const groups = groupDefs.map(([key, label, f]) => {
+    const cs = changes.filter((c) => ITEMS.get(c.item_id) && f(ITEMS.get(c.item_id)));
+    if (cs.length < 3) return null;
+    const ps = cs.map((c) => c.pct).sort((a, b) => a - b);
+    return { key, label, items: cs.length, pct: ps[Math.floor(ps.length / 2)], cheaper: ps.filter((x) => x < -0.005).length, pricier: ps.filter((x) => x > 0.005).length };
+  }).filter(Boolean);
+  const prev = listings[listings.length - 2];
+  const goneN = Math.round(prev.auctions * 0.18);
+  const swingId = ids[3];
+  const dealId = ids.find((id) => (discountFor(id) || 0) > 0.25) || ids[0];
+  const goldDay = sold.reduce((a, b) => a + b.value_day, 0);
+  return {
+    installed: true, dates, date: day(end), realm: 'Forever', faction: 'Alliance',
+    window: { start, end, scans: 20, prev_scans: 19, first_ts: listings[0].ts, covered_s: 82800, prev_covered_s: 79200 },
+    listings, peak, low, latest,
+    gone: { auctions: goneN, of: prev.auctions, pct: Math.round((goneN / prev.auctions) * 10000) / 10000, from_ts: prev.ts, to_ts: latest.ts, sold: Math.round(goneN * 0.7), expired: Math.round(goneN * 0.2), relisted: goneN - Math.round(goneN * 0.7) - Math.round(goneN * 0.2) },
+    totals: { gold_day: goldDay, gold_observed: Math.round(goldDay / 1.2), units_day: sold.reduce((a, b) => a + b.sold_day, 0), units_observed: sold.reduce((a, b) => a + b.sold, 0), sold_auctions: 5321, items_sold: sold.length, gold_change: 0.12, sell_through: 0.78 },
+    top_gold, top_units,
+    most_listed: [...ids].sort((a, b) => CURRENT.get(b).available - CURRENT.get(a).available).slice(0, 5).map((id) => ({ item_id: id, ...info(id), qty: CURRENT.get(id).available * 12, auctions: CURRENT.get(id).available, sellers: 7, min_unit: CURRENT.get(id).price })),
+    price_source: 'scans', price_items: changes.length, cheaper: changes.filter((c) => c.pct < -0.005).length, pricier: changes.filter((c) => c.pct > 0.005).length,
+    up, down, groups,
+    swing: { item_id: swingId, ...info(swingId), ratio: 3.4, low: Math.round(CURRENT.get(swingId).price * 0.6), low_ts: listings[4].ts, high: Math.round(CURRENT.get(swingId).price * 2.04), high_ts: listings[15].ts },
+    deal: { item_id: dealId, ...info(dealId), price: CURRENT.get(dealId).price, baseline: baselineFor(dealId), discount: discountFor(dealId) },
+    generated_ts: NOW_S(),
+  };
 }

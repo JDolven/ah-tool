@@ -280,6 +280,15 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR)
                 except ValueError:
                     raise BadRequest("days/limit must be numbers")
                 return market.activity(conn, cfg, days, limit, realm)
+            if path == "/api/market/report":
+                from . import report
+                date = qs.get("date") or None
+                if date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+                    raise BadRequest("date must be YYYY-MM-DD")
+                try:
+                    return report.daily(conn, cfg, date, realm)
+                except ValueError as e:
+                    raise NotFound(str(e))
             if path == "/api/market/my":
                 try:
                     days = int(qs.get("days", 30))

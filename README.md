@@ -48,6 +48,10 @@ In-game commands: `/ahtl` shows the logger status, `/ahtl scan` starts a full sc
 - **Item** – price chart, history, recipes, your own auctions.
 - **Statistics** – the market broken down by quality/class, biggest movers.
 - **My auctions** – what you have posted, compared with the current price.
+- **Market Report** (`#/report`) – one day at the auction house on a single page: listings through the day, estimated
+  gold traded and units sold, most listed, biggest price moves and group moves vs the day before, and highlights.
+  Needs AH Tool Logger full scans (several a day give the best report). Pick earlier days with the date picker; the
+  *Print* button prints it or saves it as PDF.
 
 ## Item tooltips
 Hover any item name to see an in-game style tooltip (stats, effects, sell price, icon) plus the AH price, market
