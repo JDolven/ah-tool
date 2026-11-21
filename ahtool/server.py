@@ -1,12 +1,15 @@
 """HTTP server: JSON API + static files from web/."""
-import gzip
+import base64
+import hashlib
 import json
 import mimetypes
 import os
 import re
 import socket
 import sys
+import threading
 import traceback
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -19,9 +22,16 @@ WEB_BLOCKED = {
     ("GET", "/api/postings"), ("GET", "/api/market/my"),
     ("HEAD", "/api/postings"), ("HEAD", "/api/market/my"),
 }
-MAX_BODY = 1 << 20          # normal API calls
-MAX_SYNC_BODY = 96 << 20    # one sync batch, gzip (Cloudflare refuses > 100 MB anyway)
-MAX_SYNC_JSON = 512 << 20   # the same batch unpacked
+MAX_BODY = 1 << 20          # normal API calls (local app and web version)
+# One sync batch unpacked. sync.py cuts row data into batches of MAX_BATCH_ROWS (150k rows, ~15-20 MB of JSON);
+# 64 MB leaves room for the static tables in the first batch. Override with AHTOOL_MAX_SYNC_MB if ever needed.
+MAX_SYNC_JSON = int(os.environ.get("AHTOOL_MAX_SYNC_MB") or 64) << 20
+MAX_SYNC_BODY = MAX_SYNC_JSON  # the gzip body can never legitimately be larger than what it unpacks to
+SYNC_CONTENT_TYPE = "application/gzip"  # what sync._request sends; plain application/json is accepted as well
+SOCKET_TIMEOUT = 30          # seconds of silence before a connection is dropped (slowloris)
+MAX_WEB_CONNECTIONS = 128    # concurrent connections served at once in the web version
+UNSAFE_METHODS = ("POST", "PUT", "DELETE")
+_CL_RE = re.compile(r"[0-9]{1,15}")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(ROOT, "web")
@@ -36,6 +46,64 @@ def default_connect():
     return db.connect()
 
 
+# Inline event handlers the frontend needs, allowed via 'unsafe-hashes'. Empty: the frontend uses none.
+INLINE_HANDLERS = ()
+_INLINE_SCRIPT_RE = re.compile(rb"<script\b(?![^>]*\bsrc\s*=)[^>]*>(.*?)</script\s*>", re.S | re.I)
+
+
+def _sha256(b):
+    return "'sha256-%s'" % base64.b64encode(hashlib.sha256(b).digest()).decode("ascii")
+
+
+def csp_for_html(html):
+    """Content-Security-Policy for a page: inline <script>s are allowed by hash, computed from the served HTML."""
+    hashes = [_sha256(m.group(1)) for m in _INLINE_SCRIPT_RE.finditer(html)]
+    handlers = ["'unsafe-hashes'"] + [_sha256(h.encode("utf-8")) for h in INLINE_HANDLERS] if INLINE_HANDLERS else []
+    return "; ".join([
+        "default-src 'self'",
+        " ".join(["script-src 'self'"] + hashes + handlers),
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src 'self' https://fonts.gstatic.com",
+        "img-src 'self' data: https://wow.zamimg.com",
+        "connect-src 'self'",
+        "object-src 'none'",
+        "base-uri 'none'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+    ])
+
+
+CSP_API = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"  # JSON, scripts, styles, ...
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+}
+
+
+def _reject_constant(name):
+    raise ValueError("NaN/Infinity are not allowed")
+
+
+def loads_strict(raw):
+    """json.loads for request bodies: UTF-8 only, no NaN/Infinity."""
+    return json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+
+
+def gunzip_capped(raw, cap):
+    """Unpack one gzip member, refusing to produce more than `cap` bytes (gzip bombs)."""
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        out = d.decompress(raw, cap + 1)
+    except zlib.error:
+        raise BadRequest("body is not valid gzip")
+    if len(out) > cap or d.unconsumed_tail:
+        raise TooLarge("sync batch too large")
+    if not d.eof or d.unused_data:
+        raise BadRequest("body is not valid gzip")
+    return out
+
+
 class NotFound(Exception):
     pass
 
@@ -45,6 +113,10 @@ class BadRequest(Exception):
 
 
 class NotImplementedYet(Exception):
+    pass
+
+
+class TooLarge(BadRequest):
     pass
 
 
@@ -81,21 +153,29 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
     port = int(port if port is not None else cfg.get("port", 8642))
     web_root = os.path.normpath(web_dir)
 
+    extra_hosts = {h.lower() for h in (cfg.get("allowed_hosts") or []) if isinstance(h, str)}
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "AHTool"
+        timeout = SOCKET_TIMEOUT  # applied to the socket by StreamRequestHandler.setup()
 
         def log_message(self, fmt, *args):
             if web and self.path == "/healthz":
                 return
             sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
-        def _send(self, code, body, ctype, extra=None):
+        def _send(self, code, body, ctype, extra=None, csp=CSP_API):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Security-Policy", csp)
+            for k, v in SECURITY_HEADERS.items():
+                self.send_header(k, v)
             for k, v in (extra or {}).items():
                 self.send_header(k, v)
+            if self.close_connection:
+                self.send_header("Connection", "close")
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
@@ -104,6 +184,11 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
             body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
             self._send(code, body, "application/json; charset=utf-8", {"Cache-Control": "no-store"})
 
+        def _fail(self, code, msg):
+            """Error answer that also ends the connection (the request may not have been read completely)."""
+            self.close_connection = True
+            return self._json({"error": msg}, code)
+
         def _static(self, path):
             rel = unquote(path).lstrip("/") or "index.html"
             full = os.path.normpath(os.path.join(web_root, rel))
@@ -111,7 +196,7 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                 return self._json({"error": "forbidden"}, 403)
             if not os.path.isfile(full):
                 if "." in os.path.basename(rel):
-                    return self._json({"error": "not found: " + path}, 404)
+                    return self._json({"error": "not found"}, 404)
                 full = os.path.join(web_root, "index.html")  # SPA fallback
                 if not os.path.isfile(full):
                     return self._json({"error": "web/index.html mangler"}, 404)
@@ -120,29 +205,108 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                 ctype += "; charset=utf-8"
             with open(full, "rb") as f:
                 data = f.read()
-            if web and os.path.basename(full) == "index.html":
-                data = data.replace(b"<html ", b'<html data-mode="web" ', 1)
-            self._send(200, data, ctype, {"Cache-Control": "no-store"})
+            csp = CSP_API
+            if ctype.startswith("text/html"):
+                if web and os.path.basename(full) == "index.html":
+                    data = data.replace(b"<html ", b'<html data-mode="web" ', 1)
+                csp = csp_for_html(data)
+            self._send(200, data, ctype, {"Cache-Control": "no-store"}, csp=csp)
 
-        def _read_body(self, limit=None):
-            try:
-                n = int(self.headers.get("Content-Length") or 0)
-            except ValueError:
-                n = -1
-            if n < 0 or (limit is not None and n > limit):
-                raise BadRequest("request body too large")
-            return self.rfile.read(n) if n else b""
+        # ------------------------------------------------------------ request framing / origin checks
+
+        def _content_length(self):
+            """-> declared body length. Refuses Transfer-Encoding and malformed or repeated Content-Length, which
+            proxies and this server could otherwise frame differently (request smuggling)."""
+            if self.headers.get_all("Transfer-Encoding"):
+                raise BadRequest("Transfer-Encoding is not supported")
+            vals = self.headers.get_all("Content-Length") or []
+            if not vals:
+                return 0
+            if len(vals) > 1 or not _CL_RE.fullmatch(vals[0].strip()):
+                raise BadRequest("invalid Content-Length")
+            return int(vals[0].strip())
+
+        def _read_body(self, limit):
+            n = self._content_length()
+            if n > limit:
+                raise TooLarge("request body too large")
+            self._body_pending = 0
+            data = self.rfile.read(n) if n else b""
+            if len(data) != n:
+                self.close_connection = True
+                raise BadRequest("incomplete request body")
+            return data
+
+        def _host_ok(self):
+            if web:
+                return True
+            host = (self.headers.get("Host") or "").strip().lower()
+            port = self.server.server_address[1]
+            allowed = {"localhost:%d" % port, "127.0.0.1:%d" % port, "[::1]:%d" % port} | extra_hosts
+            if port == 80:
+                allowed |= {"localhost", "127.0.0.1", "[::1]"}
+            return host in allowed
+
+        def _same_origin(self):
+            """Browser requests from another site (CSRF) carry an Origin and/or Sec-Fetch-Site saying so. Clients
+            that send neither (sync.py, curl, tests) are not browsers and are let through."""
+            site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+            if site in ("cross-site", "same-site"):
+                return False
+            origin = self.headers.get("Origin")
+            if origin is None:
+                return True
+            netloc = urlparse(origin.strip()).netloc.lower() if origin.strip().lower() != "null" else ""
+            hosts = {(self.headers.get("Host") or "").strip().lower()}
+            if web and self.headers.get("X-Forwarded-Host"):  # behind a reverse proxy that rewrites Host
+                hosts.add(self.headers["X-Forwarded-Host"].split(",")[0].strip().lower())
+            return bool(netloc) and netloc in hosts
+
+        def _ctype_ok(self, allowed, body_len):
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if not ctype and body_len == 0:
+                return True  # bodyless POST/DELETE from api.js
+            return ctype in allowed
 
         def _handle(self, method):
+            self._body_pending = 0
+            try:
+                self._body_pending = self._content_length()
+            except BadRequest as e:
+                return self._fail(400, str(e))
+            try:
+                if not self._host_ok():
+                    return self._fail(403, "forbidden host")
+                if method in UNSAFE_METHODS and not self._same_origin():
+                    return self._fail(403, "cross-origin request refused")
+                return self._dispatch(method)
+            finally:
+                if self._body_pending:  # body left unread: the next "request" on this connection would be the body
+                    self.close_connection = True
+
+        def _dispatch(self, method):
             u = urlparse(self.path)
             path = u.path
             if web and path.startswith("/api/sync/"):
                 return self._sync(method, path.rstrip("/"))
-            try:
-                raw = self._read_body(MAX_BODY if web else None) if method in ("POST", "PUT", "DELETE") else b""
-            except BadRequest as e:
-                self.close_connection = True
-                return self._json({"error": str(e)}, 413)
+            if self._body_pending and method not in UNSAFE_METHODS:
+                # GET/HEAD with a body: read it away (small) or drop the connection after answering
+                if self._body_pending > MAX_BODY:
+                    return self._fail(413, "request body too large")
+                try:
+                    self._read_body(MAX_BODY)
+                except BadRequest as e:
+                    return self._fail(400, str(e))
+            raw = b""
+            if method in UNSAFE_METHODS:
+                if not self._ctype_ok(("application/json",), self._body_pending):
+                    return self._fail(415, "Content-Type must be application/json")
+                try:
+                    raw = self._read_body(MAX_BODY)
+                except TooLarge as e:
+                    return self._fail(413, str(e))
+                except BadRequest as e:
+                    return self._fail(400, str(e))
             if web and path == "/healthz":
                 return self._json({"ok": True})
             if web and path == "/api/x":
@@ -168,9 +332,9 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                 self._json({"error": str(e.args[0]) if e.args else "not found"}, 404)
             except BadRequest as e:
                 self._json({"error": str(e)}, 400)
-            except Exception as e:  # noqa
+            except Exception:  # noqa
                 traceback.print_exc()
-                self._json({"error": "%s: %s" % (type(e).__name__, e)}, 500)
+                self._json({"error": "internal server error"}, 500)
             finally:
                 if conn is not None:
                     try:
@@ -187,7 +351,7 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
             if method != "POST":
                 return self._json({"error": "method not allowed"}, 405)
             try:
-                req = json.loads(raw.decode("utf-8"))
+                req = loads_strict(raw)
                 m, target = req["m"], req["p"]
                 if m not in ("GET", "POST", "PUT", "DELETE") or not isinstance(target, str):
                     raise ValueError
@@ -228,9 +392,9 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                 self._json({"error": str(e)}, 400)
             except KeyError as e:
                 self._json({"error": str(e.args[0]) if e.args else "not found"}, 404)
-            except Exception as e:  # noqa
+            except Exception:  # noqa
                 traceback.print_exc()
-                self._json({"error": "%s: %s" % (type(e).__name__, e)}, 500)
+                self._json({"error": "internal server error"}, 500)
             finally:
                 if conn is not None:
                     try:
@@ -260,23 +424,34 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                         raise BadRequest("cursor must be JSON")
                     return self._json(sync.pull_page(conn, cursor, qs.get("limit") or sync.PULL_LIMIT))
                 if method == "POST" and path == "/api/sync/push":
-                    raw = self._read_body(MAX_SYNC_BODY)
-                    if (self.headers.get("Content-Type") or "").startswith("application/gzip"):
-                        with gzip.GzipFile(fileobj=__import__("io").BytesIO(raw)) as g:
-                            raw = g.read(MAX_SYNC_JSON + 1)
-                        if len(raw) > MAX_SYNC_JSON:
-                            raise BadRequest("sync batch too large")
-                    payload = json.loads(raw.decode("utf-8"))
+                    gz = self._ctype_ok((SYNC_CONTENT_TYPE,), -1)
+                    if not gz and not self._ctype_ok(("application/json",), -1):
+                        return self._fail(415, "Content-Type must be " + SYNC_CONTENT_TYPE)
+                    try:
+                        raw = self._read_body(MAX_SYNC_BODY)
+                        if gz:
+                            raw = gunzip_capped(raw, MAX_SYNC_JSON)
+                    except TooLarge as e:
+                        return self._fail(413, str(e))
+                    try:
+                        payload = sync.loads_strict(raw.decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError):
+                        raise BadRequest("sync batch is not valid JSON")
+                    del raw
                     res = sync.apply(conn, cfg, payload, source)
                     analytics.invalidate()
                     return self._json(res)
                 return self._json({"error": "unknown endpoint"}, 404)
-            except (BadRequest, sync.BadPayload, ValueError, OSError, EOFError) as e:
-                self.close_connection = True
-                return self._json({"error": "%s" % e}, 400)
-            except Exception as e:  # noqa
+            except BadRequest as e:
+                return self._fail(400, str(e))
+            except sync.BadPayload as e:  # our own validation text: names the table/field, no internals
+                return self._fail(400, "invalid sync batch: %s" % e)
+            except (ValueError, OSError, EOFError):
                 traceback.print_exc()
-                return self._json({"error": "%s: %s" % (type(e).__name__, e)}, 500)
+                return self._fail(400, "bad sync request")
+            except Exception:  # noqa
+                traceback.print_exc()
+                return self._fail(500, "internal server error")
             finally:
                 if conn is not None:
                     conn.close()
@@ -291,7 +466,7 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
             body = None
             if method in ("POST", "PUT", "DELETE") and raw.strip():
                 try:
-                    body = json.loads(raw.decode("utf-8"))
+                    body = loads_strict(raw)
                 except (ValueError, UnicodeDecodeError):
                     raise BadRequest("request body is not valid JSON")
             if method == "POST":
@@ -300,8 +475,9 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                     res = ingest.ingest(conn, cfg, force=True)
                     try:
                         res["logger"] = market.ingest(conn, cfg, force=True)
-                    except Exception as e:  # noqa
-                        res["logger"] = {"error": str(e)}
+                    except Exception:  # noqa
+                        traceback.print_exc()
+                        res["logger"] = {"error": "AH Tool Logger import failed (see the console)"}
                     A.invalidate()
                     if not res.get("skipped"):
                         alerts_mod.evaluate(conn, cfg)
@@ -492,5 +668,28 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
             if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
                 self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             super().server_bind()
+
+        # The web version is public: bound the number of connection threads. Over the limit a connection gets a
+        # plain 503 and is closed instead of starting yet another thread.
+        slots = threading.BoundedSemaphore(MAX_WEB_CONNECTIONS) if web else None
+
+        def process_request(self, request, client_address):
+            if self.slots is not None and not self.slots.acquire(blocking=False):
+                try:
+                    request.settimeout(2)
+                    request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n"
+                                    b"Connection: close\r\nRetry-After: 5\r\n\r\n")
+                except OSError:
+                    pass
+                self.shutdown_request(request)
+                return
+            super().process_request(request, client_address)
+
+        def process_request_thread(self, request, client_address):
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                if self.slots is not None:
+                    self.slots.release()
 
     return Server((host, port), Handler)

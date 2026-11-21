@@ -217,5 +217,33 @@ export function openGuide(plan, meta) {
   const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
   const w = window.open(url, '_blank');
   setTimeout(() => URL.revokeObjectURL(url), 60000);
+  // The blob page inherits the app's CSP, so its inline script (kept for the downloaded copy) is blocked there.
+  // The page is same-origin: wire its buttons from here instead.
+  if (w) w.addEventListener('load', () => wireGuide(w, guideText(plan, meta), meta.fileName));
   return !!w;
+}
+
+function wireGuide(w, text, file) {
+  const doc = w.document;
+  const msg = doc.getElementById('msg');
+  const btn = (id) => doc.getElementById(id);
+  if (!msg || !btn('b-print')) return;
+  const say = (t) => { msg.textContent = t; w.setTimeout(() => { if (msg.textContent === t) msg.textContent = ''; }, 2500); };
+  btn('b-print').onclick = () => w.print();
+  btn('b-dl').onclick = () => {
+    const html = '<!doctype html>\n' + doc.documentElement.outerHTML;
+    const a = doc.createElement('a');
+    a.href = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+    a.download = file; doc.body.appendChild(a); a.click(); a.remove();
+    say('Saved');
+  };
+  btn('b-copy').onclick = () => {
+    const fallback = () => {
+      const t = doc.createElement('textarea'); t.value = text; doc.body.appendChild(t); t.select();
+      try { doc.execCommand('copy'); say('Copied'); } catch (e) { say('Copy failed'); }
+      t.remove();
+    };
+    if (w.navigator.clipboard && w.navigator.clipboard.writeText) w.navigator.clipboard.writeText(text).then(() => say('Copied'), fallback);
+    else fallback();
+  };
 }

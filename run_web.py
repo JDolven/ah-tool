@@ -23,6 +23,13 @@ def main():
     if cfg["sync_token"] and len(cfg["sync_token"]) < 32:
         print("AHTOOL_SYNC_TOKEN is shorter than 32 characters - refusing to start with a guessable token.")
         return 2
+    data_dir = os.path.dirname(os.path.abspath(db_path))
+    os.makedirs(data_dir, exist_ok=True)
+    if not os.access(data_dir, os.W_OK) or (os.path.exists(db_path) and not os.access(db_path, os.W_OK)):
+        print("%s is not writable by uid %d. If the volume was created by an older image that ran as root, run once:\n"
+              "  docker run --rm -v <volume>:/data alpine chown -R %d:%d /data"
+              % (db_path, os.getuid(), os.getuid(), os.getgid()))
+        return 2
     conn = db.connect(db_path)
     sync.ensure_schema(conn)
     sync.load_pushed_cfg(conn, cfg)
