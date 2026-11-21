@@ -95,7 +95,7 @@ async function renderTrending(box, ctx) {
   const row = (r) => `<li class="list-row">
       <div class="list-main">
         <span class="trend-name">${r.created_item_id ? itemLink(r.created_item_id, r.name, r.created_quality) : `<span class="spell-name">${esc(r.name)}</span>`}${confBadge(r.confidence)}</span>
-        <div class="list-meta">${r.profession_id ? `<a href="#/professions/${esc(r.profession_id)}" class="muted-link">${esc(profName(r))}</a>` : esc(profName(r))} · profit ${money(r.profit, { signed: true })}</div>
+        <div class="list-meta">${r.profession_id ? `<a href="#/professions/${encodeURIComponent(r.profession_id)}" class="muted-link">${esc(profName(r))}</a>` : esc(profName(r))} · profit ${money(r.profit, { signed: true })}</div>
       </div>
       <div class="list-side trend-side">
         ${sparkline(r.spark, { w: 72, h: 22 })}
@@ -277,7 +277,7 @@ async function renderCrafts(box, ctx) {
       (r) => `<li class="list-row">
         <div class="list-main">
           ${r.created_item_id ? itemLink(r.created_item_id, r.name, r.created_quality) : `<span>${esc(r.name)}</span>`}
-          <div class="list-meta"><a href="#/professions/${r._prof.id}" class="muted-link">${esc(r._prof.name)}</a> · cost ${money(r.cost)}</div>
+          <div class="list-meta"><a href="#/professions/${encodeURIComponent(r._prof.id)}" class="muted-link">${esc(r._prof.name)}</a> · cost ${money(r.cost)}</div>
         </div>
         <div class="list-side">
           <div>${money(r.profit, { signed: true })}</div>

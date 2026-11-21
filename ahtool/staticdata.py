@@ -4,6 +4,7 @@ Units: items.vendor_sell = SellPrice (per unit, copper); items.vendor_buy = BuyP
 (per unit, copper); items.stack = Stackable (max stack size).
 """
 import csv
+import math
 import os
 import re
 import struct
@@ -35,6 +36,9 @@ def log(*a):
     print("[staticdata]", *a, file=sys.stderr)
 
 
+MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # the largest DB2 CSV (ItemSparse) is far below this
+
+
 def _download(cfg, table):
     cache = cfg["cache_dir"]
     os.makedirs(cache, exist_ok=True)
@@ -49,12 +53,23 @@ def _download(cfg, table):
     log("downloading", url)
     req = urllib.request.Request(url, headers={"User-Agent": "ahtool/1.0"})
     tmp = dest + ".part"
-    with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
-        while True:
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            f.write(chunk)
+    total = 0
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    raise IOError("%s: download larger than %d bytes, aborted" % (table, MAX_DOWNLOAD_BYTES))
+                f.write(chunk)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     os.replace(tmp, dest)
     return dest
 
@@ -62,10 +77,10 @@ def _download(cfg, table):
 def _int(s, default=0):
     try:
         return int(s)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         try:
             return int(float(s))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return default
 
 
@@ -194,9 +209,11 @@ def update_vendor_from_cache(conn, vendor_cache):
         for k, v in vendor_cache.items():
             try:
                 iid = int(k)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
-            if isinstance(v, (int, float)) and v > 0:
+            # bool is an int subclass; inf/NaN/huge values would overflow int() or SQLite INTEGER
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and 0 < v < 2 ** 62 \
+                    and 0 < iid < 2 ** 62:
                 rows.append((iid, int(v), "auctionator_cache"))
     conn.executemany("INSERT OR REPLACE INTO vendor_items VALUES(?,?,?)", rows)
     return len(rows)

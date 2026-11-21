@@ -2,7 +2,7 @@
 // Data: GET /api/tooltip/<id> (structured lines + AH section), cached client-side.
 // Debug: ?tt=<id> pins a tooltip open (used for screenshots).
 import { api } from './api.js';
-import { esc, isNum, pct, itemName } from './util.js';
+import { esc, isNum, pct, itemName, safeIconUrl } from './util.js';
 
 const SHOW_DELAY = 150;
 const CACHE_MS = 5 * 60 * 1000;
@@ -87,7 +87,7 @@ function render(d) {
   let ahHtml = `<table class="wtt-ah">${rows.map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`).join('')}</table>`;
   const used = a.used_in || {};
   if (used.count) {
-    ahHtml += `<div class="wtt-line wtt-gold">Used in ${used.count} recipe${used.count === 1 ? '' : 's'}${used.professions && used.professions.length ? ` <span class="wtt-dim">(${esc(used.professions.join(', '))})</span>` : ''}</div>`;
+    ahHtml += `<div class="wtt-line wtt-gold">Used in ${esc(used.count)} recipe${used.count === 1 ? '' : 's'}${used.professions && used.professions.length ? ` <span class="wtt-dim">(${esc(used.professions.join(', '))})</span>` : ''}</div>`;
   }
   const crafted = a.crafted_by || [];
   crafted.slice(0, 2).forEach((r, i) => {
@@ -103,7 +103,7 @@ function render(d) {
   }
   const custom = d.custom ? '<div class="wtt-line wtt-dim wtt-note">Custom Forever item – limited data</div>' : '';
   return `
-    <div class="wtt-icon" style="background-image:url('${esc(d.icon_url || '')}')"></div>
+    <div class="wtt-icon"></div>
     <div class="wtt-box">
       <div class="wtt-name ${qcls(d.quality)}">${esc(itemName(d.name, d.id))}</div>
       ${lines}
@@ -148,7 +148,11 @@ async function show(id, target) {
   }
   if (current !== mine || !data) return;
   box.innerHTML = render(data);
-  box.classList.toggle('wtt-noicon', !data.icon_url);
+  // Icon set through the DOM, not a style="" string: HTML escaping does not protect CSS context.
+  const iconUrl = safeIconUrl(data.icon_url);
+  const ico = box.querySelector('.wtt-icon');
+  if (ico && iconUrl) ico.style.backgroundImage = `url(${JSON.stringify(iconUrl)})`;
+  box.classList.toggle('wtt-noicon', !iconUrl);
   box.hidden = false;
   position(lastX, lastY);
 }

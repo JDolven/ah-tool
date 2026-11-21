@@ -80,14 +80,19 @@ def _s(v):
     return "" if v is None else str(v)
 
 
+_INT_LIMIT = 2 ** 62  # keep values well inside SQLite's signed 64-bit INTEGER
+
+
 def _i(v, default=0):
+    """int(v), or default for non-numbers, NaN/inf and values SQLite could not store."""
     try:
-        return int(v)
-    except (TypeError, ValueError):
+        n = int(v)
+    except (TypeError, ValueError, OverflowError):
         try:
-            return int(float(v))
-        except (TypeError, ValueError):
+            n = int(float(v))
+        except (TypeError, ValueError, OverflowError):
             return default
+    return n if -_INT_LIMIT < n < _INT_LIMIT else default
 
 
 def _seq(v):
@@ -96,6 +101,9 @@ def _seq(v):
     if isinstance(v, dict):
         return [v[k] for k in sorted(v, key=lambda k: (not isinstance(k, int), k if isinstance(k, int) else 0))]
     return []
+
+
+MAX_ROW_MULT = 1000  # "N*row" repeats a row N times; a real scan never has 1000 identical auctions
 
 
 def parse_rows(d, with_status=False):
@@ -111,6 +119,8 @@ def parse_rows(d, with_status=False):
                 mult = int(row[:star])
             except ValueError:
                 continue
+            if not 0 < mult <= MAX_ROW_MULT:
+                continue  # malformed (or a memory bomb): skip the row
             row = row[star + 1:]
         f = row.split(",")
         if len(f) < 8:
@@ -119,7 +129,7 @@ def parse_rows(d, with_status=False):
             r = (int(f[0]), int(f[1]), int(f[2]), int(f[3]), int(f[4]), int(f[5]), int(f[6]), f[7])
         except ValueError:
             continue
-        if r[0] <= 0 or r[2] <= 0:
+        if r[0] <= 0 or r[2] <= 0 or any(abs(x) >= _INT_LIMIT for x in r[:7]):
             continue
         if with_status:
             r = r + (_i(f[8]) if len(f) > 8 else 0,)
@@ -402,7 +412,8 @@ def buy_cost(stacks, qty):
 
 def _stacks(conn, scan_id, item_id):
     return [(b / c, c) for b, c in conn.execute(
-        "SELECT buyout, count FROM ah_auctions WHERE scan_id=? AND item_id=? AND buyout>0", (scan_id, item_id))]
+        "SELECT buyout, count FROM ah_auctions WHERE scan_id=? AND item_id=? AND buyout>0 AND count>0",
+        (scan_id, item_id))]
 
 
 def cost_for(conn, cfg, needs, realm=None):
@@ -446,13 +457,13 @@ def item_market(conn, cfg, item_id, qty=None, days=14, realm=None):
                             "WHERE scan_id=? AND item_id=?", (scan["id"], item_id)).fetchall()
         grouped = Counter()
         for c, b, mb, bid, tl, owner, suf in rows:
-            grouped[(round(b / c, 2) if b > 0 else None, c, b, owner, tl, bid > 0)] += 1
+            grouped[(round(b / c, 2) if b > 0 and c > 0 else None, c, b, owner, tl, bid > 0)] += 1
         listings = [{"unit": k[0], "count": k[1], "buyout": k[2], "owner": k[3] or None, "time_left": k[4],
                      "time_left_text": TIME_LEFT_TEXT.get(k[4]), "has_bid": k[5], "auctions": n}
                     for k, n in grouped.items()]
         listings.sort(key=lambda x: (x["unit"] is None, x["unit"] or 0, x["count"]))
         out["listings"] = listings
-        stacks = [(b / c, c) for c, b, *_ in rows if b > 0]
+        stacks = [(b / c, c) for c, b, *_ in rows if b > 0 and c > 0]
         qty_all = sum(r[0] for r in rows)
         units = sorted(stacks)
         cum, depth = 0, []
@@ -616,7 +627,7 @@ def my_market(conn, cfg, days=30, realm=None):
         lowest = None
         cheaper = 0
         if scan:
-            q = ("SELECT buyout, count, owner FROM ah_auctions WHERE scan_id=? AND item_id=? AND buyout>0")
+            q = ("SELECT buyout, count, owner FROM ah_auctions WHERE scan_id=? AND item_id=? AND buyout>0 AND count>0")
             others = [(b / c, c) for b, c, o in conn.execute(q, (scan["id"], a["item_id"]))
                       if not (o and o.split("-")[0] in my_names)]
             if others:

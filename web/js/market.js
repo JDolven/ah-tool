@@ -71,7 +71,7 @@ export async function renderItemMarket(box, itemId, alive) {
       ${tile('Listed now', s ? num(s.qty) : '0', s ? `${num(s.auctions)} auctions` : 'none in the latest scan')}
       ${tile('Sellers', s ? num(s.sellers) : '–')}
       ${tile('Cheapest', s ? money(s.min_unit) : '–', s && isNum(s.median_unit) ? `median ${money(s.median_unit)}` : '')}
-      ${tile('Sold / day', isNum(t.per_day) ? num(t.per_day, 1) : '–', `${num(t.sold || 0)} sold in ${sales.days}d`)}
+      ${tile('Sold / day', isNum(t.per_day) ? num(t.per_day, 1) : '–', `${num(t.sold || 0)} sold in ${esc(sales.days)}d`)}
       ${tile('Avg sold price', money(t.avg_unit))}
       ${tile('Sell-through', isNum(t.sell_through) ? pct(t.sell_through, 0) : '–', 'sold vs. expired')}
     </div>

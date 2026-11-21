@@ -12,6 +12,7 @@ Each row stores a JSON "static tooltip": {name, quality, icon, item_level, requi
 type, damage, armor, stats, resistances, durability, classes, skill, effects, description, sell_price, ...}.
 The API (ahtool.tooltip) turns it into display lines and adds the AH section.
 """
+import ast
 import csv
 import json
 import os
@@ -461,9 +462,41 @@ class SpellDB:
         if not re.fullmatch(r"[0-9.+\-*/() ]+", e or "x"):
             return None
         try:
-            return float(eval(e, {"__builtins__": {}}, {}))  # noqa: S307 - digits/operators only
+            return float(_arith(e))
         except Exception:
             return None
+
+
+_ARITH_MAX_LEN = 500
+_ARITH_MAX_ABS = 1e15  # far beyond any spell value; stops runaway products
+
+
+def _arith(expr):
+    """Evaluate + - * / // and unary +/- over numeric literals (what spell formulas use), without eval().
+
+    Raises ValueError (or ZeroDivisionError) for anything else, e.g. ** or an oversized result."""
+    if len(expr) > _ARITH_MAX_LEN:
+        raise ValueError("expression too long")
+    ops = {ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b, ast.Mult: lambda a, b: a * b,
+           ast.Div: lambda a, b: a / b, ast.FloorDiv: lambda a, b: a // b}
+
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            v = node.value
+        elif isinstance(node, ast.BinOp) and type(node.op) in ops:
+            v = ops[type(node.op)](ev(node.left), ev(node.right))
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            v = ev(node.operand)
+            v = -v if isinstance(node.op, ast.USub) else v
+        else:
+            raise ValueError("unsupported expression")
+        if abs(v) > _ARITH_MAX_ABS:
+            raise ValueError("value out of range")
+        return v
+
+    return ev(ast.parse(expr.strip(), mode="eval"))
 
 
 def _matching(text, start, open_c, close_c):

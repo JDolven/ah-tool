@@ -5,6 +5,7 @@ Values: dict (keyed or mixed; positional entries get int keys 1..n) / list (pure
 / {} (empty table) / int / float / bool / None / bytes (all strings: raw bytes, so CBOR blobs stay intact).
 Table string keys are returned as str (utf-8, errors='replace'); numeric keys as int.
 """
+import math
 import re
 
 _WS = re.compile(rb"(?:[ \t\r\n]+|--\[(=*)\[.*?\]\1\]|--[^\n]*)*", re.S)
@@ -21,6 +22,9 @@ _SIMPLE = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"a": b"\x07", b"b": b"\x08", 
 
 class LuaParseError(ValueError):
     pass
+
+
+MAX_DEPTH = 200  # table nesting limit (deeper input would hit Python's recursion limit)
 
 
 def _unesc_fn(m):
@@ -44,14 +48,16 @@ class _P:
     def ws(self, p):
         return _WS.match(self.d, p).end()
 
-    def value(self, p):
+    def value(self, p, depth=0):
         d = self.d
         p = self.ws(p)
         if p >= self.n:
             raise LuaParseError("unexpected EOF")
         c = d[p]
         if c == 0x7B:  # {
-            return self.table(p + 1)
+            if depth >= MAX_DEPTH:
+                raise LuaParseError("tables nested too deeply at %d" % p)
+            return self.table(p + 1, depth + 1)
         if c == 0x22:
             m = _DQ.match(d, p)
             if not m:
@@ -71,9 +77,15 @@ class _P:
             t = m.group()
             if b"x" in t or b"X" in t:
                 return int(t, 16), m.end()
-            if _INT.fullmatch(t):
-                return int(t), m.end()
-            return float(t), m.end()
+            try:
+                if _INT.fullmatch(t):
+                    return int(t), m.end()
+                f = float(t)
+            except ValueError:  # e.g. an integer literal beyond int_max_str_digits
+                raise LuaParseError("bad number at %d" % p)
+            if not math.isfinite(f):  # 1e999 etc.: WoW never writes these; int() on them would overflow
+                raise LuaParseError("number out of range at %d" % p)
+            return f, m.end()
         m = _NAME.match(d, p)
         if m:
             t = m.group()
@@ -87,7 +99,7 @@ class _P:
             return float("-inf"), p + 4
         raise LuaParseError("unexpected %r at %d" % (d[p:p + 20], p))
 
-    def table(self, p):
+    def table(self, p, depth=1):
         d = self.d
         keyed = {}
         pos = []
@@ -100,14 +112,14 @@ class _P:
             if c == b"":
                 raise LuaParseError("unterminated table")
             if c == b"[" and not _LONG.match(d, p):
-                k, p = self.value(p + 1)
+                k, p = self.value(p + 1, depth)
                 p = self.ws(p)
                 if d[p:p + 1] != b"]":
                     raise LuaParseError("expected ] at %d" % p)
                 p = self.ws(p + 1)
                 if d[p:p + 1] != b"=":
                     raise LuaParseError("expected = at %d" % p)
-                v, p = self.value(p + 1)
+                v, p = self.value(p + 1, depth)
                 if isinstance(k, bytes):
                     k = k.decode("utf-8", "replace")
                 elif isinstance(k, float) and k.is_integer():
@@ -118,10 +130,10 @@ class _P:
                 q = self.ws(m.end()) if m else 0
                 if m and d[q:q + 1] == b"=" and d[q + 1:q + 2] != b"=" and \
                         m.group() not in (b"true", b"false", b"nil"):
-                    v, p = self.value(q + 1)
+                    v, p = self.value(q + 1, depth)
                     keyed[m.group().decode("utf-8", "replace")] = v
                 else:
-                    v, p = self.value(p)
+                    v, p = self.value(p, depth)
                     pos.append(v)
             p = self.ws(p)
             if d[p:p + 1] in (b",", b";"):

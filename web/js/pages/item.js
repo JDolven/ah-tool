@@ -177,7 +177,7 @@ export async function render(ctx) {
   if (used.length) {
     new DataTable(el.querySelector('#used'), [
       { key: 'name', label: 'Recipe', defaultDir: 'asc', render: (u) => esc(u.name || `Spell #${u.spell_id}`) },
-      { key: 'profession', label: 'Profession', defaultDir: 'asc', render: (u) => (u.profession_id ? `<a href="#/professions/${esc(u.profession_id)}">${esc(u.profession || '')}</a>` : esc(u.profession || '–')) },
+      { key: 'profession', label: 'Profession', defaultDir: 'asc', render: (u) => (u.profession_id ? `<a href="#/professions/${encodeURIComponent(u.profession_id)}">${esc(u.profession || '')}</a>` : esc(u.profession || '–')) },
       { key: 'count', label: 'Count', align: 'right', render: (u) => num(u.count) },
     ], { sortKey: 'profession', sortDir: 'asc', limit: 15 }).setRows(used);
   } else {

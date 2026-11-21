@@ -7,6 +7,7 @@ class CBORError(ValueError):
 
 
 _BREAK = object()
+MAX_DEPTH = 200  # nesting limit for arrays/maps/tags (Python recursion would fail long before CBOR does)
 
 
 def loads(data):
@@ -44,13 +45,22 @@ def _hashable(k):
 
 
 def _dec(b, p):
+    # Every malformed input surfaces as CBORError (callers only catch that).
     try:
         return _dec2(b, p)
     except IndexError:
         raise CBORError("truncated")
+    except struct.error:
+        raise CBORError("truncated float")
+    except RecursionError:
+        raise CBORError("nested too deeply")
+    except TypeError as e:
+        raise CBORError("malformed: %s" % e)
 
 
-def _dec2(b, p):
+def _dec2(b, p, depth=0):
+    if depth > MAX_DEPTH:
+        raise CBORError("nested too deeply")
     ib = b[p]
     p += 1
     mt = ib >> 5
@@ -77,22 +87,25 @@ def _dec2(b, p):
         raise CBORError("bad simple value")
     if ai == 31:  # indefinite length
         if mt in (2, 3):
+            # Chunks must be definite-length strings (RFC 8949 3.2.3); text/bytes both decode to str here.
             chunks = []
             while b[p] != 0xFF:
-                v, p = _dec2(b, p)
+                if b[p] >> 5 not in (2, 3) or b[p] & 31 == 31:
+                    raise CBORError("bad indefinite-length string chunk")
+                v, p = _dec2(b, p, depth + 1)
                 chunks.append(v)
             return "".join(chunks), p + 1
         if mt == 4:
             r = []
             while b[p] != 0xFF:
-                v, p = _dec2(b, p)
+                v, p = _dec2(b, p, depth + 1)
                 r.append(v)
             return r, p + 1
         if mt == 5:
             r = {}
             while b[p] != 0xFF:
-                k, p = _dec2(b, p)
-                v, p = _dec2(b, p)
+                k, p = _dec2(b, p, depth + 1)
+                v, p = _dec2(b, p, depth + 1)
                 r[_hashable(k)] = v
             return r, p + 1
         raise CBORError("bad indefinite length")
@@ -108,14 +121,14 @@ def _dec2(b, p):
     if mt == 4:
         r = []
         for _ in range(n):
-            v, p = _dec2(b, p)
+            v, p = _dec2(b, p, depth + 1)
             r.append(v)
         return r, p
     if mt == 5:
         r = {}
         for _ in range(n):
-            k, p = _dec2(b, p)
-            v, p = _dec2(b, p)
+            k, p = _dec2(b, p, depth + 1)
+            v, p = _dec2(b, p, depth + 1)
             r[_hashable(k)] = v
         return r, p
-    return _dec2(b, p)  # tag (major 6): ignored
+    return _dec2(b, p, depth + 1)  # tag (major 6): ignored

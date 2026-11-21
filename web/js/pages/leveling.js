@@ -109,7 +109,7 @@ export async function render(ctx) {
       <label class="field lv-prof">
         <span class="field-label">Profession</span>
         <select id="lv-prof" class="select-in">${profs
-          .map((p) => `<option value="${p.id}" ${p.id === st.prof ? 'selected' : ''}>${PROF_ICONS[p.id] || ''} ${esc(p.name)}${mine.has(p.id) ? ` (yours: ${num(mine.get(p.id))})` : ''}</option>`)
+          .map((p) => `<option value="${esc(p.id)}" ${p.id === st.prof ? 'selected' : ''}>${PROF_ICONS[p.id] || ''} ${esc(p.name)}${mine.has(p.id) ? ` (yours: ${num(mine.get(p.id))})` : ''}</option>`)
           .join('')}</select>
       </label>
       <label class="field field-num">

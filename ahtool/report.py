@@ -14,6 +14,7 @@ earlier. The 24 hours before that are "the day before". Everything comes from da
 * group moves: median price change of the busy items per trade-goods group
 """
 import datetime
+import re
 import statistics
 import time
 from collections import defaultdict
@@ -26,6 +27,7 @@ MOVERS_N = 3
 BUSY_QTY = 10        # average listed quantity (scans) / max available (Auctionator) for an item to count as "busy"
 FLAT = 0.005         # +-0.5 % counts as unchanged
 ICON_URL = "https://wow.zamimg.com/images/wow/icons/medium/%s.jpg"
+_ICON_RE = re.compile(r"[A-Za-z0-9_\-]+")  # icon names that are safe to put into the URL
 
 # (key, label, class_id, subclass_id or None)
 GROUPS = [
@@ -285,7 +287,7 @@ def daily(conn, cfg, date=None, realm=None):
             info[iid] = {"name": name, "quality": q if q is not None else 1, "icon_url": None}
         try:
             for iid, icon in conn.execute("SELECT id, icon FROM item_tooltip WHERE id IN (%s)" % marks, ids):
-                if icon:
+                if isinstance(icon, str) and _ICON_RE.fullmatch(icon):
                     info.setdefault(iid, {"name": None, "quality": 1})["icon_url"] = ICON_URL % icon
         except Exception:  # item_tooltip may not exist yet
             pass

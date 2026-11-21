@@ -1,6 +1,6 @@
 // Market Report: one day at the auction house, summarised from AH Tool Logger full scans.
 import { api } from '../api.js';
-import { esc, money, moneyText, num, pct, isNum, itemName, qClass, ttAttr, dateLong, errorState, debounce } from '../util.js';
+import { esc, money, moneyText, num, pct, isNum, itemName, itemLink, qClass, ttAttr, dateLong, errorState, debounce, safeIconUrl } from '../util.js';
 import { noScans } from '../market.js';
 
 const FLAT = 0.005;
@@ -19,8 +19,15 @@ const dayHm = (ts) => {
 const goldOnly = (c) => (isNum(c) ? `${num(Math.round(c / 10000))}g` : '–');
 const plural = (n, one, many) => `${num(n)} ${n === 1 ? one : many}`;
 
+// Broken icons are removed (no inline onerror handler: the CSP forbids inline script).
+document.addEventListener('error', (e) => {
+  const t = e.target;
+  if (t && t.tagName === 'IMG' && t.closest && t.closest('.rp-ico')) t.remove();
+}, true);
+
 function icon(r, size = '') {
-  const img = r.icon_url ? `<img src="${esc(r.icon_url)}" alt="" loading="lazy" onerror="this.remove()">` : '';
+  const url = safeIconUrl(r.icon_url);
+  const img = url ? `<img src="${esc(url)}" alt="" loading="lazy">` : '';
   return `<span class="rp-ico ${size} ${qClass(r.quality)}" aria-hidden="true">${img}</span>`;
 }
 
@@ -152,11 +159,11 @@ function facts(rep) {
   }
   const s = rep.swing;
   if (s) {
-    out.push(`<div class="rp-fact"><div class="rp-fact-big">${icon(s, 'sm')}${num(s.ratio, 1)}×</div><p><a class="item ${qClass(s.quality)}" href="#/item/${s.item_id}" ${ttAttr(s.item_id)}>${esc(itemName(s.name, s.item_id))}</a> swung within the day: ${esc(moneyText(s.low))} at ${hm(s.low_ts)}, ${esc(moneyText(s.high))} at ${hm(s.high_ts)} (typical listing price).</p></div>`);
+    out.push(`<div class="rp-fact"><div class="rp-fact-big">${icon(s, 'sm')}${num(s.ratio, 1)}×</div><p>${itemLink(s.item_id, s.name, s.quality)} swung within the day: ${esc(moneyText(s.low))} at ${hm(s.low_ts)}, ${esc(moneyText(s.high))} at ${hm(s.high_ts)} (typical listing price).</p></div>`);
   }
   const d = rep.deal;
   if (d) {
-    out.push(`<div class="rp-fact"><div class="rp-fact-big">${icon(d, 'sm')}${pct(d.discount)}</div><p>under market for <a class="item ${qClass(d.quality)}" href="#/item/${d.item_id}" ${ttAttr(d.item_id)}>${esc(itemName(d.name, d.item_id))}</a>: ${esc(moneyText(d.price))} against ${esc(moneyText(d.baseline))} (14-day median). <a href="#/deals">More deals</a></p></div>`);
+    out.push(`<div class="rp-fact"><div class="rp-fact-big">${icon(d, 'sm')}${pct(d.discount)}</div><p>under market for ${itemLink(d.item_id, d.name, d.quality)}: ${esc(moneyText(d.price))} against ${esc(moneyText(d.baseline))} (14-day median). <a href="#/deals">More deals</a></p></div>`);
   }
   const st = rep.totals.sell_through;
   if (isNum(st)) {

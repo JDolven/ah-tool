@@ -2,7 +2,7 @@
 
 Local program that reads Auctionator SavedVariables, stores history in SQLite, serves a local web UI.
 **Python 3.12 stdlib only** (no pip installs). Frontend: vanilla HTML/CSS/JS + Chart.js from
-`https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js`. UI language: **English**.
+`web/vendor/chart.umd.js` (Chart.js 4.4.1, vendored). UI language: **English**.
 
 Root: the repository folder.
 

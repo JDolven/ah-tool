@@ -134,12 +134,12 @@ export function guideHtml(plan, meta) {
   const profit = isNum(t.net) && t.net < 0;
 
   const stepRows = rows.map((x) => {
-    if (x.ms) return `<tr class="ms"><td class="ck"></td><td class="skill">${x.ms.skill}</td><td colspan="3">⚑ ${esc(x.ms.text)}</td></tr>`;
+    if (x.ms) return `<tr class="ms"><td class="ck"></td><td class="skill">${esc(x.ms.skill)}</td><td colspan="3">⚑ ${esc(x.ms.text)}</td></tr>`;
     const s = x.step;
     const regs = (s.reagents || []).map((g) => `${n(g.count)}× ${item(g.item_id, g.name, g.quality)}`).join(', ');
     const made = s.num_created > 1 ? ` <span class="muted">(makes ${n(s.num_created)})</span>` : '';
     const buyRecipe = isNum(s.recipe_item) ? ' <span class="warn">(recipe must be bought)</span>' : '';
-    return `<tr><td class="ck"><i></i></td><td class="skill">${s.from}–${s.to}</td>
+    return `<tr><td class="ck"><i></i></td><td class="skill">${esc(s.from)}–${esc(s.to)}</td>
       <td><b>${n(s.crafts)}×</b> ${s.created_item_id ? item(s.created_item_id, stepName(s), s.created_quality) : esc(stepName(s))}${made}${buyRecipe}${regs ? `<div class="regs">each: ${regs}</div>` : ''}</td>
       <td class="r hide-sm">${gold(s.cost_total)}</td><td class="r">${isNum(s.net_total) ? (s.net_total < 0 ? `<span class="profit">+${gold(-s.net_total)}</span>` : gold(s.net_total)) : '–'}</td></tr>`;
   }).join('');
