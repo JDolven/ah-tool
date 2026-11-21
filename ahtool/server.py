@@ -1,6 +1,7 @@
 """HTTP server: JSON API + static files from web/."""
 import base64
 import hashlib
+import html as html_mod
 import json
 import mimetypes
 import os
@@ -131,17 +132,19 @@ def _sha256(b):
     return "'sha256-%s'" % base64.b64encode(hashlib.sha256(b).digest()).decode("ascii")
 
 
-def csp_for_html(html):
-    """Content-Security-Policy for a page: inline <script>s are allowed by hash, computed from the served HTML."""
+def csp_for_html(html, extra_origins=()):
+    """Content-Security-Policy for a page: inline <script>s are allowed by hash, computed from the served HTML.
+    extra_origins: script + connect origins of the optional page-statistics tracker (web version only)."""
     hashes = [_sha256(m.group(1)) for m in _INLINE_SCRIPT_RE.finditer(html)]
+    extra = list(extra_origins)
     handlers = ["'unsafe-hashes'"] + [_sha256(h.encode("utf-8")) for h in INLINE_HANDLERS] if INLINE_HANDLERS else []
     return "; ".join([
         "default-src 'self'",
-        " ".join(["script-src 'self'"] + hashes + handlers),
+        " ".join(["script-src 'self'"] + extra + hashes + handlers),
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
         "font-src 'self' https://fonts.gstatic.com",
         "img-src 'self' data: https://wow.zamimg.com",
-        "connect-src 'self'",
+        " ".join(["connect-src 'self'"] + extra),
         "object-src 'none'",
         "base-uri 'none'",
         "form-action 'self'",
@@ -337,8 +340,26 @@ class _HeaderCappedReader(io.BufferedReader):
         return line
 
 
+# Request threads get this much stack. musl (the Alpine image) gives threads only 128 kB, where deeply nested JSON
+# overflows the C stack - a segfault - before CPython can raise RecursionError (which the handlers turn into 400).
+# glibc and Windows already give threads several MB; this makes every platform behave the same.
+THREAD_STACK = 8 << 20
+
+
+def _ensure_thread_stack():
+    # threading.stack_size() is not a pure getter: without an argument it RESETS the size to the default (0). So
+    # always set, and put a larger value back if someone had chosen one.
+    try:
+        old = threading.stack_size(THREAD_STACK)
+        if old > THREAD_STACK:
+            threading.stack_size(old)
+    except (ValueError, RuntimeError):  # platform without adjustable thread stacks
+        pass
+
+
 def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR, web=False):
     """web=True: the shared web version (see webstate.py and sync.py) instead of the local app."""
+    _ensure_thread_stack()
     connect = connect or default_connect
     port = int(port if port is not None else cfg.get("port", 8642))
     web_root = os.path.normpath(web_dir)
@@ -347,6 +368,19 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
     # Web version behind a reverse proxy: the browser's Origin is the public address, which the proxy may not pass on
     # in Host/X-Forwarded-Host. AHTOOL_PUBLIC_URL (run_web.py puts it in cfg) names it.
     public_origin = parse_origin(cfg.get("public_url")) if web and cfg.get("public_url") else None
+    # Optional page statistics (Umami or compatible), web version only: AHTOOL_ANALYTICS_SCRIPT + _ID. Auto-track is
+    # off because the app routes by #hash, which the tracker neither sees nor keeps; app.js reports each page itself.
+    # The tracker's origin is added to script-src and connect-src (it posts to <origin>/api/send).
+    analytics_tag, analytics_origins = b"", ()
+    a_src, a_id = (cfg.get("analytics_script") or "").strip(), (cfg.get("analytics_id") or "").strip()
+    a_origin = parse_origin(a_src) if web and a_src and a_id else None
+    if a_origin and urlsplit(a_src).scheme == "https":
+        a_origin_str = "%s://%s" % (urlsplit(a_src).scheme, urlsplit(a_src).netloc.lower())
+        analytics_origins = (a_origin_str,)
+        domain = urlsplit(cfg.get("public_url") or "").hostname or ""
+        analytics_tag = ('<script defer src="%s" data-website-id="%s" data-auto-track="false"%s></script>\n' % (
+            html_mod.escape(a_src), html_mod.escape(a_id),
+            ' data-domains="%s"' % html_mod.escape(domain) if domain else "")).encode("utf-8")
     trust_hops = _trusted_hops(cfg.get("trust_proxy")) if web else 0
     # only these TCP peers' X-Forwarded-For is believed (AHTOOL_TRUSTED_PROXIES; unset: any peer's)
     trusted_nets = _trusted_proxies(cfg.get("trusted_proxies", os.environ.get("AHTOOL_TRUSTED_PROXIES"))) \
@@ -500,7 +534,9 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
             if ctype.startswith("text/html"):
                 if web and os.path.basename(full) == "index.html":
                     data = data.replace(b"<html ", b'<html data-mode="web" ', 1)
-                csp = csp_for_html(data)
+                    if analytics_tag:
+                        data = data.replace(b"</head>", analytics_tag + b"</head>", 1)
+                csp = csp_for_html(data, analytics_origins if web else ())
             self._send(200, data, ctype, {"Cache-Control": "no-store"}, csp=csp)
 
         # ------------------------------------------------------------ request framing / origin checks

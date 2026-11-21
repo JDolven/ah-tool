@@ -11,6 +11,8 @@ the environment:
   AHTOOL_MAX_PER_IP  concurrent connections/requests per client address (default 16)
   AHTOOL_MAX_SYNC_MB largest unpacked sync batch accepted (default 24)
   AHTOOL_HOST/PORT   listen address (default 0.0.0.0:8642)
+  AHTOOL_ANALYTICS_SCRIPT / AHTOOL_ANALYTICS_ID   optional Umami tracker (script URL + website id); only counted
+                     on the AHTOOL_PUBLIC_URL host
 """
 import os
 import sys
@@ -26,9 +28,14 @@ def main():
     cfg = dict(config.DEFAULTS, root=ROOT, db_path=db_path, web=True,
                sync_token=os.environ.get("AHTOOL_SYNC_TOKEN", "").strip(),
                public_url=os.environ.get("AHTOOL_PUBLIC_URL", "").strip(),
-               trust_proxy=os.environ.get("AHTOOL_TRUST_PROXY", "").strip())
+               trust_proxy=os.environ.get("AHTOOL_TRUST_PROXY", "").strip(),
+               analytics_script=os.environ.get("AHTOOL_ANALYTICS_SCRIPT", "").strip(),
+               analytics_id=os.environ.get("AHTOOL_ANALYTICS_ID", "").strip())
     if cfg["public_url"] and server.parse_origin(cfg["public_url"]) is None:
         print("AHTOOL_PUBLIC_URL must look like https://ah.example.net (got %r)." % cfg["public_url"])
+        return 2
+    if cfg["analytics_script"] and not cfg["analytics_script"].startswith("https://"):
+        print("AHTOOL_ANALYTICS_SCRIPT must be an https:// URL (got %r)." % cfg["analytics_script"])
         return 2
     if cfg["sync_token"] and len(cfg["sync_token"]) < 32:
         print("AHTOOL_SYNC_TOKEN is shorter than 32 characters - refusing to start with a guessable token.")

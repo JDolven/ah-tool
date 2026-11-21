@@ -54,6 +54,27 @@ if (WEB) {
 
 let routeToken = 0;
 
+// Page statistics (web version only, when the server added an Umami tracker with auto-track off). Hash routes are
+// reported as paths – #/deals -> /deals – since the tracker drops the #part. The deferred script may still be
+// loading on the first page, so wait for it briefly.
+function trackPage(path) {
+  if (!WEB) return;
+  const url = path === '/' ? '/' : `/${path.replace(/^\/+|\/+$/g, '')}`;
+  const send = (tries) => {
+    const u = window.umami;
+    if (u && typeof u.track === 'function') {
+      try {
+        u.track((p) => ({ ...p, url, title: document.title }));
+      } catch (e) {
+        /* statistics must never break the page */
+      }
+    } else if (tries > 0) {
+      setTimeout(() => send(tries - 1), 500);
+    }
+  };
+  send(10);
+}
+
 function parseHash() {
   let h = location.hash.replace(/^#/, '');
   if (!h) h = '/';
@@ -80,6 +101,7 @@ async function route() {
     return;
   }
   document.title = `${r.title} – AH Tool`;
+  trackPage(path);
   const params = path.match(r.re).slice(1);
   view.classList.remove('fade-in');
   void view.offsetWidth;
