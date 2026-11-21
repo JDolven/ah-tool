@@ -1,4 +1,4 @@
-import { api } from '../api.js';
+import { api, WEB } from '../api.js';
 import {
   esc, money, num, pct, itemLink, itemName, qClass, discountBar, relTime, tsFmt, debounce,
   errorState, skeletonRows, emptyState, isNum, dateLong, ttAttr,
@@ -13,7 +13,7 @@ export async function render(ctx) {
     <header class="page-head">
       <div>
         <h1>Watchlist &amp; Alerts</h1>
-        <p class="lead">Watch items and get an alert when the price drops to your limit. Alerts are checked after every import – also while this page is closed, as long as the tool is running.</p>
+        <p class="lead">Watch items and get an alert when the price drops to your limit. ${WEB ? 'Alerts are checked when new prices arrive, while this page is open in this browser.' : 'Alerts are checked after every import – also while this page is closed, as long as the tool is running.'}</p>
       </div>
     </header>
     <section class="card filters">
@@ -255,10 +255,12 @@ function renderSettings(box, s) {
   const bs = bn.state();
   box.innerHTML = `
     <div class="set-list">
-      <div class="set-row">
+      ${WEB ? `<div class="set-row">
+        <div class="set-text"><div class="set-title">Saved in this browser</div><div class="set-desc">Your watchlist, alerts and these settings are stored only in this browser, not on the server. Alerts are checked while this page is open, when new prices arrive.</div></div>
+      </div>` : `<div class="set-row">
         <div class="set-text"><div class="set-title">Windows notifications</div><div class="set-desc">A Windows toast when an alert fires after an import – even with the browser closed.</div></div>
         <label class="toggle"><input type="checkbox" data-set="notify_windows" ${s.notify_windows !== false ? 'checked' : ''} aria-label="Windows notifications"><span class="toggle-ui"></span></label>
-      </div>
+      </div>`}
       <div class="set-row">
         <div class="set-text"><div class="set-title">Browser notifications</div><div class="set-desc" id="bn-desc">${esc(bn.describe(bs))}</div></div>
         <button type="button" class="btn btn-sm" id="bn-btn" ${bs === 'unsupported' || bs === 'denied' ? 'disabled' : ''}>${bs === 'on' ? 'Turn off' : 'Enable'}</button>
@@ -329,6 +331,11 @@ function wireSettings(el, ctx) {
     if (test) {
       test.disabled = true;
       try {
+        if (WEB) {
+          if (!bn.test()) throw new Error('Enable browser notifications first.');
+          toast('<strong>Test notification shown</strong>', 'ok');
+          return;
+        }
         await api.notifyTest();
         const shown = bn.test();
         toast(`<strong>Test notification sent</strong> – check the Windows notification area${shown ? ' (and the browser notification)' : ''}.`, 'ok');

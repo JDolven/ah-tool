@@ -50,9 +50,18 @@ def main():
     conn.close()
     analytics.invalidate()
 
+    pusher = None
+    if cfg.get("sync_url") and cfg.get("sync_token"):
+        from ahtool import sync
+        pusher = sync.Pusher(cfg, lambda: db.connect(cfg["db_path"]))
+        print("Pushing market data to the web version at %s." % cfg["sync_url"])
+        pusher.trigger()
+
     def on_ingest(*_a, **_k):
         analytics.invalidate()
         print("New Auctionator data imported.")
+        if pusher:
+            pusher.trigger()
         try:
             c = db.connect()
             try:

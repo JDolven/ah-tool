@@ -134,6 +134,41 @@ shorter than the gap) it counts as *expired*, and if the same seller posted that
 Cancelled auctions look like sales, so the numbers are estimates – several scans a day give the best results.
 Raw auctions are kept for the newest `logger_keep_raw_scans` (6) scans; per-item summaries and sales are kept forever.
 
+## Web version (share prices with other players)
+
+The same app can run as a shared website (e.g. in Docker on a home server) that everyone can open in a browser.
+Your local AH Tool pushes the market data to it after every import; the website never reads WoW files itself.
+
+**What leaves your PC** – only market data: item/recipe/tooltip data, Auctionator prices and the AH Tool Logger full
+scans. **What never leaves it** – your posting history, AH mail (sales, purchases, buyers), your own auctions, your
+professions, shopping list, watchlist, alerts, settings and the paths in config.json. In the full scans the name of
+the scanning character is removed, and every auction or sale posted by one of *your* characters gets a blank seller,
+so nobody can tell which auctions are yours. Your characters are found from your scans, your own auctions and your
+AH mail; add alts the logger has never seen to `sync_hide_sellers`. `python -m ahtool.sync --dry-run` shows the
+batches it would send and which names it masks. What is pushed is decided by explicit column lists in
+`ahtool/sync.py`, so new local data stays local until someone adds it there on purpose.
+
+**Personal setup lives in each visitor's browser.** On the website, My Professions, known recipes, the shopping
+list, the watchlist, alert history and settings are stored in the browser (localStorage) and sent along with each
+request, so the server computes "craftable for you", leveling plans and alerts without storing anything about anyone.
+*My Professions → Export setup / Import setup* moves it to another browser. Alerts are checked while the page is
+open, when new prices arrive, and show as browser notifications. My Sales and My auctions do not exist on the website.
+
+**Run the server** (Docker): `docker build -t ahtool-web .` then
+`docker run -v /path/to/data:/data -e AHTOOL_SYNC_TOKEN=<random, 32+ chars> -p 8642:8642 ahtool-web`.
+Generate a token with `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+
+**Push from your PC**: add to config.json
+
+```json
+"sync_url": "https://ah.example.net",
+"sync_token": "<the same token>",
+"sync_hide_sellers": ["MyBankAlt"]
+```
+
+and restart `start.bat`. It pushes at start and a few seconds after each import (only what is new). By hand:
+`python -m ahtool.sync` (`--full` resends everything if the website ever drifts).
+
 ## License
 AH Tool (the app and the AH Tool Logger addon) is free software under the
 [GNU Affero General Public License v3.0](LICENSE). You may use, change and share it, but any copy or modified

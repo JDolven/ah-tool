@@ -18,8 +18,92 @@ export function clearCache() {
   cache.clear();
 }
 
+// ---------------------------------------------------------------- web version
+// The shared web version keeps nothing personal on the server: professions, known recipes, shopping list, watchlist,
+// settings and alerts live here in localStorage and are sent along with every call (POST /api/x). The server answers
+// with the new state after a change, and we store it. See ahtool/webstate.py.
+export const WEB = !MOCK && document.documentElement.dataset.mode === 'web';
+const STATE_KEY = 'ahtool-state-v1';
+
+export function loadState() {
+  try {
+    const s = JSON.parse(localStorage.getItem(STATE_KEY) || 'null');
+    return s && typeof s === 'object' ? s : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+export function saveState(s) {
+  try {
+    localStorage.setItem(STATE_KEY, JSON.stringify(s));
+  } catch (e) {
+    /* storage full or disabled: the change lasts until the page is closed */
+  }
+}
+
+/** Replace the whole saved setup (import). Validation happens on the server at the next call. */
+export function replaceState(s) {
+  const keep = loadState().eval;
+  saveState({ ...s, eval: keep });
+  clearCache();
+}
+
+/** A GET only changes state when it evaluated alerts (status poll). Merge just that, so a poll that was in flight
+ *  during a click never undoes the click. */
+function mergeAlerts(s) {
+  const cur = loadState();
+  cur.alerts = s.alerts;
+  cur.alertstate = s.alertstate;
+  cur.eval = s.eval;
+  for (const [id, w] of Object.entries(s.watch || {})) {
+    const c = cur.watch && cur.watch[id];
+    if (!c) continue;
+    for (const k of ['last_alert_price', 'last_alert_ts']) {
+      if (w[k] === undefined) delete c[k];
+      else c[k] = w[k];
+    }
+  }
+  saveState(cur);
+}
+
+let writeQueue = Promise.resolve();
+
+function tunnel(method, path, body) {
+  if (method === 'GET') return tunnelOnce(method, path, body);
+  // Writes run one at a time: each one must start from the state the previous one produced.
+  const run = writeQueue.then(() => tunnelOnce(method, path, body));
+  writeQueue = run.catch(() => {});
+  return run;
+}
+
+async function tunnelOnce(method, path, body) {
+  const res = await fetch('/api/x', {
+    method: 'POST',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ m: method, p: path, b: body === undefined ? null : body, s: loadState() }),
+  });
+  let data = null;
+  try {
+    data = await res.json();
+  } catch (e) {
+    data = null;
+  }
+  if (!res.ok) {
+    const err = new Error(data && data.error ? data.error : `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  if (data && data.s) {
+    if (method === 'GET') mergeAlerts(data.s);
+    else saveState(data.s);
+  }
+  return data ? data.r : null;
+}
+
 async function request(method, path, body) {
   if (MOCK) return mockCall(method, path, body);
+  if (WEB) return tunnel(method, path, body);
   const opts = { method, headers: { Accept: 'application/json' } };
   if (body !== undefined) {
     opts.headers['Content-Type'] = 'application/json';

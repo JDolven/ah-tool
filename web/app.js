@@ -1,5 +1,5 @@
 // AH Tool – single-page app entry (ES module).
-import { api, clearCache, MOCK } from './js/api.js';
+import { api, clearCache, MOCK, WEB } from './js/api.js';
 import { esc, money, pct, itemName, qClass, relTime, dateLong, debounce, isNum, ttAttr } from './js/util.js';
 import { installTooltips } from './js/tooltip.js';
 import { destroyAll, rerenderAll } from './js/charts.js';
@@ -38,6 +38,19 @@ const ROUTES = [
   { re: /^\/stats\/?$/, nav: 'stats', title: 'Statistics', fn: stats.render },
   { re: /^\/postings\/?$/, nav: 'postings', title: 'My auctions', fn: postings.render },
 ];
+
+// Web version: pages built on your own trades do not exist there (that data never leaves your PC).
+if (WEB) {
+  for (const nav of ['sales', 'postings']) {
+    document.querySelector(`.nav [data-nav="${nav}"]`)?.remove();
+    const i = ROUTES.findIndex((r) => r.nav === nav);
+    if (i >= 0) ROUTES.splice(i, 1);
+  }
+  const rb = document.getElementById('refresh-btn');
+  if (rb) rb.title = 'Reload the latest prices from the server';
+  const foot = document.querySelector('.foot');
+  if (foot) foot.insertAdjacentHTML('beforeend', ' · Your professions, lists and alerts are saved in this browser only');
+}
 
 let routeToken = 0;
 
@@ -261,7 +274,7 @@ function renderSideStatus(s) {
   el.innerHTML = `
     <div class="ss-realm"><span class="dot ${s.items_priced ? 'dot-ok' : 'dot-idle'}"></span>${esc(s.realm || 'No realm')}</div>
     <div class="ss-line">Scanned ${dateLong(s.latest_date)}</div>
-    <div class="ss-line muted">Imported ${relTime(s.last_ingest_ts)}</div>`;
+    <div class="ss-line muted">${WEB ? `Updated ${relTime(s.last_push_ts)}` : `Imported ${relTime(s.last_ingest_ts)}`}</div>`;
 }
 
 async function pollStatus(initial = false) {
@@ -286,6 +299,13 @@ refreshBtn.addEventListener('click', async () => {
   refreshBtn.disabled = true;
   refreshBtn.classList.add('busy');
   try {
+    if (WEB) {
+      clearCache();
+      await pollStatus();
+      toast('<strong>Reloaded</strong> – prices arrive from the AH Tool on a player\'s PC after each scan.', 'ok');
+      rerender();
+      return;
+    }
     const res = await api.ingest();
     clearCache();
     const s = await api.status(true).catch(() => null);

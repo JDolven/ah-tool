@@ -1,4 +1,6 @@
 """HTTP server: JSON API + static files from web/."""
+import gzip
+import hmac
 import json
 import mimetypes
 import os
@@ -10,7 +12,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import alerts as alerts_mod
-from . import analytics, market, notify, shopping, tooltip, userstate
+from . import analytics, market, notify, shopping, tooltip, userstate, webstate
+
+# Web version: endpoints that only make sense on the PC that runs WoW, or that would expose your own trades.
+WEB_BLOCKED = {
+    ("POST", "/api/ingest"), ("POST", "/api/notify/test"), ("POST", "/api/alerts/evaluate"),
+    ("GET", "/api/postings"), ("GET", "/api/market/my"),
+    ("HEAD", "/api/postings"), ("HEAD", "/api/market/my"),
+}
+MAX_BODY = 1 << 20          # normal API calls
+MAX_SYNC_BODY = 96 << 20    # one sync batch, gzip (Cloudflare refuses > 100 MB anyway)
+MAX_SYNC_JSON = 512 << 20   # the same batch unpacked
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(ROOT, "web")
@@ -64,7 +76,8 @@ def _leveling():
     return leveling
 
 
-def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR):
+def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR, web=False):
+    """web=True: the shared web version (see webstate.py and sync.py) instead of the local app."""
     connect = connect or default_connect
     port = int(port if port is not None else cfg.get("port", 8642))
     web_root = os.path.normpath(web_dir)
@@ -74,6 +87,8 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR)
         server_version = "AHTool"
 
         def log_message(self, fmt, *args):
+            if web and self.path == "/healthz":
+                return
             sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
         def _send(self, code, body, ctype, extra=None):
@@ -106,16 +121,33 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR)
                 ctype += "; charset=utf-8"
             with open(full, "rb") as f:
                 data = f.read()
+            if web and os.path.basename(full) == "index.html":
+                data = data.replace(b"<html ", b'<html data-mode="web" ', 1)
             self._send(200, data, ctype, {"Cache-Control": "no-store"})
 
-        def _read_body(self):
-            n = int(self.headers.get("Content-Length") or 0)
+        def _read_body(self, limit=None):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = -1
+            if n < 0 or (limit is not None and n > limit):
+                raise BadRequest("request body too large")
             return self.rfile.read(n) if n else b""
 
         def _handle(self, method):
-            raw = self._read_body() if method in ("POST", "PUT", "DELETE") else b""
             u = urlparse(self.path)
             path = u.path
+            if web and path.startswith("/api/sync/"):
+                return self._sync(method, path.rstrip("/"))
+            try:
+                raw = self._read_body(MAX_BODY if web else None) if method in ("POST", "PUT", "DELETE") else b""
+            except BadRequest as e:
+                self.close_connection = True
+                return self._json({"error": str(e)}, 413)
+            if web and path == "/healthz":
+                return self._json({"ok": True})
+            if web and path == "/api/x":
+                return self._tunnel(method, raw)
             if not path.startswith("/api/"):
                 if method not in ("GET", "HEAD"):
                     return self._json({"error": "method not allowed"}, 405)
@@ -124,6 +156,8 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR)
             conn = None
             try:
                 conn = connect()
+                if web:  # a direct call without the browser's state: an empty visitor
+                    webstate.install(conn, None)
                 self._json(self._route(method, path.rstrip("/"), qs, conn, raw))
             except NotImplementedYet as e:
                 self._json({"error": str(e)}, 501)
@@ -145,7 +179,111 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR)
                     except Exception:
                         pass
 
+        # ------------------------------------------------------------ web version
+
+        def _tunnel(self, method, raw):
+            """POST /api/x {m, p, b, s}: run API call `m p` with body `b` against the visitor's state `s`.
+            Answers {r: result, s: new state (only when it changed)}. State travels in the body because it can be
+            larger than a header may be."""
+            if method != "POST":
+                return self._json({"error": "method not allowed"}, 405)
+            try:
+                req = json.loads(raw.decode("utf-8"))
+                m, target = req["m"], req["p"]
+                if m not in ("GET", "POST", "PUT", "DELETE") or not isinstance(target, str):
+                    raise ValueError
+            except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+                return self._json({"error": "bad request"}, 400)
+            u = urlparse(target)
+            path = u.path.rstrip("/")
+            if not path.startswith("/api/") or path.startswith("/api/sync") or path == "/api/x":
+                return self._json({"error": "unknown endpoint"}, 404)
+            qs = {k: v[-1] for k, v in parse_qs(u.query).items()}
+            body = req.get("b")
+            braw = json.dumps(body).encode("utf-8") if body is not None else b""
+            conn = None
+            try:
+                conn = connect()
+                webstate.install(conn, req.get("s"))
+                changed = m != "GET"
+                result = self._route(m, path, qs, conn, braw)
+                if path == "/api/status":
+                    # Alerts are evaluated per browser, once per new batch of prices.
+                    st = req.get("s") if isinstance(req.get("s"), dict) else {}
+                    marker = webstate.data_marker(conn)
+                    if marker and st.get("eval") != marker:
+                        if st.get("eval") is not None:
+                            alerts_mod.evaluate(conn, cfg, notify_user=False)
+                            result["unseen_alerts"] = userstate.unseen_alerts(conn)
+                        changed = True
+                out = {"r": result}
+                if changed:
+                    out["s"] = webstate.export(conn)
+                    out["s"]["eval"] = webstate.data_marker(conn)
+                self._json(out)
+            except NotImplementedYet as e:
+                self._json({"error": str(e)}, 501)
+            except NotFound as e:
+                self._json({"error": str(e) or "not found"}, 404)
+            except (userstate.Invalid, BadRequest) as e:
+                self._json({"error": str(e)}, 400)
+            except KeyError as e:
+                self._json({"error": str(e.args[0]) if e.args else "not found"}, 404)
+            except Exception as e:  # noqa
+                traceback.print_exc()
+                self._json({"error": "%s: %s" % (type(e).__name__, e)}, 500)
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        def _sync(self, method, path):
+            """Push endpoints for the local app (sync.py). Bearer token from AHTOOL_SYNC_TOKEN."""
+            from . import sync
+            token = cfg.get("sync_token") or ""
+            given = (self.headers.get("Authorization") or "")
+            given = given[7:] if given.startswith("Bearer ") else ""
+            if not token:
+                self.close_connection = True
+                return self._json({"error": "sync is disabled (no AHTOOL_SYNC_TOKEN)"}, 403)
+            if not hmac.compare_digest(given.encode(), token.encode()):
+                self.close_connection = True
+                return self._json({"error": "wrong sync token"}, 401)
+            conn = None
+            try:
+                if method == "GET" and path == "/api/sync/state":
+                    conn = connect()
+                    return self._json(sync.remote_state(conn))
+                if method == "POST" and path == "/api/sync/push":
+                    raw = self._read_body(MAX_SYNC_BODY)
+                    if (self.headers.get("Content-Type") or "").startswith("application/gzip"):
+                        with gzip.GzipFile(fileobj=__import__("io").BytesIO(raw)) as g:
+                            raw = g.read(MAX_SYNC_JSON + 1)
+                        if len(raw) > MAX_SYNC_JSON:
+                            raise BadRequest("sync batch too large")
+                    payload = json.loads(raw.decode("utf-8"))
+                    conn = connect()
+                    res = sync.apply(conn, cfg, payload)
+                    analytics.invalidate()
+                    return self._json(res)
+                return self._json({"error": "unknown endpoint"}, 404)
+            except (BadRequest, sync.BadPayload, ValueError, OSError, EOFError) as e:
+                self.close_connection = True
+                return self._json({"error": "%s" % e}, 400)
+            except Exception as e:  # noqa
+                traceback.print_exc()
+                return self._json({"error": "%s: %s" % (type(e).__name__, e)}, 500)
+            finally:
+                if conn is not None:
+                    conn.close()
+
+        # ------------------------------------------------------------ routes
+
         def _route(self, method, path, qs, conn, raw=b""):
+            if web and (method, path) in WEB_BLOCKED:
+                raise NotFound("not available in the web version")
             realm = qs.get("realm") or None
             A = analytics
             body = None
@@ -252,7 +390,13 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR)
             if path == "/api/settings":
                 return userstate.get_settings(conn)
             if path == "/api/status":
-                return A.status(conn, cfg, realm)
+                st = A.status(conn, cfg, realm)
+                if web:
+                    st["web"] = True
+                    st["logger"] = dict(st.get("logger") or {}, installed=True)
+                    r = conn.execute("SELECT value FROM main.meta WHERE key='sync_push_ts'").fetchone()
+                    st["last_push_ts"] = int(r[0]) if r else None
+                return st
             if path == "/api/items/search":
                 try:
                     limit = int(qs.get("limit", 50))

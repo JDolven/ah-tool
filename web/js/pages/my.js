@@ -1,4 +1,4 @@
-import { api } from '../api.js';
+import { api, WEB, loadState, replaceState } from '../api.js';
 import {
   esc, money, num, skillRange, debounce, errorState, skeletonRows, emptyState, isNum, confBadge,
 } from '../util.js';
@@ -19,6 +19,14 @@ export async function render(ctx) {
         <p class="lead">Tell the tool what you can craft. Recipes count as craftable when your skill is at least the recipe's orange (trainer) level – override single recipes below if you have not learned them, or know a recipe from a drop.</p>
       </div>
     </header>
+    ${WEB ? `<section class="card">
+      <div class="card-head"><h2>Saved in this browser</h2></div>
+      <p class="card-note">Your professions, known recipes, shopping list and watchlist are stored only in this browser – nothing about you is kept on the server. Export them to move to another browser or PC, or to keep a backup.</p>
+      <div class="set-foot">
+        <button type="button" class="btn btn-sm" id="st-export">Export setup</button>
+        <label class="btn btn-sm">Import setup<input type="file" id="st-import" accept="application/json,.json" hidden></label>
+      </div>
+    </section>` : ''}
     <section class="card">
       <div class="card-head"><h2>Your professions</h2><span class="card-note" id="mp-saved" aria-live="polite"></span></div>
       <div id="mp-profs">${skeletonRows(4, 3)}</div>
@@ -45,6 +53,7 @@ export async function render(ctx) {
 
   let profs = [];
   let mine = new Map(); // profession_id -> skill
+  if (WEB) wireSetupTransfer(el);
 
   const craftTable = new DataTable(el.querySelector('#mc-table'), recipeColumns({ shop: true, showProf: true, noCraftTag: true, noSkill: true }), {
     sortKey: 'profit',
@@ -332,3 +341,33 @@ function knownColumns() {
   ];
 }
 
+
+// Web version: move the browser-stored setup between browsers as a JSON file.
+function wireSetupTransfer(el) {
+  el.querySelector('#st-export').addEventListener('click', () => {
+    const { eval: _e, alertstate: _a, ...s } = loadState();
+    const blob = new Blob([JSON.stringify({ ahtool_setup: 1, ...s }, null, 1)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `ahtool-setup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+  el.querySelector('#st-import').addEventListener('change', async (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    try {
+      const s = JSON.parse(await f.text());
+      if (!s || s.ahtool_setup !== 1) throw new Error('This is not an AH Tool setup file.');
+      delete s.ahtool_setup;
+      if (!confirm('Replace the setup in this browser with the imported one?')) return;
+      replaceState(s);
+      toast('<strong>Setup imported</strong>', 'ok');
+      location.reload();
+    } catch (err) {
+      toast(`<strong>Import failed</strong><br>${esc(err.message)}`, 'err');
+    } finally {
+      e.target.value = '';
+    }
+  });
+}

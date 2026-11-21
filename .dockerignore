@@ -1,0 +1,7 @@
+.git
+data
+config.json
+*.db
+*.db-*
+__pycache__
+addon

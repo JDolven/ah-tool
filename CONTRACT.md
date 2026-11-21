@@ -362,3 +362,22 @@ Auctionator only gives one min price per scan + daily max quantity, so outliers 
 - Sales come from scan pairs ending in the window, scaled to 24 h by the seconds those pairs cover. Prices: median of the
   per-scan median unit buyout per window (Auctionator daily price when the day before has no scans). Busy item = 10+
   listed in both periods; +-0.5 % = no change; a group needs 3+ busy items.
+
+---
+# v7: Web version (`run_web.py`, `ahtool/sync.py`, `ahtool/webstate.py`)
+- `server.make_server(..., web=True)`: index.html gets `data-mode="web"`; `/healthz`; blocked: POST ingest,
+  notify/test, alerts/evaluate, GET postings, market/my (404 "not available in the web version").
+- **Per-browser state:** `POST /api/x {m, p, b, s}` runs API call m/p with body b. `s` (localStorage `ahtool-state-v1`:
+  `{professions:{pid:skill}, known:{spell:0|1}, shopping:{spell:qty}, watch:{item:{max_price,enabled,note,created_at,
+  last_alert_price,last_alert_ts}}, settings:{}, alerts:[..], alertstate:{kind:item:{price,ts}}, eval}`) is loaded into
+  TEMP tables named like the real ones (also empty temp postings/my_mail/my_auctions and a temp copy of meta), so all
+  code runs unchanged and nothing is written to the shared DB. Answer `{r, s?}`: s after writes, and from
+  `/api/status` when `eval` != MAX(ingests.id) (then `alerts.evaluate(notify_user=False)` runs; first visit only sets
+  eval). Frontend: `api.WEB`, writes serialised, GET state merged (alerts only).
+- **Sync** (Bearer `AHTOOL_SYNC_TOKEN`, not reachable via /api/x): `GET /api/sync/state` -> `{protocol, static_hash,
+  last_push_ts, price_daily:{realm:{from_day,count_before}}, snapshots:{max_ts,count}, scans:[[realm,faction,ts,raw_kept,diffed]]}`;
+  `POST /api/sync/push` (gzip JSON, one atomic batch) with any of `cfg` (analysis keys only), `meta`, `static`
+  (all 6 tables, replace), `price_current` (replace per realm), `ingests` (replace), `snapshots{replace,rows}`,
+  `price_daily` (upsert), `scans:[{scan,items,auctions,sales}]` (scan ids mapped by realm/faction/ts),
+  `scan_updates:[{key,drop_raw?,sales?}]`. Count checks below the watermark trigger a full resend.
+- Local: config `sync_url`, `sync_token`, `sync_hide_sellers`; `run.py` pushes via `sync.Pusher` (8 s debounce).

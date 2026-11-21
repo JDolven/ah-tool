@@ -12,5 +12,8 @@
   "thin_high_factor": 2.0,
   "conf_min_days": 7,
   "conf_min_avg_qty": 5,
-  "trend_min_profit": 1000
+  "trend_min_profit": 1000,
+  "sync_url": "",
+  "sync_token": "",
+  "sync_hide_sellers": []
 }

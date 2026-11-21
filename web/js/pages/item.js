@@ -1,4 +1,4 @@
-import { api } from '../api.js';
+import { api, WEB } from '../api.js';
 import {
   esc, money, num, pct, pctRaw, itemName, qClass, QUALITY_NAMES, wowheadLink, dateLong, dateShort,
   tsFmt, discountBar, errorState, skeletonTiles, skeletonRows, emptyState, tile, isNum, itemLink,
@@ -99,10 +99,10 @@ export async function render(ctx) {
         <div class="card-head"><h2>Price changes</h2><span class="card-note">Recorded at each import</span></div>
         <div id="snaps"></div>
       </section>
-      <section class="card">
+      ${WEB ? '' : `<section class="card">
         <div class="card-head"><h2>My auctions</h2></div>
         <div id="my-posts"></div>
-      </section>
+      </section>`}
     </div>
 
     <section class="card card-flush" id="crafted-sec">
@@ -153,7 +153,7 @@ export async function render(ctx) {
 
   // My postings
   const posts = (it.postings || []).slice().sort((a, b) => b.ts - a.ts);
-  el.querySelector('#my-posts').innerHTML = posts.length
+  if (el.querySelector('#my-posts')) el.querySelector('#my-posts').innerHTML = posts.length
     ? `<div class="scroll-list"><table class="mini"><thead><tr><th>Posted</th><th class="r">Price</th><th class="r">Qty</th><th class="r">vs current</th></tr></thead><tbody>${posts
         .map((p) => {
           const d = isNum(cur.price) && cur.price > 0 && isNum(p.price) ? ((p.price - cur.price) / cur.price) * 100 : null;
