@@ -1,31 +1,39 @@
-"""Push market data from the local AH Tool to the web version, and receive it there.
+"""Push market data from local AH Tools to the shared web version, and receive it there.
 
-Only public market data leaves the PC. What is pushed is decided by the explicit column lists below, never by
+Several people can push to the same web version, each with their own key (see keys.py). Each pusher's data is
+merged, never replaces anyone else's.
+
+Only public market data leaves a PC. What is pushed is decided by the explicit column lists below, never by
 "everything except": a table or column that is added locally later stays local until it is listed here.
 
-Pushed:   item/recipe/tooltip data, Auctionator prices (price_daily, price_current, snapshots, ingests) and the
-          AH Tool Logger full scans (ah_scans, ah_scan_items, ah_auctions, ah_sales).
+Pushed:   item/recipe/tooltip data, Auctionator prices (price_daily, price_current, snapshots) and the AH Tool Logger
+          full scans (ah_scans, ah_scan_items, ah_auctions, ah_sales).
 Never:    postings (Auctionator posting history), my_mail, my_auctions, my_professions, known_recipes,
           shopping_list, watchlist, alerts, settings, paths from config.json.
-Masked:   ah_scans.char is blanked, and the seller name of every auction/sale posted by one of your own characters
-          is blanked (""), so the web version cannot tell which auctions are yours. Your characters are taken from
-          the scans you made, your own auctions and your AH mail, plus `sync_hide_sellers` in config.json for alts
-          the logger has never seen.
+Masked:   ah_scans.char is blanked, and the seller name of every auction/sale posted by one of the pusher's own
+          characters is blanked (""), so the web version cannot tell which auctions are whose. The characters are
+          taken from the scans, own auctions and AH mail on that PC, plus `sync_hide_sellers` in its config.json.
 
-The protocol is incremental: the client asks the server what it has (GET /api/sync/state) and sends only what is
-missing, in batches (POST /api/sync/push, gzip JSON). Run `python -m ahtool.sync` to push by hand, `--full` to
-resend everything.
+Merging (server): price_daily keeps the lowest low / highest high / highest available per realm+item+day,
+price_current keeps the newest observation per item, snapshots and scans are unique by key. Analysis settings and
+the static item/recipe data come only from the owner (AHTOOL_SYNC_TOKEN or an owner key); a contributor's static
+data is used only while the web version has none.
+
+Incremental: each PC remembers in its own DB what it has pushed to which web version (meta `sync:<url>`), tied to
+the web database's random `epoch`, so a reset web database gets everything again. `python -m ahtool.sync --full`
+resends everything.
 """
 import gzip
 import hashlib
 import json
+import os
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 
-PROTOCOL = 1
+PROTOCOL = 2
 MAX_BATCH_ROWS = 150000
 DAY_OVERLAP = 3  # days of price_daily that are always resent (Auctionator updates today and recent days)
 
@@ -42,16 +50,22 @@ STATIC_TABLES = {
 PRICE_DAILY = ("realm", "item_id", "day", "low", "high", "available")
 PRICE_CURRENT = ("realm", "item_id", "price", "available", "last_day", "updated_at")
 SNAPSHOTS = ("realm", "item_id", "ts", "price", "available")
-INGESTS = ("id", "ts", "file_mtime", "realm", "items", "changed")
 SCAN = ("ts", "realm", "faction", "source", "total", "n", "partial", "raw_kept", "diffed")
 SCAN_ITEMS = ("item_id", "auctions", "qty", "min_unit", "median_unit", "sellers")
 AUCTIONS = ("item_id", "suffix", "count", "buyout", "min_bid", "bid", "time_left", "owner")
 SALES = ("prev_ts", "item_id", "suffix", "count", "unit_price", "owner", "kind")
-META_KEYS = ("last_ingest_ts", "logger_ingest_ts", "tooltip_version")
-# Analysis settings that make the web version compute the same numbers as the local one. Never paths.
+META_MAX_KEYS = ("last_ingest_ts", "logger_ingest_ts")  # merged as the newest of all pushers
+# Analysis settings that make the web version compute the same numbers as the owner's app. Never paths.
 CFG_KEYS = ("ah_cut", "deal_threshold", "baseline_days", "outlier_mad_k", "outlier_min_rel", "thin_qty",
             "thin_high_factor", "conf_min_days", "conf_min_avg_qty", "trend_min_profit", "logger_keep_raw_scans",
             "logger_max_age_h")
+
+SERVER_SCHEMA = """
+CREATE UNIQUE INDEX IF NOT EXISTS ux_snapshots ON snapshots(realm, item_id, ts);
+CREATE TABLE IF NOT EXISTS sync_keys(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+    hash TEXT NOT NULL UNIQUE, role TEXT NOT NULL DEFAULT 'contributor', created_at INTEGER NOT NULL,
+    revoked_at INTEGER, last_push_ts INTEGER, pushes INTEGER NOT NULL DEFAULT 0);
+"""
 
 
 class SyncError(Exception):
@@ -71,7 +85,7 @@ def own_names(conn, cfg):
             pass
     extra = (cfg or {}).get("sync_hide_sellers") or []
     if isinstance(extra, str):
-        extra = [x for x in extra.split(",")]
+        extra = extra.split(",")
     names.update(extra)
     return {_base_name(n) for n in names if n and _base_name(n)}
 
@@ -99,45 +113,64 @@ def _rows(conn, sql, params=()):
     return [list(r) for r in conn.execute(sql, params)]
 
 
-def build_batches(conn, cfg, remote, full=False):
-    """-> list of payload dicts to POST, in order. `remote` is the server's /api/sync/state answer."""
+def _local_key(cfg):
+    return "sync:" + hashlib.sha1((cfg.get("sync_url") or "").rstrip("/").encode()).hexdigest()[:16]
+
+
+def local_state(conn, cfg):
+    r = conn.execute("SELECT value FROM meta WHERE key=?", (_local_key(cfg),)).fetchone()
+    try:
+        s = json.loads(r[0]) if r else {}
+    except ValueError:
+        s = {}
+    return s if isinstance(s, dict) else {}
+
+
+def save_local_state(conn, cfg, state):
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", (_local_key(cfg), json.dumps(state)))
+
+
+def build_batches(conn, cfg, remote, full=False, mine=None):
+    """-> (list of payload dicts to POST in order, the local sync state to save once all of them succeeded).
+
+    `remote` is the server's /api/sync/state answer, `mine` what this PC pushed before (local_state)."""
     own = own_names(conn, cfg)
-    head = {"protocol": PROTOCOL, "cfg": {k: cfg[k] for k in CFG_KEYS if k in (cfg or {})},
-            "meta": {k: v for k, v in conn.execute("SELECT key, value FROM meta") if k in META_KEYS}}
+    mine = dict(mine or {})
+    if full or mine.get("epoch") != remote.get("epoch"):
+        mine = {}
+    new_state = {"epoch": remote.get("epoch"), "daily": dict(mine.get("daily") or {}), "snap_ts": mine.get("snap_ts")}
+    meta = {k: v for k, v in conn.execute("SELECT key, value FROM meta") if k in META_MAX_KEYS}
+    head = {"protocol": PROTOCOL, "meta": meta}
+    if remote.get("accept_cfg"):
+        head["cfg"] = {k: cfg[k] for k in CFG_KEYS if k in (cfg or {})}
     batches = []
 
-    # --- static item/recipe data: all or nothing, only when it changed
-    sh = static_hash(conn)
-    if full or remote.get("static_hash") != sh:
-        batches.append({"static": {"hash": sh, "tables": {
-            t: _rows(conn, "SELECT %s FROM %s" % (",".join(cols), t)) for t, cols in STATIC_TABLES.items()}}})
+    # --- static item/recipe data: all or nothing, only when it changed and the server wants it from us
+    if remote.get("accept_static"):
+        sh = static_hash(conn)
+        if full or remote.get("static_hash") != sh:
+            batches.append({"static": {"hash": sh, "tables": {
+                t: _rows(conn, "SELECT %s FROM %s" % (",".join(cols), t)) for t, cols in STATIC_TABLES.items()}},
+                "meta": dict(meta, **{k: v for k, v in conn.execute(
+                    "SELECT key, value FROM meta WHERE key='tooltip_version'")})})
 
     # --- Auctionator prices
-    prices = {"price_current": {}, "ingests": _rows(conn, "SELECT %s FROM ingests ORDER BY id" % ",".join(INGESTS))}
-    for (realm,) in conn.execute("SELECT DISTINCT realm FROM price_current"):
-        prices["price_current"][realm] = _rows(
-            conn, "SELECT %s FROM price_current WHERE realm=?" % ",".join(PRICE_CURRENT), (realm,))
-    rs = remote.get("snapshots") or {}
-    since = rs.get("max_ts")
-    if not full and since is not None and conn.execute(
-            "SELECT COUNT(*) FROM snapshots WHERE ts<=?", (since,)).fetchone()[0] == rs.get("count"):
-        prices["snapshots"] = {"replace": False, "rows": _rows(
-            conn, "SELECT %s FROM snapshots WHERE ts>? ORDER BY ts" % ",".join(SNAPSHOTS), (since,))}
-    else:
-        prices["snapshots"] = {"replace": True, "rows": _rows(
-            conn, "SELECT %s FROM snapshots ORDER BY ts" % ",".join(SNAPSHOTS))}
+    prices = {"price_current": _rows(conn, "SELECT %s FROM price_current" % ",".join(PRICE_CURRENT))}
+    since = mine.get("snap_ts")
+    prices["snapshots"] = _rows(conn, "SELECT %s FROM snapshots WHERE ts>? ORDER BY ts" % ",".join(SNAPSHOTS),
+                                (since if since is not None else -1,))
+    if prices["snapshots"]:
+        new_state["snap_ts"] = prices["snapshots"][-1][2]
     batches.append(prices)
 
     daily = []
-    remote_days = remote.get("price_daily") or {}
-    for (realm,) in conn.execute("SELECT DISTINCT realm FROM price_daily"):
-        rd = remote_days.get(realm) or {}
-        wm = rd.get("from_day")
-        if full or wm is None or conn.execute("SELECT COUNT(*) FROM price_daily WHERE realm=? AND day<?",
-                                              (realm, wm)).fetchone()[0] != rd.get("count_before"):
-            wm = -10 ** 9
+    for realm, mx in conn.execute("SELECT realm, MAX(day) FROM price_daily GROUP BY realm").fetchall():
+        wm = (mine.get("daily") or {}).get(realm)
+        frm = wm - DAY_OVERLAP if isinstance(wm, int) else -10 ** 9
         daily.extend(_rows(conn, "SELECT %s FROM price_daily WHERE realm=? AND day>=? ORDER BY day, item_id"
-                           % ",".join(PRICE_DAILY), (realm, wm)))
+                           % ",".join(PRICE_DAILY), (realm, frm)))
+        new_state["daily"][realm] = mx
     for i in range(0, len(daily), MAX_BATCH_ROWS):
         batches.append({"price_daily": daily[i:i + MAX_BATCH_ROWS]})
 
@@ -191,13 +224,12 @@ def build_batches(conn, cfg, remote, full=False):
     batches[0] = dict(head, **batches[0])
     for b in batches[1:]:
         b["protocol"] = PROTOCOL
-    return batches
+    return batches, new_state
 
 
 def _request(cfg, method, path, payload=None, timeout=180):
     url = (cfg.get("sync_url") or "").rstrip("/") + path
     headers = {"Authorization": "Bearer %s" % cfg.get("sync_token", ""), "Accept": "application/json",
-               # a browser-like UA is not needed; a named one makes the requests easy to find in logs
                "User-Agent": "AHTool-sync/%d" % PROTOCOL}
     data = None
     if payload is not None:
@@ -206,7 +238,7 @@ def _request(cfg, method, path, payload=None, timeout=180):
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+            body = r.read()
     except urllib.error.HTTPError as e:
         body = e.read()[:300].decode("utf-8", "replace")
         try:
@@ -216,24 +248,30 @@ def _request(cfg, method, path, payload=None, timeout=180):
         raise SyncError("%s %s -> HTTP %d: %s" % (method, url, e.code, body))
     except (urllib.error.URLError, OSError) as e:
         raise SyncError("%s %s failed: %s" % (method, url, getattr(e, "reason", e)))
+    try:
+        return json.loads(body.decode("utf-8"))
+    except ValueError:
+        # typically a login page: the web version's host is behind a login that does not let the sync path through
+        raise SyncError("%s %s did not answer with JSON - is the site behind a login?" % (method, url))
 
 
-def push(conn, cfg, full=False, log=print):
-    """Bring the web version up to date. Returns a summary dict."""
+def push(conn, cfg, full=False):
+    """Bring the web version up to date with this PC's data. Returns a summary dict."""
     if not cfg.get("sync_url") or not cfg.get("sync_token"):
         raise SyncError("sync_url and sync_token must be set in config.json")
     t0 = time.time()
     remote = _request(cfg, "GET", "/api/sync/state")
     if remote.get("protocol") != PROTOCOL:
-        raise SyncError("the web version speaks sync protocol %s, this app %s - update both"
+        raise SyncError("the web version speaks sync protocol %s, this app %s - update the older one"
                         % (remote.get("protocol"), PROTOCOL))
-    batches = build_batches(conn, cfg, remote, full=full)
-    sent = {"batches": 0}
+    batches, new_state = build_batches(conn, cfg, remote, full=full, mine=local_state(conn, cfg))
+    sent = {"batches": 0, "as": remote.get("you")}
     for b in batches:
         res = _request(cfg, "POST", "/api/sync/push", b)
         sent["batches"] += 1
         for k, v in (res.get("applied") or {}).items():
-            sent[k] = sent.get(k, 0) + v
+            sent[k] = sent.get(k, 0) + v if isinstance(v, int) else v
+    save_local_state(conn, cfg, new_state)
     sent["seconds"] = round(time.time() - t0, 1)
     return sent
 
@@ -276,25 +314,33 @@ class Pusher:
 def _summary(res):
     keys = ("price_daily", "snapshots", "scans", "auctions", "static")
     parts = ["%s %s" % (res[k], k) for k in keys if res.get(k)]
-    return ", ".join(parts or ["already up to date"]) + " in %ss" % res.get("seconds")
+    if res.get("static_ignored"):
+        parts.append("item data kept from the owner")
+    who = " as %s" % res["as"] if res.get("as") else ""
+    return ", ".join(parts or ["already up to date"]) + "%s in %ss" % (who, res.get("seconds"))
 
 
 # ================================================================ server (web version)
 
-def remote_state(conn):
-    """What the server has, so the client can send only what is missing."""
-    meta = dict(conn.execute("SELECT key, value FROM main.meta WHERE key IN ('sync_static_hash','sync_push_ts')"))
-    daily = {}
-    for realm, mx in conn.execute("SELECT realm, MAX(day) FROM price_daily GROUP BY realm").fetchall():
-        frm = mx - DAY_OVERLAP
-        daily[realm] = {"from_day": frm, "count_before": conn.execute(
-            "SELECT COUNT(*) FROM price_daily WHERE realm=? AND day<?", (realm, frm)).fetchone()[0]}
-    mx, cnt = conn.execute("SELECT MAX(ts), COUNT(*) FROM snapshots").fetchone()
-    return {"protocol": PROTOCOL, "static_hash": meta.get("sync_static_hash"),
+def ensure_schema(conn):
+    conn.executescript(SERVER_SCHEMA)
+    if not conn.execute("SELECT 1 FROM main.meta WHERE key='sync_epoch'").fetchone():
+        with conn:
+            conn.execute("INSERT OR IGNORE INTO main.meta(key,value) VALUES('sync_epoch',?)", (os.urandom(8).hex(),))
+
+
+def remote_state(conn, source):
+    """What the server has, and what it accepts from this pusher."""
+    ensure_schema(conn)
+    meta = dict(conn.execute("SELECT key, value FROM main.meta WHERE key IN "
+                             "('sync_static_hash','sync_push_ts','sync_epoch')"))
+    has_static = bool(meta.get("sync_static_hash"))
+    return {"protocol": PROTOCOL, "epoch": meta.get("sync_epoch"), "you": source["name"],
+            "static_hash": meta.get("sync_static_hash"),
+            "accept_static": source["owner"] or not has_static, "accept_cfg": source["owner"],
             "last_push_ts": int(meta["sync_push_ts"]) if meta.get("sync_push_ts") else None,
-            "price_daily": daily, "snapshots": {"max_ts": mx, "count": cnt if mx is not None else 0},
             "scans": [list(r) for r in conn.execute(
-                "SELECT realm, faction, ts, raw_kept, diffed FROM ah_scans ORDER BY ts")]}
+                "SELECT realm, faction, ts, raw_kept, diffed FROM main.ah_scans ORDER BY ts")]}
 
 
 class BadPayload(ValueError):
@@ -319,16 +365,19 @@ def _ins(cur, table, cols, rows, verb="INSERT"):
                         rows)
 
 
-def apply(conn, cfg, payload):
-    """Apply one pushed batch atomically. `cfg` (the live server config) gets the pushed analysis settings."""
+def apply(conn, cfg, payload, source):
+    """Apply one pushed batch atomically, merged with what other pushers sent.
+
+    source: {"name", "owner": bool, "key_id": int|None}. `cfg` (the live server config) gets the owner's settings."""
     if not isinstance(payload, dict) or payload.get("protocol") != PROTOCOL:
-        raise BadPayload("unsupported sync protocol")
+        raise BadPayload("unsupported sync protocol - update the AH Tool on this PC")
+    ensure_schema(conn)
     applied = {}
     new_cfg = None
     cur = conn.cursor()
     cur.execute("BEGIN IMMEDIATE")
     try:
-        if "cfg" in payload:
+        if "cfg" in payload and source["owner"]:
             c = payload["cfg"]
             if not isinstance(c, dict):
                 raise BadPayload("cfg must be an object")
@@ -338,46 +387,75 @@ def apply(conn, cfg, payload):
             m = payload["meta"]
             if not isinstance(m, dict):
                 raise BadPayload("meta must be an object")
-            for k in META_KEYS:
-                if isinstance(m.get(k), (str, int)):
-                    cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES(?,?)", (k, str(m[k])))
+            for k in META_MAX_KEYS:
+                try:
+                    v = int(m[k])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                old = cur.execute("SELECT value FROM main.meta WHERE key=?", (k,)).fetchone()
+                if not old or not old[0].isdigit() or int(old[0]) < v:
+                    cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES(?,?)", (k, str(v)))
         st = payload.get("static")
         if st is not None:
             tables = (st or {}).get("tables")
             if not isinstance(tables, dict) or set(tables) != set(STATIC_TABLES):
                 raise BadPayload("static must contain exactly: %s" % ", ".join(STATIC_TABLES))
-            for t, cols in STATIC_TABLES.items():
-                rows = _fixed(tables[t], len(cols), t)
-                cur.execute("DELETE FROM main.%s" % t)
-                _ins(cur, t, cols, rows)
-            cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_static_hash',?)",
-                        (str(st.get("hash") or ""),))
-            applied["static"] = sum(len(v) for v in tables.values())
+            has = cur.execute("SELECT value FROM main.meta WHERE key='sync_static_hash'").fetchone()
+            if source["owner"] or not (has and has[0]):
+                for t, cols in STATIC_TABLES.items():
+                    rows = _fixed(tables[t], len(cols), t)
+                    cur.execute("DELETE FROM main.%s" % t)
+                    _ins(cur, t, cols, rows)
+                cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_static_hash',?)",
+                            (str(st.get("hash") or ""),))
+                tv = (payload.get("meta") or {}).get("tooltip_version")
+                if isinstance(tv, (str, int)):
+                    cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('tooltip_version',?)", (str(tv),))
+                applied["static"] = sum(len(v) for v in tables.values())
+            else:
+                applied["static_ignored"] = True
+
+        before = conn.total_changes
+        realms = {}
         if "price_current" in payload:
-            pc = payload["price_current"]
-            if not isinstance(pc, dict):
-                raise BadPayload("price_current must be {realm: rows}")
-            for realm, rows in pc.items():
-                rows = _fixed(rows, len(PRICE_CURRENT), "price_current")
-                if any(r[0] != realm for r in rows):
-                    raise BadPayload("price_current rows must belong to their realm")
-                cur.execute("DELETE FROM main.price_current WHERE realm=?", (realm,))
-                _ins(cur, "price_current", PRICE_CURRENT, rows)
-        if "ingests" in payload:
-            rows = _fixed(payload["ingests"], len(INGESTS), "ingests")
-            cur.execute("DELETE FROM main.ingests")
-            _ins(cur, "ingests", INGESTS, rows)
-        if "snapshots" in payload:
-            sn = payload["snapshots"]
-            rows = _fixed((sn or {}).get("rows"), len(SNAPSHOTS), "snapshots")
-            if sn.get("replace"):
-                cur.execute("DELETE FROM main.snapshots")
-            _ins(cur, "snapshots", SNAPSHOTS, rows)
-            applied["snapshots"] = len(rows)
+            rows = _fixed(payload["price_current"], len(PRICE_CURRENT), "price_current")
+            # newest observation wins; unchanged rows are not touched, so they do not count as new data
+            cur.executemany(
+                "INSERT INTO main.price_current(realm,item_id,price,available,last_day,updated_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(realm,item_id) DO UPDATE SET price=excluded.price, available=excluded.available, "
+                "last_day=excluded.last_day, updated_at=excluded.updated_at "
+                "WHERE (COALESCE(excluded.last_day,0), COALESCE(excluded.updated_at,0)) >= "
+                "(COALESCE(price_current.last_day,0), COALESCE(price_current.updated_at,0)) "
+                "AND (excluded.price IS NOT price_current.price OR excluded.available IS NOT price_current.available "
+                "OR excluded.last_day IS NOT price_current.last_day)", rows)
+            for r in rows:
+                realms[r[0]] = realms.get(r[0], 0) + 1
         if "price_daily" in payload:
             rows = _fixed(payload["price_daily"], len(PRICE_DAILY), "price_daily")
-            _ins(cur, "price_daily", PRICE_DAILY, rows, "INSERT OR REPLACE")
+            cur.executemany(
+                "INSERT INTO main.price_daily(realm,item_id,day,low,high,available) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(realm,item_id,day) DO UPDATE SET "
+                "low=MIN(COALESCE(price_daily.low,excluded.low), COALESCE(excluded.low,price_daily.low)), "
+                "high=MAX(COALESCE(price_daily.high,excluded.high), COALESCE(excluded.high,price_daily.high)), "
+                "available=MAX(COALESCE(price_daily.available,excluded.available), "
+                "COALESCE(excluded.available,price_daily.available)) "
+                "WHERE excluded.low < price_daily.low OR excluded.high > price_daily.high "
+                "OR excluded.available > price_daily.available OR price_daily.low IS NULL "
+                "OR price_daily.high IS NULL OR price_daily.available IS NULL", rows)
             applied["price_daily"] = len(rows)
+            for r in rows:
+                realms.setdefault(r[0], 0)
+        if "snapshots" in payload:
+            rows = _fixed(payload["snapshots"], len(SNAPSHOTS), "snapshots")
+            _ins(cur, "snapshots", SNAPSHOTS, rows, "INSERT OR IGNORE")
+            applied["snapshots"] = len(rows)
+        changed = conn.total_changes - before
+        if changed:
+            # One ingest row per push that changed prices: the analytics cache and the per-browser alert check
+            # key on MAX(ingests.id).
+            realm = max(realms, key=lambda k: realms[k]) if realms else None
+            cur.execute("INSERT INTO main.ingests(ts,file_mtime,realm,items,changed) VALUES(?,NULL,?,?,?)",
+                        (int(time.time()), realm, realms.get(realm, 0), changed))
 
         def scan_id(key):
             if not isinstance(key, list) or len(key) != 3:
@@ -394,7 +472,6 @@ def apply(conn, cfg, payload):
                 out.append((sid, prev, ts, iid, suffix, count, unit, owner or "", kind))
             cur.executemany("INSERT INTO main.ah_sales(scan_id,prev_scan_id,ts,item_id,suffix,count,unit_price,owner,"
                             "kind) VALUES(?,?,?,?,?,?,?,?,?)", out)
-            return len(out)
 
         for s in payload.get("scans") or []:
             row = _fixed([s.get("scan")], len(SCAN), "scan")[0] if isinstance(s, dict) else None
@@ -403,9 +480,9 @@ def apply(conn, cfg, payload):
             ts, realm, faction = row[0], row[1], row[2]
             if scan_id([realm, faction, ts]) is not None:
                 continue
-            # char is always blank here: the scanning character is one of yours
+            # char is always blank here: the scanning character belongs to the pusher
             cur.execute("INSERT INTO main.ah_scans(ts,realm,faction,char,source,total,n,partial,raw_kept,diffed) "
-                        "VALUES(?,?,?,'',?,?,?,?,?,?)", row[:3] + row[3:])
+                        "VALUES(?,?,?,'',?,?,?,?,?,?)", row)
             sid = cur.lastrowid
             items = _fixed(s.get("items") or [], len(SCAN_ITEMS), "scan items")
             cur.executemany("INSERT INTO main.ah_scan_items(scan_id,%s) VALUES(?,%s)"
@@ -429,14 +506,17 @@ def apply(conn, cfg, payload):
             if "sales" in u:
                 put_sales(sid, realm, faction, ts, u["sales"])
                 cur.execute("UPDATE main.ah_scans SET diffed=1 WHERE id=?", (sid,))
-        # Safety net independent of the client: never hold more raw auctions than the local app does.
+        # Never hold more raw auctions than the owner's app does, whoever pushed them.
         keep = int((new_cfg or cfg or {}).get("logger_keep_raw_scans") or 6)
         for realm, faction in cur.execute("SELECT DISTINCT realm, faction FROM main.ah_scans").fetchall():
             for (sid,) in cur.execute("SELECT id FROM main.ah_scans WHERE realm=? AND faction=? AND raw_kept=1 "
                                       "ORDER BY ts DESC LIMIT -1 OFFSET ?", (realm, faction, max(2, keep))).fetchall():
                 cur.execute("DELETE FROM main.ah_auctions WHERE scan_id=?", (sid,))
                 cur.execute("UPDATE main.ah_scans SET raw_kept=0 WHERE id=?", (sid,))
-        cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_push_ts',?)", (str(int(time.time())),))
+        now = int(time.time())
+        cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_push_ts',?)", (str(now),))
+        if source.get("key_id"):
+            cur.execute("UPDATE main.sync_keys SET last_push_ts=?, pushes=pushes+1 WHERE id=?", (now, source["key_id"]))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -447,7 +527,7 @@ def apply(conn, cfg, payload):
 
 
 def load_pushed_cfg(conn, cfg):
-    """Server start: reuse the analysis settings from the last push."""
+    """Server start: reuse the owner's analysis settings from the last push."""
     r = conn.execute("SELECT value FROM main.meta WHERE key='sync_cfg'").fetchone()
     if r:
         try:
@@ -456,7 +536,7 @@ def load_pushed_cfg(conn, cfg):
             pass
 
 
-# ================================================================ CLI
+# ================================================================ CLI (local app)
 
 def main(argv=None):
     import argparse
@@ -470,10 +550,13 @@ def main(argv=None):
     try:
         if a.dry_run:
             remote = _request(cfg, "GET", "/api/sync/state") if cfg.get("sync_url") else {}
-            for i, b in enumerate(build_batches(conn, cfg, remote, full=a.full)):
+            batches, _ = build_batches(conn, cfg, remote, full=a.full, mine=local_state(conn, cfg))
+            for i, b in enumerate(batches):
                 size = len(gzip.compress(json.dumps(b, separators=(",", ":")).encode()))
-                print("batch %d: %s, %.1f kB gzip" % (i + 1, ", ".join(k for k in b if k not in ("protocol",)),
+                print("batch %d: %s, %.1f kB gzip" % (i + 1, ", ".join(k for k in b if k != "protocol"),
                                                       size / 1024))
+            if remote.get("you"):
+                print("The web version knows this PC as: %s" % remote["you"])
             print("Your characters (masked as seller): %s" % (", ".join(sorted(own_names(conn, cfg))) or "none"))
             return 0
         print("Pushed: %s" % _summary(push(conn, cfg, full=a.full)))

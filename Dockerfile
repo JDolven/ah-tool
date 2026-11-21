@@ -13,6 +13,9 @@ COPY run_web.py ./
 RUN mkdir -p data && for t in tests/test_*.py; do python "$t" >/tmp/test.log 2>&1 || { tail -40 /tmp/test.log; exit 1; }; done \
     && rm -rf data tests /tmp/test.log && find / -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null; true
 
+# `docker exec ahtool ahkey create <name>` - sync keys for the people who push data (ahtool/keys.py)
+RUN printf '#!/bin/sh\ncd /app && exec python -m ahtool.keys "$@"\n' > /usr/local/bin/ahkey && chmod 755 /usr/local/bin/ahkey
+
 EXPOSE 8642
 VOLUME /data
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \

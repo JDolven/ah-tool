@@ -15,7 +15,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 import make_fixture_db  # noqa: E402
-from ahtool import analytics, db, market, server, sync  # noqa: E402
+from ahtool import analytics, db, keys, market, server, sync  # noqa: E402
 
 fails = []
 
@@ -105,7 +105,7 @@ check(code == 404, "sync is not reachable through the tunnel (%s)" % code)
 res = sync.push(lconn, lcfg)
 check(res.get("static") and res.get("price_daily") and res.get("scans") == 2, "first push %s" % res)
 w = sqlite3.connect(web_path)
-for t in ("items", "recipes", "recipe_reagents", "price_daily", "price_current", "snapshots", "ingests",
+for t in ("items", "recipes", "recipe_reagents", "price_daily", "price_current", "snapshots",
           "ah_scan_items", "item_tooltip"):
     a = lconn.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
     b = w.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
@@ -126,20 +126,24 @@ check("savedvariables" not in w.execute("SELECT value FROM meta WHERE key='sync_
       "no paths in pushed cfg")
 
 # ---------------------------------------------------------------- second push is incremental
-batches = sync.build_batches(lconn, lcfg, sync._request(lcfg, "GET", "/api/sync/state"))
+batches, _ = sync.build_batches(lconn, lcfg, sync._request(lcfg, "GET", "/api/sync/state"),
+                                mine=sync.local_state(lconn, lcfg))
 check(not any("static" in b for b in batches), "static not resent")
 check(not any(b.get("scans") for b in batches), "scans not resent")
 daily = sum(len(b.get("price_daily") or []) for b in batches)
 check(0 < daily < lconn.execute("SELECT COUNT(*) FROM price_daily").fetchone()[0], "only recent days resent (%d)" % daily)
+n_ing = w.execute("SELECT COUNT(*) FROM ingests").fetchone()[0]
 res = sync.push(lconn, lcfg)
-check(not res.get("scans") and not res.get("static"), "second push small %s" % res)
+check(not res.get("scans") and not res.get("static") and not res.get("snapshots"), "second push small %s" % res)
+check(w.execute("SELECT COUNT(*) FROM ingests").fetchone()[0] == n_ing, "unchanged prices -> no new ingest row")
 
-# drift is detected: remove old rows on the server -> full price_daily resend
-w.execute("DELETE FROM price_daily WHERE day < (SELECT MIN(day) + 2 FROM price_daily)")
+# a reset web database (new epoch) gets everything again
+w.execute("DELETE FROM price_daily")
+w.execute("UPDATE meta SET value='other' WHERE key='sync_epoch'")
 w.commit()
 res = sync.push(lconn, lcfg)
 check(w.execute("SELECT COUNT(*) FROM price_daily").fetchone()[0] ==
-      lconn.execute("SELECT COUNT(*) FROM price_daily").fetchone()[0], "drift repaired by count check")
+      lconn.execute("SELECT COUNT(*) FROM price_daily").fetchone()[0], "new epoch -> full resend")
 
 # raw pruned locally -> dropped on the server too
 lconn.execute("DELETE FROM ah_auctions WHERE scan_id=(SELECT MIN(id) FROM ah_scans)")
@@ -150,10 +154,10 @@ check(w.execute("SELECT COUNT(*) FROM ah_auctions a JOIN ah_scans s ON s.id=a.sc
       .fetchone()[0] == 0 and w.execute("SELECT SUM(raw_kept) FROM ah_scans").fetchone()[0] == 1, "raw prune synced")
 
 # bad payloads are refused atomically
-code, res, _ = call("POST", "/api/sync/push", raw=gzip.compress(b'{"protocol":1,"price_daily":[[1,2]]}'),
+code, res, _ = call("POST", "/api/sync/push", raw=gzip.compress(b'{"protocol":2,"price_daily":[[1,2]]}'),
                     headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/gzip"})
 check(code == 400, "malformed batch -> 400 (%s %s)" % (code, res))
-code, res, _ = call("POST", "/api/sync/push", raw=b'{"protocol":1,"static":{"tables":{"items":[]}}}',
+code, res, _ = call("POST", "/api/sync/push", raw=b'{"protocol":2,"static":{"tables":{"items":[]}}}',
                     headers={"Authorization": "Bearer " + TOKEN})
 check(code == 400, "partial static -> 400 (%s)" % code)
 
@@ -203,7 +207,7 @@ for t in ("my_professions", "watchlist", "settings", "shopping_list", "alerts"):
 check(w.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'alertstate:%'").fetchone()[0] == 0, "no alertstate shared")
 
 # new prices -> the next status poll evaluates this browser's alerts
-lconn.execute("INSERT INTO ingests(ts,file_mtime,realm,items,changed) VALUES(?,?,'PvP',1,1)", (now, now))
+lconn.execute("UPDATE price_current SET price=price-1, updated_at=updated_at+1 WHERE item_id=2453")
 lconn.commit()
 sync.push(lconn, lcfg)
 code, res = x("GET", "/api/status", None, st)
@@ -225,6 +229,81 @@ try:  # the server answers 413 without reading the body, so the client may see a
 except urllib.error.URLError:
     code = 413
 check(code == 413, "oversized call refused (%s)" % code)
+
+
+# ---------------------------------------------------------------- several pushers with their own keys
+kconn = db.connect(web_path)
+k_ola = keys.create(kconn, "Ola")
+k_own = keys.create(kconn, "Me on laptop", owner=True)
+try:
+    keys.create(kconn, "Ola")
+    check(False, "duplicate active key name refused")
+except ValueError:
+    check(True, "duplicate active key name refused")
+check(kconn.execute("SELECT COUNT(*) FROM sync_keys WHERE hash LIKE 'aht_%'").fetchone()[0] == 0
+      and k_ola not in str(kconn.execute("SELECT * FROM sync_keys").fetchall()), "only hashes of keys stored")
+
+# Ola's PC: other character, lower price on an existing day, an older current price, own trades + other items data
+ola_path = os.path.join(tmp, "ola.db")
+make_fixture_db.build(ola_path)
+oconn = db.connect(ola_path)
+day, low, high = oconn.execute("SELECT day, low, high FROM price_daily WHERE item_id=2453 ORDER BY day DESC LIMIT 1").fetchone()
+oconn.execute("UPDATE price_daily SET low=?, high=? WHERE item_id=2453 AND day=?", (low // 2, high * 2, day))
+oconn.execute("UPDATE price_current SET price=1, updated_at=updated_at-100000 WHERE item_id=2453")
+oconn.execute("UPDATE items SET name='Ola renamed it' WHERE id=2453")
+oconn.execute("INSERT INTO postings VALUES(2453, 1799990000, 12345, 7)")
+oconn.commit()
+olua = """AHToolLoggerDB = { ["v"] = 1, ["scans"] = { %s },
+["mail"] = { ["sold|Y|OlasBuyer|1|1|1"] = { ["t"] = %d, ["type"] = "sold", ["item"] = "Y", ["player"] = "OlasBuyer",
+     ["price"] = 1, ["count"] = 1, ["char"] = "Olachar" } } }""" % (
+    scan(now - 1800, [(2453, 0, 5, 4800, 4000, 0, 4, "Alice"), (2453, 0, 5, 4700, 4000, 0, 4, "Olachar"),
+                      (2453, 0, 5, 4600, 4000, 0, 4, "Me")], "Olachar"), now - 600)
+olp = os.path.join(tmp, "Ola.lua")
+with open(olp, "w", encoding="utf-8") as f:
+    f.write(olua)
+ocfg = {"logger_savedvariables": olp, "addons_dir": "", "deal_threshold": 0.9, "sync_url": BASE, "sync_token": k_ola}
+market.ingest(oconn, ocfg)
+cfg_before = w.execute("SELECT value FROM meta WHERE key='sync_cfg'").fetchone()[0]
+code, st_ola, _ = call("GET", "/api/sync/state", headers={"Authorization": "Bearer " + k_ola})
+check(code == 200 and st_ola["you"] == "Ola" and not st_ola["accept_static"] and not st_ola["accept_cfg"],
+      "contributor state %s" % {k: st_ola.get(k) for k in ("you", "accept_static", "accept_cfg")})
+res = sync.push(oconn, ocfg)
+check(res.get("scans") == 1 and not res.get("static"), "contributor push %s" % res)
+check(w.execute("SELECT value FROM meta WHERE key='sync_cfg'").fetchone()[0] == cfg_before
+      and wcfg.get("deal_threshold") == 0.3, "contributor cannot change analysis settings")
+check(w.execute("SELECT name FROM items WHERE id=2453").fetchone()[0] != "Ola renamed it",
+      "contributor cannot replace item data")
+lo, hi = w.execute("SELECT low, high FROM price_daily WHERE item_id=2453 AND day=?", (day,)).fetchone()
+check(lo == low // 2 and hi == high * 2, "daily prices merged: lowest low, highest high (%s %s)" % (lo, hi))
+check(w.execute("SELECT price FROM price_current WHERE item_id=2453").fetchone()[0] != 1,
+      "an older current price does not overwrite a newer one")
+check(w.execute("SELECT COUNT(*) FROM ah_scans").fetchone()[0] == 3, "Ola's scan added next to ours")
+owners = {r[0] for r in w.execute("SELECT owner FROM ah_auctions")}
+check("Olachar" not in owners and "Alice" in owners, "Ola's characters masked by Ola's PC %s" % owners)
+check("Me" in owners, "our name in Ola's scan is just another seller to Ola (expected) %s" % owners)
+dump = str([r for t in ("price_daily", "postings", "ah_sales", "ah_scans", "meta") for r in w.execute("SELECT * FROM %s" % t)])
+check("OlasBuyer" not in dump and "12345" not in dump, "Ola's own trades never arrive")
+check(kconn.execute("SELECT pushes, last_push_ts IS NOT NULL FROM sync_keys WHERE name='Ola'").fetchone() == (4, 1)
+      or kconn.execute("SELECT pushes FROM sync_keys WHERE name='Ola'").fetchone()[0] > 0, "key usage recorded")
+
+# owner key may send item data and settings
+code, st_me, _ = call("GET", "/api/sync/state", headers={"Authorization": "Bearer " + k_own})
+check(st_me["accept_static"] and st_me["accept_cfg"], "owner key accepted for static/cfg")
+
+# revoke -> refused on the next request
+check(keys.revoke(kconn, "Ola") == 1, "revoke by name")
+code, res, _ = call("GET", "/api/sync/state", headers={"Authorization": "Bearer " + k_ola})
+check(code == 401, "revoked key -> 401 (%s)" % code)
+try:
+    sync.push(oconn, ocfg)
+    check(False, "push with revoked key fails")
+except sync.SyncError as e:
+    check("401" in str(e), "push with revoked key fails: %s" % e)
+check(keys.revoke(kconn, "nobody") == 0, "revoking an unknown name does nothing")
+code, res, _ = call("GET", "/api/sync/state", headers={"Authorization": "Bearer aht_" + "x" * 43})
+check(code == 401, "made-up key -> 401")
+oconn.close()
+kconn.close()
 
 srv.shutdown()
 lconn.close()

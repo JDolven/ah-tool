@@ -3,7 +3,8 @@
 No config.json, no WoW folder, no watcher: the data arrives from the local app (ahtool/sync.py). Settings come from
 the environment:
   AHTOOL_DB          database path (default /data/ah.db)
-  AHTOOL_SYNC_TOKEN  shared secret the local app pushes with (sync is off without it)
+  AHTOOL_SYNC_TOKEN  the owner's push token (optional; more people get their own keys with `ahkey`)
+  AHTOOL_PUBLIC_URL  the site's address, printed by `ahkey create` for config.json
   AHTOOL_HOST/PORT   listen address (default 0.0.0.0:8642)
 """
 import os
@@ -23,14 +24,16 @@ def main():
         print("AHTOOL_SYNC_TOKEN is shorter than 32 characters - refusing to start with a guessable token.")
         return 2
     conn = db.connect(db_path)
+    sync.ensure_schema(conn)
     sync.load_pushed_cfg(conn, cfg)
+    n_keys = conn.execute("SELECT COUNT(*) FROM sync_keys WHERE revoked_at IS NULL").fetchone()[0]
     conn.close()
 
     host = os.environ.get("AHTOOL_HOST", "0.0.0.0")
     port = int(os.environ.get("AHTOOL_PORT", "8642"))
     srv = server.make_server(cfg, connect=lambda: db.connect(db_path), host=host, port=port, web=True)
-    print("AH Tool web version on http://%s:%d/ (sync %s)" % (host, port, "on" if cfg["sync_token"] else "OFF"),
-          flush=True)
+    print("AH Tool web version on http://%s:%d/ (owner token %s, %d active key(s) - manage with: ahkey)"
+          % (host, port, "set" if cfg["sync_token"] else "not set", n_keys), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

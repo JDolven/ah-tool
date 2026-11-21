@@ -155,8 +155,8 @@ request, so the server computes "craftable for you", leveling plans and alerts w
 open, when new prices arrive, and show as browser notifications. My Sales and My auctions do not exist on the website.
 
 **Run the server** (Docker): `docker build -t ahtool-web .` then
-`docker run -v /path/to/data:/data -e AHTOOL_SYNC_TOKEN=<random, 32+ chars> -p 8642:8642 ahtool-web`.
-Generate a token with `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+`docker run -v /path/to/data:/data -e AHTOOL_SYNC_TOKEN=<random, 32+ chars> -e AHTOOL_PUBLIC_URL=https://ah.example.net -p 8642:8642 ahtool-web`.
+Generate a token with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. That token is the owner's.
 
 **Push from your PC**: add to config.json
 
@@ -167,7 +167,23 @@ Generate a token with `python -c "import secrets; print(secrets.token_urlsafe(32
 ```
 
 and restart `start.bat`. It pushes at start and a few seconds after each import (only what is new). By hand:
-`python -m ahtool.sync` (`--full` resends everything if the website ever drifts).
+`python -m ahtool.sync` (`--full` resends everything).
+
+**More people pushing** – give everyone who runs the local AH Tool their own key, made on the server:
+
+```
+docker exec ahtool ahkey create "Ola"       # prints the key once + the config.json lines to send Ola
+docker exec ahtool ahkey list               # who, last push, number of pushes
+docker exec ahtool ahkey revoke "Ola"       # refused from the next request
+```
+
+Only a hash of each key is stored, so a lost key is replaced, not recovered. Everyone's data is merged: daily
+prices keep the lowest low and the highest high, the current price keeps the newest observation, and scans are added
+side by side. Each PC masks its own characters and never sends its own trades, exactly as above. Analysis settings
+and the item/recipe data come only from the owner (the token, or a key made with `--owner`), so differing addon
+versions on other PCs cannot flip them back and forth. Note that one player's characters are ordinary sellers in
+another player's scans, just as in game; ask them to list each other in `sync_hide_sellers` if that matters. When
+several people scan the same hours, Market Activity counts the sales each of them estimated, so totals run high.
 
 ## License
 AH Tool (the app and the AH Tool Logger addon) is free software under the

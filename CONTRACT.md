@@ -374,10 +374,14 @@ Auctionator only gives one min price per scan + daily max quantity, so outliers 
   code runs unchanged and nothing is written to the shared DB. Answer `{r, s?}`: s after writes, and from
   `/api/status` when `eval` != MAX(ingests.id) (then `alerts.evaluate(notify_user=False)` runs; first visit only sets
   eval). Frontend: `api.WEB`, writes serialised, GET state merged (alerts only).
-- **Sync** (Bearer `AHTOOL_SYNC_TOKEN`, not reachable via /api/x): `GET /api/sync/state` -> `{protocol, static_hash,
-  last_push_ts, price_daily:{realm:{from_day,count_before}}, snapshots:{max_ts,count}, scans:[[realm,faction,ts,raw_kept,diffed]]}`;
-  `POST /api/sync/push` (gzip JSON, one atomic batch) with any of `cfg` (analysis keys only), `meta`, `static`
-  (all 6 tables, replace), `price_current` (replace per realm), `ingests` (replace), `snapshots{replace,rows}`,
-  `price_daily` (upsert), `scans:[{scan,items,auctions,sales}]` (scan ids mapped by realm/faction/ts),
-  `scan_updates:[{key,drop_raw?,sales?}]`. Count checks below the watermark trigger a full resend.
+- **Sync, protocol 2** (Bearer `AHTOOL_SYNC_TOKEN` = owner, or a key from `ahtool/keys.py` / `ahkey` in the image:
+  table `sync_keys(id,name,hash sha256,role owner|contributor,created_at,revoked_at,last_push_ts,pushes)`; not reachable
+  via /api/x). `GET /api/sync/state` -> `{protocol, epoch, you, static_hash, accept_static, accept_cfg, last_push_ts,
+  scans:[[realm,faction,ts,raw_kept,diffed]]}`. `POST /api/sync/push` (gzip JSON, one atomic batch) with any of `cfg`
+  and `static` (owner only; a contributor's static only while the server has none), `meta` (max of last_ingest_ts,
+  logger_ingest_ts), `price_current` (upsert, newest (last_day, updated_at) wins), `price_daily` (upsert: min low, max
+  high, max available), `snapshots` (insert or ignore, unique realm/item/ts), `scans:[{scan,items,auctions,sales}]`
+  (scan ids mapped by realm/faction/ts), `scan_updates:[{key,drop_raw?,sales?}]`. A push that changes prices adds one
+  server-side `ingests` row (cache + alert marker). Clients keep their own watermarks in local meta `sync:<sha1(url)>`
+  = `{epoch, daily:{realm:max_day}, snap_ts}`; another epoch (reset server DB) or `--full` -> send everything.
 - Local: config `sync_url`, `sync_token`, `sync_hide_sellers`; `run.py` pushes via `sync.Pusher` (8 s debounce).

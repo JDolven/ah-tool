@@ -1,6 +1,5 @@
 """HTTP server: JSON API + static files from web/."""
 import gzip
-import hmac
 import json
 import mimetypes
 import os
@@ -240,22 +239,19 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                         pass
 
         def _sync(self, method, path):
-            """Push endpoints for the local app (sync.py). Bearer token from AHTOOL_SYNC_TOKEN."""
-            from . import sync
-            token = cfg.get("sync_token") or ""
+            """Push endpoints for the local apps (sync.py). Bearer: AHTOOL_SYNC_TOKEN or a key from keys.py."""
+            from . import keys, sync
             given = (self.headers.get("Authorization") or "")
-            given = given[7:] if given.startswith("Bearer ") else ""
-            if not token:
-                self.close_connection = True
-                return self._json({"error": "sync is disabled (no AHTOOL_SYNC_TOKEN)"}, 403)
-            if not hmac.compare_digest(given.encode(), token.encode()):
-                self.close_connection = True
-                return self._json({"error": "wrong sync token"}, 401)
+            given = given[7:].strip() if given.startswith("Bearer ") else ""
             conn = None
             try:
+                conn = connect()
+                source = keys.authenticate(conn, cfg, given)
+                if source is None:
+                    self.close_connection = True
+                    return self._json({"error": "unknown or revoked sync key"}, 401)
                 if method == "GET" and path == "/api/sync/state":
-                    conn = connect()
-                    return self._json(sync.remote_state(conn))
+                    return self._json(sync.remote_state(conn, source))
                 if method == "POST" and path == "/api/sync/push":
                     raw = self._read_body(MAX_SYNC_BODY)
                     if (self.headers.get("Content-Type") or "").startswith("application/gzip"):
@@ -264,8 +260,7 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                         if len(raw) > MAX_SYNC_JSON:
                             raise BadRequest("sync batch too large")
                     payload = json.loads(raw.decode("utf-8"))
-                    conn = connect()
-                    res = sync.apply(conn, cfg, payload)
+                    res = sync.apply(conn, cfg, payload, source)
                     analytics.invalidate()
                     return self._json(res)
                 return self._json({"error": "unknown endpoint"}, 404)
