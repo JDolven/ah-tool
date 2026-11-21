@@ -184,6 +184,7 @@ none.
 docker exec ahtool ahkey create "Ola"       # prints the key once + the config.json lines to send Ola
 docker exec ahtool ahkey list               # who, last push, number of pushes
 docker exec ahtool ahkey revoke "Ola"       # refused from the next request
+docker exec ahtool ahkey purge "Ola"        # delete every price and scan row Ola's key pushed
 ```
 
 Only a hash of each key is stored, so a lost key is replaced, not recovered. Everyone's data is merged: daily
@@ -193,6 +194,14 @@ and the item/recipe data come only from the owner (the token, or a key made with
 versions on other PCs cannot flip them back and forth. Note that one player's characters are ordinary sellers in
 another player's scans, just as in game; ask them to list each other in `sync_hide_sellers` if that matters. When
 several people scan the same hours, Market Activity counts the sales each of them estimated, so totals run high.
+
+The website checks every pushed row (and each PC every pulled one): numbers must be numbers in a sane range, text
+short, and nothing may be dated in the future (more than 5 minutes ahead), so keep the PC clock right. A batch with one
+bad row is refused as a whole. The site remembers which key pushed each scan and price row: only that key (or the
+owner) can later change a scan, and if someone sends bad prices, `ahkey revoke` + `ahkey purge` removes them (rows
+pushed before this was added are not tracked; PCs that already pulled them keep their copy). The website's default
+realm follows the owner's pushes. `sync_url` must be `https://` (plain `http://` only for localhost), and the app
+never follows a redirect with your key.
 
 ## License
 AH Tool (the app and the AH Tool Logger addon) is free software under the

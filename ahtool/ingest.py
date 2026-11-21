@@ -144,7 +144,7 @@ def _ingest(conn, cfg, force=False):
                 "INSERT INTO price_current(realm,item_id,price,available,last_day,updated_at) VALUES(?,?,?,?,?,?) "
                 "ON CONFLICT(realm,item_id) DO UPDATE SET price=excluded.price, available=excluded.available, "
                 "last_day=excluded.last_day, updated_at=excluded.updated_at", current)
-            cur.executemany("INSERT INTO snapshots VALUES(?,?,?,?,?)", snaps)
+            cur.executemany("INSERT INTO snapshots(realm,item_id,ts,price,available) VALUES(?,?,?,?,?)", snaps)
             cur.execute("INSERT INTO ingests(ts,file_mtime,realm,items,changed) VALUES(?,?,?,?,?)",
                         (now, mtime, realm, len(items), len(snaps)))
             realm_summaries.append({"realm": realm, "items": len(items), "changed": len(snaps)})

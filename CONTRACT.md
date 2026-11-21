@@ -378,11 +378,27 @@ Auctionator only gives one min price per scan + daily max quantity, so outliers 
   table `sync_keys(id,name,hash sha256,role owner|contributor,created_at,revoked_at,last_push_ts,pushes)`; not reachable
   via /api/x). `GET /api/sync/state` -> `{protocol, epoch, you, static_hash, accept_static, accept_cfg, last_push_ts,
   scans:[[realm,faction,ts,raw_kept,diffed]]}`. `POST /api/sync/push` (gzip JSON, one atomic batch) with any of `cfg`
-  and `static` (owner only; a contributor's static only while the server has none), `meta` (max of last_ingest_ts,
-  logger_ingest_ts), `price_current` (upsert, newest (last_day, updated_at) wins), `price_daily` (upsert: min low, max
+  and `static` (owner only, also on an empty server; `hash` must be a sha256 hex, tooltip `icon` must match
+  `^[A-Za-z0-9_-]+$` or is stored NULL), `meta` (max of last_ingest_ts, logger_ingest_ts, clamped to now), `price_current` (upsert, newest (last_day, updated_at) wins), `price_daily` (upsert: min low, max
   high, max available), `snapshots` (insert or ignore, unique realm/item/ts), `scans:[{scan,items,auctions,sales}]`
   (scan ids mapped by realm/faction/ts), `scan_updates:[{key,drop_raw?,sales?}]`. A push that changes prices adds one
-  server-side `ingests` row (cache + alert marker). Clients keep their own watermarks in local meta `sync:<sha1(url)>`
+  server-side `ingests` row (cache + alert marker); an owner push also sets meta `sync_owner_realm`.
+  **Validation** (`sync.SPEC`, server `apply` and client `apply_pull`): every row column by column - ints are real ints
+  (no bool/float/str/NaN) in range (ids 1..2^31-1, prices 1..1e11 in price tables / 0..1e11 in scans, auction and sale
+  count >= 1), text <= 64 chars (realm 1..64), days <= today+1, timestamps 2001..now+5 min (pull: +1 h). One bad row
+  -> the whole batch 400 (`BadPayload`; pull: `SyncError`, nothing of the page stored). At most `SERVER_MAX_ROWS`
+  (2x MAX_BATCH_ROWS) rows per batch, static excluded. A stored price_current row dated in the future is always
+  replaced. The client leaves out local rows that would be refused and splits price_current/snapshots/scan_updates
+  into MAX_BATCH_ROWS batches. **Ownership:** server-only nullable column `src_key` on price_daily, price_current,
+  snapshots, ah_scans = the key id that pushed / last changed the row (0 = AHTOOL_SYNC_TOKEN, NULL = before this
+  column existed). `scan_updates` only apply to scans with the pusher's own src_key (owners: any); others count as
+  `applied.scan_updates_refused`. `ahkey purge <name|id>` (`keys.purge` -> `sync.purge_key`) deletes the key's rows
+  (scans with their items/auctions/sales) and adds an `ingests` row; PCs that already pulled them keep them.
+  **Default realm (web):** `analytics.get_realm` uses meta `sync_owner_realm`, else the realm with the most
+  price_current rows, never the newest ingest row (local app: unchanged). `apply_pull` writes its ingest row with the
+  PC's current realm, so pulled data never switches the local default realm.
+  **Client transport:** sync_url must be https (http only for localhost/127.0.0.1/::1), redirects are never followed
+  (the key would go along), answers are capped at 256 MB, at most 300 pull pages per run. Clients keep their own watermarks in local meta `sync:<sha1(url)>`
   = `{epoch, daily:{realm:max_day}, snap_ts}`; another epoch (reset server DB) or `--full` -> send everything.
 - **Pull:** server-only column `seq` on price_daily, price_current, ah_scans = the push (meta `sync_seq`) that last
   changed the row. `GET /api/sync/pull?cursor={pd:[seq,rowid],pc:[seq,rowid],sn:rowid,sc:[seq,id]}` -> `{protocol,

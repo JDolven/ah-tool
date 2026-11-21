@@ -72,9 +72,28 @@ def invalidate():
         _cache.clear()
 
 
+def _web_default_realm(conn):
+    """Web version (a database that receives sync pushes): the realm the owner pushed last, else the realm with the
+    most current prices. Never the newest ingest row: every contributor's push writes one. None in the local app."""
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM main.meta WHERE key IN ('sync_epoch','sync_owner_realm')"))
+    except Exception:  # noqa - no meta table yet
+        return None
+    if "sync_epoch" not in meta:
+        return None
+    if meta.get("sync_owner_realm"):
+        return meta["sync_owner_realm"]
+    r = conn.execute("SELECT realm, COUNT(*) AS n FROM price_current GROUP BY realm ORDER BY n DESC, realm "
+                     "LIMIT 1").fetchone()
+    return r[0] if r else None
+
+
 def get_realm(conn, realm=None):
     if realm:
         return realm
+    r = _web_default_realm(conn)
+    if r:
+        return r
     r = conn.execute("SELECT realm FROM ingests ORDER BY id DESC LIMIT 1").fetchone()
     if r and r[0]:
         return r[0]
