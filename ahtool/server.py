@@ -252,6 +252,13 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                     return self._json({"error": "unknown or revoked sync key"}, 401)
                 if method == "GET" and path == "/api/sync/state":
                     return self._json(sync.remote_state(conn, source))
+                if method == "GET" and path == "/api/sync/pull":
+                    qs = {k: v[-1] for k, v in parse_qs(urlparse(self.path).query).items()}
+                    try:
+                        cursor = json.loads(qs.get("cursor") or "{}")
+                    except ValueError:
+                        raise BadRequest("cursor must be JSON")
+                    return self._json(sync.pull_page(conn, cursor, qs.get("limit") or sync.PULL_LIMIT))
                 if method == "POST" and path == "/api/sync/push":
                     raw = self._read_body(MAX_SYNC_BODY)
                     if (self.headers.get("Content-Type") or "").startswith("application/gzip"):

@@ -22,6 +22,11 @@ data is used only while the web version has none.
 Incremental: each PC remembers in its own DB what it has pushed to which web version (meta `sync:<url>`), tied to
 the web database's random `epoch`, so a reset web database gets everything again. `python -m ahtool.sync --full`
 resends everything.
+
+Two-way: every PC also pulls what the others pushed (GET /api/sync/pull). The server stamps every row a push changes
+with that push's sequence number (`seq`), and each PC remembers the last one it has (meta `pull:<url>`), so only new
+rows travel. Pulled prices are merged with the same rules as on the server; pulled scans are stored with
+source='web', are never pushed back, and are never diffed against your own scans (their sales come with them).
 """
 import gzip
 import hashlib
@@ -31,7 +36,10 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+
+from .ingest import MERGE_DAILY
 
 PROTOCOL = 2
 MAX_BATCH_ROWS = 150000
@@ -60,8 +68,12 @@ CFG_KEYS = ("ah_cut", "deal_threshold", "baseline_days", "outlier_mad_k", "outli
             "thin_high_factor", "conf_min_days", "conf_min_avg_qty", "trend_min_profit", "logger_keep_raw_scans",
             "logger_max_age_h")
 
+SEQ_TABLES = ("price_daily", "price_current", "ah_scans")
 SERVER_SCHEMA = """
 CREATE UNIQUE INDEX IF NOT EXISTS ux_snapshots ON snapshots(realm, item_id, ts);
+CREATE INDEX IF NOT EXISTS ix_price_daily_seq ON price_daily(seq);
+CREATE INDEX IF NOT EXISTS ix_price_current_seq ON price_current(seq);
+CREATE INDEX IF NOT EXISTS ix_ah_scans_seq ON ah_scans(seq);
 CREATE TABLE IF NOT EXISTS sync_keys(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
     hash TEXT NOT NULL UNIQUE, role TEXT NOT NULL DEFAULT 'contributor', created_at INTEGER NOT NULL,
     revoked_at INTEGER, last_push_ts INTEGER, pushes INTEGER NOT NULL DEFAULT 0);
@@ -176,7 +188,9 @@ def build_batches(conn, cfg, remote, full=False, mine=None):
 
     # --- AH Tool Logger scans
     have = {(r[0], r[1], r[2]): (r[3], r[4]) for r in remote.get("scans") or []}
-    scans = conn.execute("SELECT id, %s FROM ah_scans ORDER BY ts" % ",".join(SCAN)).fetchall()
+    # only your own scans: pulled ones (source 'web') came from the server and belong to whoever scanned them
+    scans = conn.execute("SELECT id, %s FROM ah_scans WHERE COALESCE(source,'')<>'web' ORDER BY ts"
+                         % ",".join(SCAN)).fetchall()
     key_of = {s[0]: (s[2], s[3], s[1]) for s in scans}  # id -> (realm, faction, ts)
 
     def sales_for(sid):
@@ -276,39 +290,72 @@ def push(conn, cfg, full=False):
     return sent
 
 
-class Pusher:
-    """Background pusher for run.py: debounces triggers (Auctionator and the logger usually change together on
-    /reload) and never runs two pushes at once. Failures are printed and retried on the next trigger."""
+class Syncer:
+    """Background sync for run.py.
 
-    def __init__(self, cfg, connect, delay=8.0, log=print):
-        self.cfg, self.connect, self.delay, self.log = cfg, connect, delay, log
+    trigger(): push soon (debounced: Auctionator and the logger usually change together on /reload), then pull.
+    Every `sync_pull_minutes` (default 5, 0 = never) it pulls what other players pushed. Never two at once; failures
+    are printed and retried next time. on_pulled(result) is called when a pull changed local data."""
+
+    def __init__(self, cfg, connect, on_pulled=None, delay=8.0, log=print):
+        self.cfg, self.connect, self.on_pulled, self.delay, self.log = cfg, connect, on_pulled, delay, log
+        try:
+            minutes = float(cfg.get("sync_pull_minutes", 5))
+        except (TypeError, ValueError):
+            minutes = 5.0
+        self.pull_every = minutes * 60 if cfg.get("sync_pull", True) and minutes > 0 else None
         self._ev = threading.Event()
-        self._due = 0.0
+        self._push_due = None
+        self._pull_due = time.time() + 2 if self.pull_every else None
         self._full = False
         threading.Thread(target=self._run, name="ahtool-sync", daemon=True).start()
 
     def trigger(self, full=False):
-        self._due = time.time() + self.delay
+        self._push_due = time.time() + self.delay
         self._full = self._full or full
         self._ev.set()
 
     def _run(self):
         while True:
-            self._ev.wait()
-            while time.time() < self._due:
-                time.sleep(max(0.2, self._due - time.time()))
+            dues = [d for d in (self._push_due, self._pull_due) if d is not None]
+            wait = max(0.2, min(dues) - time.time()) if dues else None
+            self._ev.wait(wait)
             self._ev.clear()
-            full, self._full = self._full, False
+            now = time.time()
+            do_push = self._push_due is not None and now >= self._push_due
+            do_pull = self.pull_every is not None and (do_push or (self._pull_due and now >= self._pull_due))
+            if not (do_push or do_pull):
+                continue
             conn = None
             try:
                 conn = self.connect()
-                res = push(conn, self.cfg, full=full)
-                self.log("  Pushed to the web version: %s" % _summary(res))
-            except Exception as e:  # noqa - never take the local app down
-                self.log("  Push to the web version failed (retried after the next import): %s" % e)
+                if do_push:
+                    self._push_due = None
+                    full, self._full = self._full, False
+                    try:
+                        self.log("  Pushed to the web version: %s" % _summary(push(conn, self.cfg, full=full)))
+                    except Exception as e:  # noqa - never take the local app down
+                        self.log("  Push to the web version failed (retried after the next import): %s" % e)
+                if do_pull:
+                    self._pull_due = time.time() + self.pull_every
+                    try:
+                        res = pull(conn, self.cfg)
+                        if res["prices"] or res["scans"]:
+                            self.log("  Pulled from the web version: %d price rows, %d scans from other players."
+                                     % (res["prices"], res["scans"]))
+                            if self.on_pulled:
+                                self.on_pulled(res)
+                    except Exception as e:  # noqa
+                        self.log("  Pull from the web version failed (retried in %d min): %s"
+                                 % (self.pull_every // 60, e))
+            except Exception as e:  # noqa - e.g. the local DB is locked
+                self.log("  Sync failed: %s" % e)
             finally:
                 if conn is not None:
                     conn.close()
+
+
+Pusher = Syncer  # older name
 
 
 def _summary(res):
@@ -323,6 +370,10 @@ def _summary(res):
 # ================================================================ server (web version)
 
 def ensure_schema(conn):
+    # Server only: which push last changed a row, for /api/sync/pull. The local app's tables never get it.
+    for t in SEQ_TABLES:
+        if "seq" not in [r[1] for r in conn.execute("PRAGMA main.table_info(%s)" % t)]:
+            conn.execute("ALTER TABLE main.%s ADD COLUMN seq INTEGER NOT NULL DEFAULT 0" % t)
     conn.executescript(SERVER_SCHEMA)
     if not conn.execute("SELECT 1 FROM main.meta WHERE key='sync_epoch'").fetchone():
         with conn:
@@ -377,6 +428,9 @@ def apply(conn, cfg, payload, source):
     cur = conn.cursor()
     cur.execute("BEGIN IMMEDIATE")
     try:
+        r = cur.execute("SELECT value FROM main.meta WHERE key='sync_seq'").fetchone()
+        seq = (int(r[0]) if r and str(r[0]).isdigit() else 0) + 1
+        cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_seq',?)", (str(seq),))
         if "cfg" in payload and source["owner"]:
             c = payload["cfg"]
             if not isinstance(c, dict):
@@ -421,9 +475,10 @@ def apply(conn, cfg, payload, source):
             rows = _fixed(payload["price_current"], len(PRICE_CURRENT), "price_current")
             # newest observation wins; unchanged rows are not touched, so they do not count as new data
             cur.executemany(
-                "INSERT INTO main.price_current(realm,item_id,price,available,last_day,updated_at) VALUES(?,?,?,?,?,?) "
+                "INSERT INTO main.price_current(realm,item_id,price,available,last_day,updated_at,seq) "
+                "VALUES(?,?,?,?,?,?,%d) "
                 "ON CONFLICT(realm,item_id) DO UPDATE SET price=excluded.price, available=excluded.available, "
-                "last_day=excluded.last_day, updated_at=excluded.updated_at "
+                "last_day=excluded.last_day, updated_at=excluded.updated_at, seq=excluded.seq " % seq +
                 "WHERE (COALESCE(excluded.last_day,0), COALESCE(excluded.updated_at,0)) >= "
                 "(COALESCE(price_current.last_day,0), COALESCE(price_current.updated_at,0)) "
                 "AND (excluded.price IS NOT price_current.price OR excluded.available IS NOT price_current.available "
@@ -433,15 +488,8 @@ def apply(conn, cfg, payload, source):
         if "price_daily" in payload:
             rows = _fixed(payload["price_daily"], len(PRICE_DAILY), "price_daily")
             cur.executemany(
-                "INSERT INTO main.price_daily(realm,item_id,day,low,high,available) VALUES(?,?,?,?,?,?) "
-                "ON CONFLICT(realm,item_id,day) DO UPDATE SET "
-                "low=MIN(COALESCE(price_daily.low,excluded.low), COALESCE(excluded.low,price_daily.low)), "
-                "high=MAX(COALESCE(price_daily.high,excluded.high), COALESCE(excluded.high,price_daily.high)), "
-                "available=MAX(COALESCE(price_daily.available,excluded.available), "
-                "COALESCE(excluded.available,price_daily.available)) "
-                "WHERE excluded.low < price_daily.low OR excluded.high > price_daily.high "
-                "OR excluded.available > price_daily.available OR price_daily.low IS NULL "
-                "OR price_daily.high IS NULL OR price_daily.available IS NULL", rows)
+                "INSERT INTO main.price_daily(realm,item_id,day,low,high,available,seq) VALUES(?,?,?,?,?,?,%d) "
+                "ON CONFLICT(realm,item_id,day) DO UPDATE SET seq=excluded.seq, %s" % (seq, MERGE_DAILY), rows)
             applied["price_daily"] = len(rows)
             for r in rows:
                 realms.setdefault(r[0], 0)
@@ -481,8 +529,8 @@ def apply(conn, cfg, payload, source):
             if scan_id([realm, faction, ts]) is not None:
                 continue
             # char is always blank here: the scanning character belongs to the pusher
-            cur.execute("INSERT INTO main.ah_scans(ts,realm,faction,char,source,total,n,partial,raw_kept,diffed) "
-                        "VALUES(?,?,?,'',?,?,?,?,?,?)", row)
+            cur.execute("INSERT INTO main.ah_scans(ts,realm,faction,char,source,total,n,partial,raw_kept,diffed,seq) "
+                        "VALUES(?,?,?,'',?,?,?,?,?,?,?)", row + [seq])
             sid = cur.lastrowid
             items = _fixed(s.get("items") or [], len(SCAN_ITEMS), "scan items")
             cur.executemany("INSERT INTO main.ah_scan_items(scan_id,%s) VALUES(?,%s)"
@@ -502,17 +550,17 @@ def apply(conn, cfg, payload, source):
             realm, faction, ts = u["key"]
             if u.get("drop_raw"):
                 cur.execute("DELETE FROM main.ah_auctions WHERE scan_id=?", (sid,))
-                cur.execute("UPDATE main.ah_scans SET raw_kept=0, diffed=1 WHERE id=?", (sid,))
+                cur.execute("UPDATE main.ah_scans SET raw_kept=0, diffed=1, seq=? WHERE id=?", (seq, sid))
             if "sales" in u:
                 put_sales(sid, realm, faction, ts, u["sales"])
-                cur.execute("UPDATE main.ah_scans SET diffed=1 WHERE id=?", (sid,))
+                cur.execute("UPDATE main.ah_scans SET diffed=1, seq=? WHERE id=?", (seq, sid))
         # Never hold more raw auctions than the owner's app does, whoever pushed them.
         keep = int((new_cfg or cfg or {}).get("logger_keep_raw_scans") or 6)
         for realm, faction in cur.execute("SELECT DISTINCT realm, faction FROM main.ah_scans").fetchall():
             for (sid,) in cur.execute("SELECT id FROM main.ah_scans WHERE realm=? AND faction=? AND raw_kept=1 "
                                       "ORDER BY ts DESC LIMIT -1 OFFSET ?", (realm, faction, max(2, keep))).fetchall():
                 cur.execute("DELETE FROM main.ah_auctions WHERE scan_id=?", (sid,))
-                cur.execute("UPDATE main.ah_scans SET raw_kept=0 WHERE id=?", (sid,))
+                cur.execute("UPDATE main.ah_scans SET raw_kept=0, seq=? WHERE id=?", (seq, sid))
         now = int(time.time())
         cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_push_ts',?)", (str(now),))
         if source.get("key_id"):
@@ -524,6 +572,193 @@ def apply(conn, cfg, payload, source):
     if new_cfg and cfg is not None:
         cfg.update(new_cfg)
     return {"ok": True, "applied": applied}
+
+
+PULL_LIMIT = 50000
+
+
+def pull_page(conn, cursor, limit=PULL_LIMIT):
+    """Server: rows changed after `cursor`, oldest change first, at most ~limit rows per table."""
+    ensure_schema(conn)
+    c = cursor if isinstance(cursor, dict) else {}
+
+    def pair(k):
+        v = c.get(k)
+        try:
+            return int(v[0]), int(v[1])
+        except (TypeError, ValueError, IndexError):
+            return -1, -1
+
+    limit = max(100, min(int(limit or PULL_LIMIT), PULL_LIMIT))
+    epoch = conn.execute("SELECT value FROM main.meta WHERE key='sync_epoch'").fetchone()[0]
+    out = {"protocol": PROTOCOL, "epoch": epoch, "cursor": dict(c), "more": False}
+
+    def page(key, cols, table):
+        rows = conn.execute("SELECT seq, rowid, %s FROM main.%s WHERE (seq, rowid) > (?, ?) ORDER BY seq, rowid "
+                            "LIMIT ?" % (",".join(cols), table), pair(key) + (limit,)).fetchall()
+        if rows:
+            out["cursor"][key] = [rows[-1][0], rows[-1][1]]
+        out["more"] = out["more"] or len(rows) >= limit
+        return [list(r[2:]) for r in rows]
+
+    out["price_daily"] = page("pd", PRICE_DAILY, "price_daily")
+    out["price_current"] = page("pc", PRICE_CURRENT, "price_current")
+    try:
+        sn = int(c.get("sn", -1))
+    except (TypeError, ValueError):
+        sn = -1
+    rows = conn.execute("SELECT rowid, %s FROM main.snapshots WHERE rowid>? ORDER BY rowid LIMIT ?"
+                        % ",".join(SNAPSHOTS), (sn, limit)).fetchall()
+    if rows:
+        out["cursor"]["sn"] = rows[-1][0]
+    out["more"] = out["more"] or len(rows) >= limit
+    out["snapshots"] = [list(r[1:]) for r in rows]
+
+    scans, budget = [], limit
+    for r in conn.execute("SELECT seq, id, %s FROM main.ah_scans WHERE (seq, id) > (?, ?) ORDER BY seq, id"
+                          % ",".join(SCAN), pair("sc")).fetchall():
+        if scans and budget <= 0:
+            out["more"] = True
+            break
+        sid, row = r[1], list(r[2:])
+        item = {"scan": row,
+                "items": _rows(conn, "SELECT %s FROM main.ah_scan_items WHERE scan_id=?" % ",".join(SCAN_ITEMS),
+                               (sid,)),
+                "auctions": _rows(conn, "SELECT %s FROM main.ah_auctions WHERE scan_id=?" % ",".join(AUCTIONS),
+                                  (sid,)) if row[7] else None,
+                "sales": _rows(conn, "SELECT p.ts, s.item_id, s.suffix, s.count, s.unit_price, s.owner, s.kind "
+                                     "FROM main.ah_sales s LEFT JOIN main.ah_scans p ON p.id=s.prev_scan_id "
+                                     "WHERE s.scan_id=?", (sid,))}
+        budget -= len(item["items"]) + len(item["auctions"] or []) + len(item["sales"]) + 1
+        scans.append(item)
+        out["cursor"]["sc"] = [r[0], r[1]]
+    out["scans"] = scans
+    return out
+
+
+# ================================================================ client: pulling from the web version
+
+def _pull_key(cfg):
+    return "pull:" + hashlib.sha1((cfg.get("sync_url") or "").rstrip("/").encode()).hexdigest()[:16]
+
+
+def apply_pull(conn, page, keep_raw=6):
+    """Merge one pulled page into the local DB. Returns {"prices": changed rows, "scans": new/updated scans}."""
+    cur = conn.cursor()
+    cur.execute("BEGIN IMMEDIATE")
+    try:
+        before = conn.total_changes
+        rows = _fixed(page.get("price_current") or [], len(PRICE_CURRENT), "price_current")
+        cur.executemany(
+            "INSERT INTO price_current(realm,item_id,price,available,last_day,updated_at) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(realm,item_id) DO UPDATE SET price=excluded.price, available=excluded.available, "
+            "last_day=excluded.last_day, updated_at=excluded.updated_at "
+            "WHERE (COALESCE(excluded.last_day,0), COALESCE(excluded.updated_at,0)) >= "
+            "(COALESCE(price_current.last_day,0), COALESCE(price_current.updated_at,0)) "
+            "AND (excluded.price IS NOT price_current.price OR excluded.available IS NOT price_current.available "
+            "OR excluded.last_day IS NOT price_current.last_day)", rows)
+        realms = {}
+        for r in rows:
+            realms[r[0]] = realms.get(r[0], 0) + 1
+        rows = _fixed(page.get("price_daily") or [], len(PRICE_DAILY), "price_daily")
+        cur.executemany("INSERT INTO price_daily(realm,item_id,day,low,high,available) VALUES(?,?,?,?,?,?) "
+                        "ON CONFLICT(realm,item_id,day) DO UPDATE SET " + MERGE_DAILY, rows)
+        for r in rows:
+            realms.setdefault(r[0], 0)
+        rows = _fixed(page.get("snapshots") or [], len(SNAPSHOTS), "snapshots")
+        cur.executemany("INSERT INTO snapshots(realm,item_id,ts,price,available) SELECT ?,?,?,?,? WHERE NOT EXISTS "
+                        "(SELECT 1 FROM snapshots WHERE realm=? AND item_id=? AND ts=?)",
+                        [r + r[:3] for r in rows])
+        prices = conn.total_changes - before
+
+        def local_scan(realm, faction, ts):
+            return cur.execute("SELECT id, COALESCE(source,''), raw_kept FROM ah_scans WHERE realm=? AND faction=? "
+                               "AND ts=?", (realm, faction, ts)).fetchone()
+
+        def put_sales(sid, realm, faction, ts, sales):
+            cur.execute("DELETE FROM ah_sales WHERE scan_id=?", (sid,))
+            out = []
+            for prev_ts, iid, suffix, count, unit, owner, kind in _fixed(sales or [], len(SALES), "sales"):
+                prev = local_scan(realm, faction, prev_ts) if prev_ts is not None else None
+                out.append((sid, prev[0] if prev else None, ts, iid, suffix, count, unit, owner or "", kind))
+            cur.executemany("INSERT INTO ah_sales(scan_id,prev_scan_id,ts,item_id,suffix,count,unit_price,owner,kind) "
+                            "VALUES(?,?,?,?,?,?,?,?,?)", out)
+
+        n_scans = 0
+        for s in page.get("scans") or []:
+            row = _fixed([s.get("scan")], len(SCAN), "scan")[0]
+            ts, realm, faction = row[0], row[1], row[2]
+            have = local_scan(realm, faction, ts)
+            if have and have[1] != "web":
+                continue  # your own scan coming back: yours is the original
+            auctions = s.get("auctions")
+            if have:
+                sid = have[0]
+                if auctions is None and have[2]:
+                    cur.execute("DELETE FROM ah_auctions WHERE scan_id=?", (sid,))
+                    cur.execute("UPDATE ah_scans SET raw_kept=0 WHERE id=?", (sid,))
+            else:
+                cur.execute("INSERT INTO ah_scans(ts,realm,faction,char,source,total,n,partial,raw_kept,diffed) "
+                            "VALUES(?,?,?,'','web',?,?,?,?,1)", (ts, realm, faction, row[4], row[5], row[6],
+                                                                1 if auctions is not None else 0))
+                sid = cur.lastrowid
+                items = _fixed(s.get("items") or [], len(SCAN_ITEMS), "scan items")
+                cur.executemany("INSERT INTO ah_scan_items(scan_id,%s) VALUES(?,%s)"
+                                % (",".join(SCAN_ITEMS), ",".join("?" * len(SCAN_ITEMS))), [[sid] + r for r in items])
+                cur.executemany("INSERT INTO ah_auctions(scan_id,%s) VALUES(?,%s)"
+                                % (",".join(AUCTIONS), ",".join("?" * len(AUCTIONS))),
+                                [[sid] + r for r in _fixed(auctions or [], len(AUCTIONS), "auctions")])
+            put_sales(sid, realm, faction, ts, s.get("sales"))
+            n_scans += 1
+        if n_scans:  # pulled raw auctions are kept like your own: the newest few per realm/faction
+            for realm, faction in cur.execute("SELECT DISTINCT realm, faction FROM ah_scans WHERE source='web'"
+                                              ).fetchall():
+                for (sid,) in cur.execute("SELECT id FROM ah_scans WHERE realm=? AND faction=? AND source='web' AND "
+                                          "raw_kept=1 ORDER BY ts DESC LIMIT -1 OFFSET ?",
+                                          (realm, faction, max(2, keep_raw))).fetchall():
+                    cur.execute("DELETE FROM ah_auctions WHERE scan_id=?", (sid,))
+                    cur.execute("UPDATE ah_scans SET raw_kept=0 WHERE id=?", (sid,))
+        if prices:
+            # file_mtime NULL: ingest.py compares the Auctionator file only with its own imports
+            realm = max(realms, key=lambda k: realms[k]) if realms else None
+            cur.execute("INSERT INTO ingests(ts,file_mtime,realm,items,changed) VALUES(?,NULL,?,?,?)",
+                        (int(time.time()), realm, realms.get(realm, 0), prices))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"prices": prices, "scans": n_scans}
+
+
+def pull(conn, cfg, full=False, max_pages=1000):
+    """Fetch what everyone pushed since the last pull. Returns {"prices", "scans", "pages"}."""
+    if not cfg.get("sync_url") or not cfg.get("sync_token"):
+        raise SyncError("sync_url and sync_token must be set in config.json")
+    r = conn.execute("SELECT value FROM meta WHERE key=?", (_pull_key(cfg),)).fetchone()
+    try:
+        st = json.loads(r[0]) if r and not full else {}
+    except ValueError:
+        st = {}
+    total = {"prices": 0, "scans": 0, "pages": 0}
+    keep = int(cfg.get("logger_keep_raw_scans") or 6)
+    for _ in range(max_pages):
+        q = urllib.parse.urlencode({"cursor": json.dumps(st.get("cursor") or {}, separators=(",", ":"))})
+        page = _request(cfg, "GET", "/api/sync/pull?" + q)
+        if page.get("protocol") != PROTOCOL:
+            raise SyncError("the web version speaks sync protocol %s, this app %s" % (page.get("protocol"), PROTOCOL))
+        if st.get("epoch") not in (None, page.get("epoch")):
+            st = {}  # the web database was reset: start over
+            continue
+        res = apply_pull(conn, page, keep)
+        total["prices"] += res["prices"]
+        total["scans"] += res["scans"]
+        total["pages"] += 1
+        st = {"epoch": page.get("epoch"), "cursor": page.get("cursor") or {}}
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", (_pull_key(cfg), json.dumps(st)))
+        if not page.get("more"):
+            break
+    return total
 
 
 def load_pushed_cfg(conn, cfg):
@@ -544,6 +779,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Push market data to the AH Tool web version.")
     ap.add_argument("--full", action="store_true", help="resend everything (repairs a web version that drifted)")
     ap.add_argument("--dry-run", action="store_true", help="show what would be sent, send nothing")
+    ap.add_argument("--push-only", action="store_true", help="only send your data")
+    ap.add_argument("--pull-only", action="store_true", help="only fetch other players' data")
     a = ap.parse_args(argv)
     cfg = config.load()
     conn = db.connect(cfg["db_path"])
@@ -559,7 +796,12 @@ def main(argv=None):
                 print("The web version knows this PC as: %s" % remote["you"])
             print("Your characters (masked as seller): %s" % (", ".join(sorted(own_names(conn, cfg))) or "none"))
             return 0
-        print("Pushed: %s" % _summary(push(conn, cfg, full=a.full)))
+        if not a.pull_only:
+            print("Pushed: %s" % _summary(push(conn, cfg, full=a.full)))
+        if not a.push_only:
+            res = pull(conn, cfg, full=a.full)
+            print("Pulled: %d price rows, %d scans from other players (%d page(s))."
+                  % (res["prices"], res["scans"], res["pages"]))
         return 0
     except SyncError as e:
         print("Push failed: %s" % e, file=sys.stderr)

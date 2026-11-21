@@ -167,7 +167,16 @@ Generate a token with `python -c "import secrets; print(secrets.token_urlsafe(32
 ```
 
 and restart `start.bat`. It pushes at start and a few seconds after each import (only what is new). By hand:
-`python -m ahtool.sync` (`--full` resends everything).
+`python -m ahtool.sync` (`--full` resends everything, `--push-only` / `--pull-only`).
+
+**Two-way:** the app also pulls what the other players pushed – at start, after each push and every
+`sync_pull_minutes` (default 5; `"sync_pull": false` turns it off). Their prices are merged into your local
+database with the same rules as on the website (lowest low, highest high, newest current price), so your pages,
+deals, shopping list and alerts use everyone's scans, and the page refreshes itself when something arrives. Their
+full scans are stored with source `web`: they are never pushed back, and your own sales estimates only compare your
+own scans, so a sale is not counted twice. Your own Auctionator import merges the same way, so a `/reload` never
+replaces a newer price someone else saw with an older one of yours. Nothing personal is pulled – the website has
+none.
 
 **More people pushing** – give everyone who runs the local AH Tool their own key, made on the server:
 

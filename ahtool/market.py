@@ -236,10 +236,12 @@ def _diff_pending(conn):
     """Diff every not-yet-diffed scan against the previous complete scan of the same realm/faction."""
     n_sales = 0
     todo = conn.execute("SELECT id, ts, realm, faction FROM ah_scans WHERE diffed=0 AND partial=0 AND raw_kept=1 "
-                        "ORDER BY ts").fetchall()
+                        "AND COALESCE(source,'')<>'web' ORDER BY ts").fetchall()
     for sid, ts, realm, faction in todo:
+        # Only against your own previous scan: scans pulled from the web version (source 'web') carry their own
+        # sales, estimated by whoever scanned them, and diffing against them would count those sales twice.
         prev = conn.execute("SELECT id, ts FROM ah_scans WHERE realm=? AND faction=? AND ts<? AND partial=0 "
-                            "ORDER BY ts DESC LIMIT 1", (realm, faction, ts)).fetchone()
+                            "AND COALESCE(source,'')<>'web' ORDER BY ts DESC LIMIT 1", (realm, faction, ts)).fetchone()
         conn.execute("UPDATE ah_scans SET diffed=1 WHERE id=?", (sid,))
         if not prev or ts - prev[1] > MAX_DIFF_GAP:
             continue
@@ -299,11 +301,13 @@ def ingest(conn, cfg, force=False):
                 cur.executemany("INSERT INTO ah_scan_items VALUES(?,?,?,?,?,?,?)", _scan_item_rows(sid, rows))
                 new_scans += 1
             sold = _diff_pending(conn)
-            # keep raw auctions only for the newest scans per realm/faction
-            for realm, faction in cur.execute("SELECT DISTINCT realm, faction FROM ah_scans").fetchall():
+            # keep raw auctions only for the newest scans per realm/faction - your own and pulled ones (source
+            # 'web') counted separately, so other players' scans never push out the one your next scan diffs against
+            for realm, faction, web in cur.execute(
+                    "SELECT DISTINCT realm, faction, COALESCE(source,'')='web' FROM ah_scans").fetchall():
                 old = [x[0] for x in cur.execute(
-                    "SELECT id FROM ah_scans WHERE realm=? AND faction=? AND raw_kept=1 ORDER BY ts DESC LIMIT -1 "
-                    "OFFSET ?", (realm, faction, keep_raw)).fetchall()]
+                    "SELECT id FROM ah_scans WHERE realm=? AND faction=? AND (COALESCE(source,'')='web')=? AND raw_kept=1 "
+                    "ORDER BY ts DESC LIMIT -1 OFFSET ?", (realm, faction, web, keep_raw)).fetchall()]
                 for sid in old:
                     cur.execute("DELETE FROM ah_auctions WHERE scan_id=?", (sid,))
                     cur.execute("UPDATE ah_scans SET raw_kept=0, diffed=1 WHERE id=?", (sid,))

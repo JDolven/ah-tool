@@ -15,5 +15,7 @@
   "trend_min_profit": 1000,
   "sync_url": "",
   "sync_token": "",
-  "sync_hide_sellers": []
+  "sync_hide_sellers": [],
+  "sync_pull": true,
+  "sync_pull_minutes": 5
 }

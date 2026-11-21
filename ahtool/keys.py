@@ -108,7 +108,8 @@ def main(argv=None):
             url = os.environ.get("AHTOOL_PUBLIC_URL", "https://<this site>")
             print("Key for %s (%s). It is shown only now - it cannot be recovered:\n\n  %s\n"
                   % (a.name, "owner" if a.owner else "contributor", key))
-            print("Give %s these lines for config.json in their AH Tool folder, then restart start.bat:\n" % a.name)
+            print("Give %s these lines for config.json in their AH Tool folder, then restart start.bat.\n"
+                  "Their app then pushes after each import and pulls everyone else's data every 5 minutes:\n" % a.name)
             print('  "sync_url": "%s",\n  "sync_token": "%s",\n  "sync_hide_sellers": []\n' % (url, key))
             print("sync_hide_sellers: their alts that never scanned, posted or got AH mail on that PC, so those are\n"
                   "masked as sellers too. Their own trades never leave their PC.")

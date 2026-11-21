@@ -74,6 +74,14 @@ def _realm_items(realm_val):
     return items
 
 
+MERGE_DAILY = ("low=MIN(COALESCE(price_daily.low,excluded.low), COALESCE(excluded.low,price_daily.low)), "
+               "high=MAX(COALESCE(price_daily.high,excluded.high), COALESCE(excluded.high,price_daily.high)), "
+               "available=MAX(COALESCE(price_daily.available,excluded.available), "
+               "COALESCE(excluded.available,price_daily.available)) "
+               "WHERE excluded.low < price_daily.low OR excluded.high > price_daily.high "
+               "OR excluded.available > price_daily.available OR price_daily.low IS NULL "
+               "OR price_daily.high IS NULL OR price_daily.available IS NULL")
+
 _lock = threading.Lock()  # one Auctionator ingest at a time (watcher thread vs. POST /api/ingest)
 
 
@@ -86,7 +94,9 @@ def _ingest(conn, cfg, force=False):
     path = cfg["savedvariables"]
     st = os.stat(path)
     mtime = int(st.st_mtime)
-    last = conn.execute("SELECT realm, file_mtime FROM ingests ORDER BY id DESC LIMIT 1").fetchone()
+    # Rows from the web version (sync.pull) have no file_mtime: compare with the last import of the file itself.
+    last = conn.execute("SELECT realm, file_mtime FROM ingests WHERE file_mtime IS NOT NULL "
+                        "ORDER BY id DESC LIMIT 1").fetchone()
     if not force and last and last["file_mtime"] == mtime:
         return {"realm": last["realm"], "items": 0, "changed": 0, "skipped": True}
 
@@ -101,8 +111,8 @@ def _ingest(conn, cfg, force=False):
             if not isinstance(realm, str) or realm.startswith("__"):
                 continue
             items = _realm_items(rv)
-            prev = {r[0]: (r[1], r[2], r[3]) for r in cur.execute(
-                "SELECT item_id, price, available, last_day FROM price_current WHERE realm=?", (realm,))}
+            prev = {r[0]: (r[1], r[2], r[3], r[4]) for r in cur.execute(
+                "SELECT item_id, price, available, last_day, updated_at FROM price_current WHERE realm=?", (realm,))}
             daily, current, snaps = [], [], []
             for iid, v in items.items():
                 h, l, a = _dmap(v.get("h")), _dmap(v.get("l")), _dmap(v.get("a"))
@@ -119,14 +129,17 @@ def _ingest(conn, cfg, force=False):
                 price = int(price)
                 avail = a.get(last_day)
                 p = prev.get(iid)
+                if p is not None and (p[2] or 0, p[3] or 0) > (last_day, mtime):
+                    continue  # a newer observation from the web version (another player's scan) is kept
                 if p is None or p[0] != price or p[1] != avail or p[2] != last_day:
                     current.append((realm, iid, price, avail, last_day, mtime))
                 if p is None or p[0] != price or p[1] != avail:
                     snaps.append((realm, iid, mtime, price, avail))
             cur.executemany(
                 "INSERT INTO price_daily(realm,item_id,day,low,high,available) VALUES(?,?,?,?,?,?) "
-                "ON CONFLICT(realm,item_id,day) DO UPDATE SET low=excluded.low, high=excluded.high, "
-                "available=excluded.available", daily)
+                # Merge, never replace: Auctionator's own values only move this way within a day (lowest low,
+                # highest high, most listed), and it keeps prices pulled from the web version intact.
+                "ON CONFLICT(realm,item_id,day) DO UPDATE SET " + MERGE_DAILY, daily)
             cur.executemany(
                 "INSERT INTO price_current(realm,item_id,price,available,last_day,updated_at) VALUES(?,?,?,?,?,?) "
                 "ON CONFLICT(realm,item_id) DO UPDATE SET price=excluded.price, available=excluded.available, "

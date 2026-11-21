@@ -384,4 +384,14 @@ Auctionator only gives one min price per scan + daily max quantity, so outliers 
   (scan ids mapped by realm/faction/ts), `scan_updates:[{key,drop_raw?,sales?}]`. A push that changes prices adds one
   server-side `ingests` row (cache + alert marker). Clients keep their own watermarks in local meta `sync:<sha1(url)>`
   = `{epoch, daily:{realm:max_day}, snap_ts}`; another epoch (reset server DB) or `--full` -> send everything.
-- Local: config `sync_url`, `sync_token`, `sync_hide_sellers`; `run.py` pushes via `sync.Pusher` (8 s debounce).
+- **Pull:** server-only column `seq` on price_daily, price_current, ah_scans = the push (meta `sync_seq`) that last
+  changed the row. `GET /api/sync/pull?cursor={pd:[seq,rowid],pc:[seq,rowid],sn:rowid,sc:[seq,id]}` -> `{protocol,
+  epoch, cursor, more, price_daily, price_current, snapshots, scans:[{scan,items,auctions|null,sales}]}`, <= PULL_LIMIT
+  rows per table. Client (`sync.pull` / `apply_pull`): same merges locally, snapshots insert-if-missing, scans
+  inserted as source='web' (char '', diffed=1; own scans coming back are skipped), one local `ingests` row with
+  file_mtime NULL when prices changed; cursor in meta `pull:<sha1(url)>` with epoch. Local rules: ingest.py merges
+  price_daily (`MERGE_DAILY`), skips price_current rows older than (last_day, updated_at) already stored, and compares
+  file_mtime only with non-NULL rows; market.py never diffs against or prunes own raw because of source='web' scans;
+  push never sends source='web' scans.
+- Local: config `sync_url`, `sync_token`, `sync_hide_sellers`, `sync_pull` (true), `sync_pull_minutes` (5); `run.py`
+  runs `sync.Syncer` (push 8 s after an import, then pull; pull on a timer; alerts + page refresh after a pull).

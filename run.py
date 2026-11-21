@@ -53,8 +53,24 @@ def main():
     pusher = None
     if cfg.get("sync_url") and cfg.get("sync_token"):
         from ahtool import sync
-        pusher = sync.Pusher(cfg, lambda: db.connect(cfg["db_path"]))
-        print("Pushing market data to the web version at %s." % cfg["sync_url"])
+
+        def on_pulled(_res):
+            # other players' prices arrived: same as a new import (page refresh, alerts)
+            analytics.invalidate()
+            try:
+                c = db.connect(cfg["db_path"])
+                try:
+                    new = alerts.evaluate(c, cfg)
+                finally:
+                    c.close()
+                if new:
+                    print("  %d new alert(s)." % len(new))
+            except Exception as e:
+                print("  Alert evaluation failed: %s" % e)
+
+        pusher = sync.Syncer(cfg, lambda: db.connect(cfg["db_path"]), on_pulled=on_pulled)
+        print("Syncing market data with the web version at %s (push after each import, pull every %s min)."
+              % (cfg["sync_url"], cfg.get("sync_pull_minutes", 5) if cfg.get("sync_pull", True) else "-"))
         pusher.trigger()
 
     def on_ingest(*_a, **_k):

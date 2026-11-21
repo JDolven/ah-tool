@@ -290,6 +290,106 @@ check(kconn.execute("SELECT pushes, last_push_ts IS NOT NULL FROM sync_keys WHER
 code, st_me, _ = call("GET", "/api/sync/state", headers={"Authorization": "Bearer " + k_own})
 check(st_me["accept_static"] and st_me["accept_cfg"], "owner key accepted for static/cfg")
 
+# ---------------------------------------------------------------- two-way: pull what the others pushed
+n_ing_local = lconn.execute("SELECT COUNT(*) FROM ingests").fetchone()[0]
+own_before = lconn.execute("SELECT COUNT(*) FROM ah_scans WHERE source<>'web'").fetchone()[0]
+post_before = lconn.execute("SELECT COUNT(*) FROM postings").fetchone()[0]
+cur_before = lconn.execute("SELECT price FROM price_current WHERE item_id=2453").fetchone()[0]
+res = sync.pull(lconn, lcfg)
+check(res["scans"] == 1 and res["prices"] > 0, "owner pulls Ola's scan and prices %s" % res)
+web_scans = lconn.execute("SELECT char, source, diffed FROM ah_scans WHERE source='web'").fetchall()
+check(len(web_scans) == 1 and web_scans[0][0] == "" and web_scans[0][2] == 1, "pulled scan stored as web %s" % web_scans)
+check(lconn.execute("SELECT COUNT(*) FROM ah_scans WHERE source<>'web'").fetchone()[0] == own_before,
+      "own scans not duplicated by the echo")
+lo, hi = lconn.execute("SELECT low, high FROM price_daily WHERE item_id=2453 AND day=?", (day,)).fetchone()
+check(lo == low // 2 and hi == high * 2, "Ola's prices merged locally (%s %s)" % (lo, hi))
+check(lconn.execute("SELECT price FROM price_current WHERE item_id=2453").fetchone()[0] == cur_before,
+      "Ola's older current price did not replace ours")
+check(lconn.execute("SELECT COUNT(*) FROM postings").fetchone()[0] == post_before, "pull never touches postings")
+check(lconn.execute("SELECT COUNT(*) FROM ingests WHERE file_mtime IS NULL").fetchone()[0] == 1
+      and lconn.execute("SELECT COUNT(*) FROM ingests").fetchone()[0] == n_ing_local + 1, "one pull ingest row")
+res = sync.pull(lconn, lcfg)
+check(res["prices"] == 0 and res["scans"] == 0, "second pull changes nothing %s" % res)
+check(lconn.execute("SELECT COUNT(*) FROM ingests").fetchone()[0] == n_ing_local + 1, "no ingest row for nothing")
+
+# pulled data is not echoed back, and pushing after a pull changes nothing on the server
+batches, _ = sync.build_batches(lconn, lcfg, sync._request(lcfg, "GET", "/api/sync/state"), full=True)
+sent_ts = {sc["scan"][0] for b in batches for sc in b.get("scans") or []}
+check(now - 1800 not in sent_ts, "pulled scan never pushed back, even with --full")
+seq0 = w.execute("SELECT MAX(seq) FROM price_daily").fetchone()[0]
+n_srv_ing = w.execute("SELECT COUNT(*) FROM ingests").fetchone()[0]
+sync.push(lconn, lcfg)
+check(w.execute("SELECT COUNT(*) FROM ingests").fetchone()[0] == n_srv_ing
+      and w.execute("SELECT MAX(seq) FROM price_daily").fetchone()[0] == seq0, "echo push changes nothing")
+
+# your next own scan is diffed against your own previous scan, never against a pulled one
+lua3 = lua.replace(scan(now - 3600, s2, "Other"), scan(now - 3600, s2, "Other") + ", " +
+                   scan(now - 600, [(2453, 0, 5, 5000, 4000, 0, 4, "Alice")] * 2 + [(118, 0, 1, 900, 800, 0, 4, "Bob")], "Me"))
+with open(lp, "w", encoding="utf-8") as f:
+    f.write(lua3)
+market.ingest(lconn, lcfg, force=True)
+prev = lconn.execute("SELECT DISTINCT p.source, p.ts FROM ah_sales s JOIN ah_scans c ON c.id=s.scan_id "
+                     "JOIN ah_scans p ON p.id=s.prev_scan_id WHERE c.ts=?", (now - 600,)).fetchall()
+check(prev and all(r[0] != "web" for r in prev) and prev[0][1] == now - 3600, "own diff skips pulled scans %s" % prev)
+
+# your next Auctionator import never overwrites a newer price pulled from someone else
+from ahtool import ingest  # noqa: E402
+d118 = oconn.execute("SELECT last_day FROM price_current WHERE item_id=118").fetchone()[0]
+oconn.execute("UPDATE price_current SET price=4242, last_day=last_day+1, updated_at=updated_at+1000000 WHERE item_id=118")
+oconn.commit()
+sync.push(oconn, ocfg)
+sync.pull(lconn, lcfg)
+check(lconn.execute("SELECT price FROM price_current WHERE item_id=118").fetchone()[0] == 4242, "Ola's newer price pulled")
+d2453 = lconn.execute("SELECT last_day FROM price_current WHERE item_id=2453").fetchone()[0]
+auc = os.path.join(tmp, "Auctionator.lua")
+with open(auc, "w", encoding="utf-8") as f:
+    f.write('AUCTIONATOR_PRICE_DATABASE = { ["__dbversion"] = 8, ["PvP"] = {\n'
+            ' ["118"] = { ["m"] = 1, ["h"] = { ["%d"] = 1 }, ["a"] = { ["%d"] = 3 } },\n'
+            ' ["2453"] = { ["m"] = 777, ["h"] = { ["%d"] = 777, ["%d"] = %d }, ["a"] = { ["%d"] = 9 } },\n'
+            '} }\n' % (d118, d118, d2453 + 1, day, low // 2 + 1, d2453 + 1))
+lcfg["savedvariables"] = auc
+ingest.ingest(lconn, lcfg, force=True)
+check(lconn.execute("SELECT price FROM price_current WHERE item_id=118").fetchone()[0] == 4242,
+      "older own Auctionator price does not replace the newer pulled one")
+check(lconn.execute("SELECT price FROM price_current WHERE item_id=2453").fetchone()[0] == 777,
+      "a newer own Auctionator price is imported as before")
+check(lconn.execute("SELECT high FROM price_daily WHERE item_id=2453 AND day=?", (day,)).fetchone()[0] == high * 2,
+      "own import merges daily prices instead of lowering the pulled high")
+lconn.execute("INSERT INTO ingests(ts,file_mtime,realm,items,changed) VALUES(?,NULL,'PvP',1,1)", (now,))
+lconn.commit()  # what a pull leaves behind
+check(ingest.ingest(lconn, lcfg).get("skipped") is True, "unchanged Auctionator file still skipped after a pull")
+
+# Ola pulls our data too; her own scan stays hers
+res = sync.pull(oconn, ocfg)
+check(res["scans"] >= 2 and oconn.execute("SELECT COUNT(*) FROM ah_scans WHERE source<>'web'").fetchone()[0] == 1,
+      "Ola gets our scans, keeps her own %s" % res)
+dump = str(oconn.execute("SELECT * FROM ah_auctions").fetchall())
+check("Altsy" not in dump, "our alt (sync_hide_sellers) never reaches Ola")
+
+# a new PC pulls everything, page by page
+new_path = os.path.join(tmp, "new.db")
+nconn = db.connect(new_path)
+k_new = keys.create(kconn, "Kari")
+sync.PULL_LIMIT = 100
+res = sync.pull(nconn, {"sync_url": BASE, "sync_token": k_new})
+sync.PULL_LIMIT = 50000
+check(res["pages"] > 1, "paged pull (%d pages)" % res["pages"])
+for t in ("price_daily", "price_current", "snapshots"):
+    a = nconn.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
+    b = w.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
+    check(a == b, "new PC has all %s (%d/%d)" % (t, a, b))
+check(nconn.execute("SELECT COUNT(*) FROM ah_scans").fetchone()[0] == w.execute("SELECT COUNT(*) FROM ah_scans")
+      .fetchone()[0], "new PC has all scans")
+# web database reset -> the next pull starts over
+w.execute("UPDATE meta SET value='reset' WHERE key='sync_epoch'")
+w.commit()
+nconn.execute("DELETE FROM price_daily")
+nconn.commit()
+sync.pull(nconn, {"sync_url": BASE, "sync_token": k_new})
+check(nconn.execute("SELECT COUNT(*) FROM price_daily").fetchone()[0] == w.execute(
+    "SELECT COUNT(*) FROM price_daily").fetchone()[0], "new epoch -> pulled again from the start")
+nconn.close()
+
 # revoke -> refused on the next request
 check(keys.revoke(kconn, "Ola") == 1, "revoke by name")
 code, res, _ = call("GET", "/api/sync/state", headers={"Authorization": "Bearer " + k_ola})
