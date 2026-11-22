@@ -33,7 +33,7 @@ DB = os.path.join(tmp, "test.db")
 make_fixture_db.build(DB)
 INLINE = "\n    try { document.documentElement.dataset.x = '1'; } catch (e) {}\n  "
 webdir = tempfile.mkdtemp()
-with open(os.path.join(webdir, "index.html"), "w", encoding="utf-8") as f:
+with open(os.path.join(webdir, "index.html"), "w", encoding="utf-8", newline="\n") as f:  # no CRLF on Windows
     f.write('<!doctype html><html lang="en"><head><script>%s</script><script src="app.js"></script></head>'
             '<body>INDEX</body></html>' % INLINE)
 with open(os.path.join(webdir, "app.js"), "w") as f:

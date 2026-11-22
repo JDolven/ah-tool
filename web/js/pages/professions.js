@@ -371,7 +371,21 @@ export function recipeColumns(opts = {}) {
   }
   cols.push(
     { key: 'cost', label: 'Cost', align: 'right', hideSm: !!opts.shop, render: (r) => `${money(r.cost)}${!r.cost_complete ? '<span class="warn-mark" title="Incomplete cost">*</span>' : ''}` },
-    { key: 'sell', label: 'Sell value', align: 'right', hideSm: !!opts.shop, render: (r) => (r.created_item_id ? money(r.sell) : '<span class="muted" title="Does not create an item (e.g. an enchant)">–</span>') },
+    {
+      key: 'sell',
+      label: 'Sell value',
+      align: 'right',
+      hideSm: !!opts.shop,
+      sort: (r) => (r.sell_source === 'vendor' ? r.vendor_value : r.sell),
+      render: (r) => {
+        if (!r.created_item_id) return '<span class="muted" title="Does not create an item (e.g. an enchant)">–</span>';
+        if (r.sell_source === 'vendor') {
+          const why = isNum(r.sell) ? 'Selling to a vendor pays more than the AH after the cut' : 'No AH price – profit uses the vendor price';
+          return `<span title="${why}">${money(r.vendor_value)} <span class="src src-vendor">Vendor</span></span>`;
+        }
+        return money(r.sell);
+      },
+    },
     {
       key: 'profit',
       label: 'Profit',
@@ -433,7 +447,8 @@ export function recipeExpand(r) {
       </tbody>
       <tfoot>
         <tr><td colspan="4">Total cost${!r.cost_complete ? ' <span class="warn-text">(incomplete)</span>' : ''}</td><td class="r">${money(r.cost)}</td></tr>
-        ${r.created_item_id ? `<tr><td colspan="4">Sale after 5% AH cut ${confBadge(r.sell_confidence)} ${flagChip(r.sell_price_flag)}</td><td class="r">${isNum(r.sell) ? money(Math.round(r.sell * 0.95)) : '–'}</td></tr>` : ''}
+        ${r.created_item_id ? `<tr class="${r.sell_source === 'ah' ? '' : 'muted'}"><td colspan="4">Sale after 5% AH cut ${confBadge(r.sell_confidence)} ${flagChip(r.sell_price_flag)}${r.sell_source === 'ah' ? ' <span class="tag-mini ok">used</span>' : ''}</td><td class="r">${isNum(r.sell) ? money(Math.round(r.sell * 0.95)) : '–'}</td></tr>` : ''}
+        ${r.created_item_id && r.vendor_value ? `<tr class="${r.sell_source === 'vendor' ? '' : 'muted'}"><td colspan="4">Sell to vendor${r.sell_source === 'vendor' ? ' <span class="tag-mini ok">used</span>' : ''}</td><td class="r">${money(r.vendor_value)}</td></tr>` : ''}
       </tfoot>
     </table>
   </div>${trend}</div>`;

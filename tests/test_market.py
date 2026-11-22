@@ -57,10 +57,9 @@ conn.commit()
 now = int(time.time())
 
 
-def scan(t, rows):
+def scan(t, rows, nm=""):
     d = ";".join(",".join(str(x) for x in r) for r in rows)
-    return '{ ["t"] = %d, ["realm"] = "PvP", ["faction"] = "Alliance", ["char"] = "Me", ["src"] = "addon", ' \
-           '["total"] = %d, ["n"] = %d, ["d"] = "%s" }' % (t, len(rows), len(rows), d)
+    return '{ ["t"] = %d, ["realm"] = "PvP", ["faction"] = "Alliance", ["char"] = "Me", ["src"] = "addon", '            '["total"] = %d, ["n"] = %d, ["d"] = "%s", ["nm"] = "%s" }' % (t, len(rows), len(rows), d, nm)
 
 
 s1 = [(2589, 0, 20, 2000, 1000, 0, 4, "Alice")] * 3 + [(2592, 0, 10, 3000, 2000, 0, 4, "Bob")]
@@ -76,7 +75,8 @@ lua = """AHToolLoggerDB = {
   ["expired|Wool Cloth||0|10|1"] = { ["t"] = %d, ["type"] = "expired", ["item"] = "Wool Cloth", ["count"] = 10 },
 },
 }
-""" % (scan(now - 7200, s1), scan(now - 3600, s2), now - 100, now - 5000, now - 4000)
+""" % (scan(now - 7200, s1), scan(now - 3600, s2, "253664:2:Forever Tunic;2589:1:Renamed Cloth;bad;7:x:"),
+       now - 100, now - 5000, now - 4000)
 lp = os.path.join(tmp, "AHToolLogger.lua")
 with open(lp, "w", encoding="utf-8") as f:
     f.write(lua)
@@ -86,6 +86,14 @@ check(r.get("scans") == 2 and r.get("sold") == 2 and r.get("mail") == 2, "ingest
 check(market.ingest(conn, cfg).get("skipped"), "second ingest skipped")
 r = market.ingest(conn, cfg, force=True)
 check(r.get("scans") == 0 and r.get("mail") == 0, "forced re-ingest adds nothing %s" % r)
+
+# item names from scans (logger 1.1): unknown items get a name, known names are kept
+check(market.parse_names("1:2:A:b;x;3:-1:C") == {1: ("A:b", 2), 3: ("C", None)}, "parse_names")
+named = {i: tuple(v) for i, *v in conn.execute("SELECT id, name, quality FROM items WHERE id IN (253664, 2589)")}
+check(named.get(253664) == ("Forever Tunic", 2), "custom item named from scan %s" % named)
+check(named.get(2589) == ("Linen Cloth", 1), "existing name kept %s" % named)
+conn.execute("DELETE FROM items WHERE id=253664")
+check(market.apply_names(conn) == 1, "names re-applied after an items rebuild")
 
 m = market.item_market(conn, cfg, 2592, qty=12)
 check(m["summary"]["qty"] == 15 and m["summary"]["sellers"] == 2, "summary %s" % m["summary"])

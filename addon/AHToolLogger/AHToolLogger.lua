@@ -8,6 +8,8 @@
 -- Data format of a scan (compact string, one auction per row, rows separated by ";"):
 --   [N*]itemId,suffixId,count,buyout,minBid,bid,timeLeft,owner   (N* = N identical auctions)
 -- timeLeft is the band 1..4 (short, medium, long, very long).
+-- A scan also carries nm = "itemId:quality:name;..." - one name per item, so the app can name custom realm items
+-- that are missing from its static data.
 
 local VERSION = 1
 local KEEP_SCANS = 3          -- full scans kept in the file (the app imports them on /reload and keeps the history)
@@ -65,19 +67,22 @@ if MODERN then
   api.first = 0
   function api.count() return C_AuctionHouse.GetNumReplicateItems() or 0 end
   function api.row(i)
-    local _, _, count, _, _, _, _, minBid, _, buyout, bid, _, _, owner, ownerFull, _, itemId =
+    local name, _, count, quality, _, _, _, minBid, _, buyout, bid, _, _, owner, ownerFull, _, itemId =
       C_AuctionHouse.GetReplicateItemInfo(i)
     local tl = C_AuctionHouse.GetReplicateItemTimeLeft and C_AuctionHouse.GetReplicateItemTimeLeft(i) or 0
-    return makeRow(itemId, C_AuctionHouse.GetReplicateItemLink(i), count, minBid, buyout, bid, tl, ownerFull or owner)
+    local link = C_AuctionHouse.GetReplicateItemLink(i)
+    return makeRow(itemId, link, count, minBid, buyout, bid, tl, ownerFull or owner), itemId, name, quality, link
   end
 elseif LEGACY then
   api.event = "AUCTION_ITEM_LIST_UPDATE"
   api.first = 1
   function api.count() return (GetNumAuctionItems("list")) or 0 end
   function api.row(i)
-    local _, _, count, _, _, _, _, minBid, _, buyout, bid, _, _, owner, ownerFull, _, itemId = GetAuctionItemInfo("list", i)
-    return makeRow(itemId, GetAuctionItemLink("list", i), count, minBid, buyout, bid,
-      GetAuctionItemTimeLeft("list", i), ownerFull or owner)
+    local name, _, count, quality, _, _, _, minBid, _, buyout, bid, _, _, owner, ownerFull, _, itemId =
+      GetAuctionItemInfo("list", i)
+    local link = GetAuctionItemLink("list", i)
+    return makeRow(itemId, link, count, minBid, buyout, bid, GetAuctionItemTimeLeft("list", i), ownerFull or owner),
+      itemId, name, quality, link
   end
 end
 
@@ -99,6 +104,7 @@ local function readFullScan()
   local source = state.ownScan and "ahtool" or "addon"
   state.ownScan = false
   local rows, seen, t = {}, {}, time()
+  local names, nameList = {}, {}
   local i, last_i = api.first, api.first + total - 1
   local function step()
     if api.count() ~= total then
@@ -110,7 +116,15 @@ local function readFullScan()
     state.progress = (i - api.first) / total
     local stop = math.min(i + BATCH - 1, last_i)
     for idx = i, stop do
-      local ok, row = pcall(api.row, idx)
+      local ok, row, itemId, name, quality, link = pcall(api.row, idx)
+      if ok and itemId and not names[itemId] then
+        if (not name or name == "") and type(link) == "string" then name = link:match("|h%[(.-)%]|h") end
+        name = name and clean(name):gsub(":", "") or ""
+        if name ~= "" then
+          names[itemId] = true
+          nameList[#nameList + 1] = string.format("%d:%d:%s", itemId, tonumber(quality) or -1, name)
+        end
+      end
       if ok and row then
         local k = seen[row]
         if k then
@@ -138,7 +152,7 @@ local function readFullScan()
     local realm, faction, char = who()
     local scans = db().scans
     scans[#scans + 1] = { t = t, realm = realm, faction = faction, char = char, src = source, api = MODERN and "modern" or "legacy",
-                          total = total, n = n, d = table.concat(out, ";") }
+                          total = total, n = n, d = table.concat(out, ";"), nm = table.concat(nameList, ";") }
     while #scans > KEEP_SCANS do table.remove(scans, 1) end
     msg(string.format("saved full scan with %d auctions. /reload or log out to send it to AH Tool.", n))
   end
