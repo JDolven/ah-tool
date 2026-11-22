@@ -67,10 +67,11 @@ check(lconn.execute("SELECT COUNT(*) FROM ah_sales WHERE owner='Me'").fetchone()
 
 # ---------------------------------------------------------------- web server on an empty DB
 web_path = os.path.join(tmp, "web.db")
-wcfg = {"web": True, "sync_token": TOKEN}
+wcfg = {"web": True, "sync_token": TOKEN, "analytics_script": "https://stats.example/script.js",
+        "analytics_id": "abc-123", "public_url": "https://ah.example"}
 webdir = tempfile.mkdtemp()
 with open(os.path.join(webdir, "index.html"), "w", encoding="utf-8") as f:
-    f.write('<!doctype html><html lang="en" data-theme="dark"><body>X</body></html>')
+    f.write('<!doctype html><html lang="en" data-theme="dark"><head><title>t</title></head><body>X</body></html>')
 srv = server.make_server(wcfg, lambda: db.connect(web_path), port=0, web_dir=webdir, web=True)
 BASE = "http://127.0.0.1:%d" % srv.server_address[1]
 threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -164,6 +165,20 @@ check(code == 400, "partial static -> 400 (%s)" % code)
 # ---------------------------------------------------------------- web endpoints
 html = urllib.request.urlopen(BASE + "/").read()
 check(b'data-mode="web"' in html, "index marked as web version")
+check(b'data-website-id="abc-123"' in html and b'data-auto-track="false"' in html
+      and b'data-domains="ah.example"' in html and html.index(b"stats.example") < html.index(b"</head>"),
+      "analytics tag in the web version")
+csp = urllib.request.urlopen(BASE + "/").headers.get("Content-Security-Policy") or ""
+check("script-src 'self' https://stats.example" in csp and "connect-src 'self' https://stats.example" in csp,
+      "CSP allows the tracker origin: %s" % csp)
+lsrv = server.make_server({}, lambda: db.connect(web_path), port=0, web_dir=webdir)
+threading.Thread(target=lsrv.serve_forever, daemon=True).start()
+check(b"stats.example" not in urllib.request.urlopen("http://127.0.0.1:%d/" % lsrv.server_address[1]).read(),
+      "no analytics in the local app")
+lsrv.shutdown()
+# A second make_server in the same process must not shrink the thread stack (musl: 128 kB -> segfault on deep JSON)
+code = call("POST", "/api/x", raw=b"[" * 100000 + b"]" * 100000)[0]
+check(code == 400, "deeply nested body after a second make_server -> 400, no crash (%s)" % code)
 for p in ("/api/postings", "/api/market/my"):
     code, res = x("GET", p)
     check(code == 404, "%s blocked in web version (%s)" % (p, code))
