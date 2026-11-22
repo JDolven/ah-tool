@@ -923,6 +923,54 @@ finally:
     bs_srv.shutdown()
 
 tgt.shutdown()
+# ---------------------------------------------------------------- a scan larger than one batch goes in parts
+orig_batch = sync.MAX_BATCH_ROWS
+sync.MAX_BATCH_ROWS = 50
+try:
+    big_pc = db.connect(os.path.join(tmp, "big_pc.db"))
+    market.ensure_schema(big_pc)
+    big_pc.execute("INSERT INTO ah_scans(ts,realm,faction,char,source,total,n,partial,raw_kept,diffed) "
+                   "VALUES(?, 'Home', 'Alliance', 'Me', 'full', 230, 230, 0, 1, 0)", (NOW - 600,))
+    bsid = big_pc.execute("SELECT MAX(id) FROM ah_scans").fetchone()[0]
+    big_pc.executemany("INSERT INTO ah_auctions(scan_id,item_id,suffix,count,buyout,min_bid,bid,time_left,owner) "
+                       "VALUES(?,?,0,1,?,?,0,4,'x')", [(bsid, 2589, 100 + i, 90 + i) for i in range(230)])
+    big_pc.commit()
+    cw, idw = fresh_web("big_web.db")
+    bb, _ = sync.build_batches(big_pc, {}, sync.remote_state(cw, src(idw, "Own")))
+    check(all(sync._count_rows(b) <= 2 * sync.MAX_BATCH_ROWS for b in bb), "every batch of a big scan stays small")
+    n_auct = lambda: cw.execute("SELECT COUNT(*) FROM ah_auctions").fetchone()[0]  # noqa: E731
+    # the first batches arrive, then the push fails half way
+    for b in bb[:3]:
+        sync.apply(cw, {}, b, src(idw, "Own"))
+    part = n_auct()
+    check(0 < part < 230, "half a big scan stored (%d auctions)" % part)
+    # a retried part is never stored twice
+    again = [u for b in bb[:3] for u in b.get("scan_updates") or [] if "more_auctions" in u]
+    if again:
+        sync.apply(cw, {}, {"protocol": sync.PROTOCOL, "scan_updates": again[-1:]}, src(idw, "Own"))
+    check(n_auct() == part, "a part sent twice is skipped")
+    # the next push sends only what is missing
+    bb2, _ = sync.build_batches(big_pc, {}, sync.remote_state(cw, src(idw, "Own")))
+    for b in bb2:
+        sync.apply(cw, {}, b, src(idw, "Own"))
+    check(n_auct() == 230, "the next push completes the scan (%d of 230 auctions)" % n_auct())
+    check(q(cw, "SELECT COUNT(DISTINCT buyout) FROM ah_auctions") == [(230,)], "no auction stored twice")
+    bb3, _ = sync.build_batches(big_pc, {}, sync.remote_state(cw, src(idw, "Own")))
+    check(not any("more_auctions" in u for b in bb3 for u in b.get("scan_updates") or []),
+          "nothing more to send once the scan is complete")
+    # another key can't append to the owner's scan
+    r = sync.apply(cw, {}, {"protocol": sync.PROTOCOL, "scan_updates": [
+        {"key": ["Home", "Alliance", NOW - 600], "auctions_from": 230,
+         "more_auctions": [[2589, 0, 1, 5, 5, 0, 4, "m"]]}]}, src(idw, "Mal"))
+    check(n_auct() == 230, "another key's auction part is not taken (%s)" % r)
+    check(refused(lambda: sync.apply(cw, {}, {"protocol": sync.PROTOCOL, "scan_updates": [
+        {"key": ["Home", "Alliance", NOW - 600], "auctions_from": -1, "more_auctions": []}]}, src(idw, "Own"))),
+          "a negative auctions_from is refused")
+    big_pc.close()
+    cw.close()
+finally:
+    sync.MAX_BATCH_ROWS = orig_batch
+
 rd.shutdown()
 srv.shutdown()
 w.close()
