@@ -1,7 +1,8 @@
 """AH Tool Logger data: full scans, market depth, estimated sales, own auctions and AH mail.
 
 The in-game addon (addon/AHToolLogger) writes AHToolLoggerDB to SavedVariables/AHToolLogger.lua:
-  scans = [{t, realm, faction, char, src, total, n, d="itemId,suffix,count,buyout,minBid,bid,timeLeft,owner;..."}]
+  scans = [{t, realm, faction, char, src, total, n, d="itemId,suffix,count,buyout,minBid,bid,timeLeft,owner;...",
+            nm="itemId:quality:name;..." (logger 1.1+; names custom items missing from the static data)}]
   owned = {"realm-char": {t, realm, faction, char, d="...,saleStatus;..."}}
   mail  = {key: {t, type=sold|bought|expired|cancelled, item, itemId?, player, price, buyout, deposit, fee, count, char}}
 
@@ -44,6 +45,7 @@ CREATE INDEX IF NOT EXISTS idx_my_mail_ts ON my_mail(ts);
 CREATE TABLE IF NOT EXISTS my_auctions(char_key TEXT, ts INTEGER, char TEXT, realm TEXT, item_id INTEGER,
     suffix INTEGER, count INTEGER, buyout INTEGER, min_bid INTEGER, bid INTEGER, time_left INTEGER,
     sale_status INTEGER);
+CREATE TABLE IF NOT EXISTS ah_item_names(id INTEGER PRIMARY KEY, name TEXT, quality INTEGER, ts INTEGER);
 """
 
 _lock = threading.Lock()
@@ -277,6 +279,44 @@ def _drop_scan(cur, sid):
     cur.execute("DELETE FROM ah_scans WHERE id=?", (sid,))
 
 
+def parse_names(nm):
+    """Scan field nm = "itemId:quality:name;..." -> {item_id: (name, quality|None)}."""
+    out = {}
+    for part in _s(nm).split(";"):
+        bits = part.split(":", 2)
+        if len(bits) != 3 or not bits[2].strip():
+            continue
+        iid, q = _i(bits[0]), _i(bits[1], -1)
+        if iid > 0 and iid not in out:
+            out[iid] = (bits[2].strip(), q if 0 <= q <= 7 else None)
+    return out
+
+
+def _store_names(cur, names):
+    """Remember item names seen on the AH and name items the static data does not know (custom realm items)."""
+    if names:
+        now = int(time.time())
+        cur.executemany("INSERT INTO ah_item_names(id, name, quality, ts) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE "
+                        "SET name=excluded.name, quality=COALESCE(excluded.quality, quality), ts=excluded.ts",
+                        [(iid, n, q, now) for iid, (n, q) in names.items()])
+    return apply_names(cur)
+
+
+def apply_names(conn):
+    """Copy remembered AH names into items where the item is missing or unnamed. Existing names are never
+    overwritten. Also called after a static data rebuild. Returns the number of items named."""
+    try:
+        before = conn.execute("SELECT total_changes()").fetchone()[0]
+        conn.execute("INSERT OR IGNORE INTO items(id, name, quality) "
+                     "SELECT id, name, COALESCE(quality, 1) FROM ah_item_names")
+        conn.execute("UPDATE items SET name=(SELECT n.name FROM ah_item_names n WHERE n.id=items.id), "
+                     "quality=COALESCE(quality, (SELECT n.quality FROM ah_item_names n WHERE n.id=items.id)) "
+                     "WHERE (name IS NULL OR name='') AND id IN (SELECT id FROM ah_item_names)")
+        return conn.execute("SELECT total_changes()").fetchone()[0] - before
+    except Exception:  # table missing (logger never ingested)
+        return 0
+
+
 def _name_map(conn):
     m = {}
     for iid, name in conn.execute("SELECT id, name FROM items WHERE name IS NOT NULL ORDER BY id DESC"):
@@ -303,6 +343,12 @@ def ingest(conn, cfg, force=False):
         cur = conn.cursor()
         try:
             cur.execute("BEGIN IMMEDIATE")
+            names = {}
+            for s in _seq(data.get("scans")):
+                if isinstance(s, dict):
+                    for iid, v in parse_names(s.get("nm")).items():
+                        names.setdefault(iid, v)
+            new_names = _store_names(cur, names)
             for s in sorted((x for x in _seq(data.get("scans")) if isinstance(x, dict)), key=lambda x: _i(x.get("t"))):
                 ts, realm, faction = _i(s.get("t")), _s(s.get("realm")), _s(s.get("faction"))
                 if not ts:
@@ -383,7 +429,8 @@ def ingest(conn, cfg, force=False):
         except Exception:
             conn.rollback()
             raise
-    return {"skipped": False, "scans": new_scans, "sold": sold, "mail": new_mail, "owned": n_owned}
+    return {"skipped": False, "scans": new_scans, "sold": sold, "mail": new_mail, "owned": n_owned,
+            "names": new_names}
 
 
 # ---------------------------------------------------------------- queries

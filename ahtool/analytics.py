@@ -101,11 +101,16 @@ def get_realm(conn, realm=None):
     r = _web_default_realm(conn)
     if r:
         return r
-    r = conn.execute("SELECT realm FROM ingests ORDER BY id DESC LIMIT 1").fetchone()
+    # Latest ingest that actually carried prices: Auctionator can also save empty realm keys (e.g. "PvP Alliance"
+    # next to "PvP"), which would otherwise become the active realm and hide every price.
+    r = conn.execute("SELECT realm FROM ingests WHERE items > 0 ORDER BY id DESC LIMIT 1").fetchone()
     if r and r[0]:
         return r[0]
-    r = conn.execute("SELECT realm FROM price_current LIMIT 1").fetchone()
-    return r[0] if r else None
+    r = conn.execute("SELECT realm FROM price_current GROUP BY realm ORDER BY COUNT(*) DESC, realm LIMIT 1").fetchone()
+    if r:
+        return r[0]
+    r = conn.execute("SELECT realm FROM ingests ORDER BY id DESC LIMIT 1").fetchone()
+    return r[0] if r and r[0] else None
 
 
 def list_realms(conn):
@@ -117,7 +122,7 @@ def list_realms(conn):
             d = _web_default_realm(conn)
             return sorted(set(owned) | ({d} if d else set()))
     rs = [r[0] for r in conn.execute("SELECT DISTINCT realm FROM price_current ORDER BY realm")]
-    for r in conn.execute("SELECT DISTINCT realm FROM ingests"):
+    for r in conn.execute("SELECT DISTINCT realm FROM ingests WHERE items > 0"):
         if r[0] and r[0] not in rs:
             rs.append(r[0])
     return rs
@@ -513,10 +518,17 @@ def _price_on(ctx, iid, day):
     return None
 
 
+def _vendor_value(ctx, created, num):
+    """Copper from selling the whole output of one craft to a vendor (0 when unknown / not vendorable)."""
+    it = ctx.items.get(created) if created else None
+    return (it.get("vendor_sell") or 0) * num if it else 0
+
+
 def _recipe_points(ctx, rd, days):
     """[(day, cost|None, sell|None, profit|None, margin|None)] for the last `days` days."""
     _, created, num, reag = rd
     cut = ctx.p["cut"]
+    vend_value = _vendor_value(ctx, created, num)
     out = []
     latest = ctx.latest_day
     for d in range(latest - days + 1, latest + 1):
@@ -535,8 +547,9 @@ def _recipe_points(ctx, rd, days):
             if pp is not None:
                 sell = pp * num
         profit = margin = None
-        if cost is not None and sell is not None:
-            profit = sell * (1 - cut) - cost
+        if cost is not None and (sell is not None or vend_value):
+            # Recovery is the better of the AH sale (after the cut) and selling to a vendor
+            profit = max(sell * (1 - cut) if sell is not None else 0, vend_value) - cost
             margin = profit / cost if cost > 0 else None
         out.append((d, cost, sell, profit, margin))
     return out
@@ -628,6 +641,8 @@ def _build_recipes(conn, ctx, cfg, where, params, mode):
         sell = profit = margin = None
         sell_avail = None
         sell_conf = sell_flag = None
+        sell_source = None
+        vend_value = _vendor_value(ctx, created, num)
         if created:
             p = sell_price(ctx, created, mode)
             c = ctx.cur.get(created)
@@ -635,10 +650,16 @@ def _build_recipes(conn, ctx, cfg, where, params, mode):
             if p is not None:
                 sell = p * num
                 sell_conf, sell_flag = confidence(ctx, created), ctx.flag.get(created)
+            # Recovery = the better of the AH sale after the cut and the vendor price
+            ah_net = sell * (1 - cut) if sell is not None else None
+            if ah_net is not None and ah_net >= vend_value:
+                sell_source, recovery = "ah", ah_net
                 worst = min(worst, _CONF_RANK[sell_conf])
-                if complete:
-                    profit = sell * (1 - cut) - cost
-                    margin = profit / cost if cost > 0 else None
+            elif vend_value:
+                sell_source, recovery = "vendor", vend_value
+            if sell_source and complete:
+                profit = recovery - cost
+                margin = profit / cost if cost > 0 else None
         cname = _name(ctx, created) if created else None
         tr = trends.get(sid)
         out.append({
@@ -648,7 +669,8 @@ def _build_recipes(conn, ctx, cfg, where, params, mode):
             "created_quality": _quality(ctx, created) if created else None,
             "num_created": num, "skill": {"min": mn, "low": lo, "high": hi},
             "reagents": rl, "cost": _round(cost, 2), "cost_complete": complete,
-            "sell": _round(sell, 2), "profit": _round(profit, 2), "margin": _round(margin),
+            "sell": _round(sell, 2), "vendor_value": _round(vend_value, 2) if created else None,
+            "sell_source": sell_source, "profit": _round(profit, 2), "margin": _round(margin),
             "sell_available": sell_avail,
             "sell_confidence": sell_conf, "sell_price_flag": sell_flag,
             "confidence": ("low", "medium", "high")[worst],
@@ -689,6 +711,7 @@ def mycrafts(conn, cfg=None, mode="current", limit=50, realm=None):
 
 
 def professions(conn, cfg=None, realm=None):
+    from . import gathering  # gathering imports analytics
     ctx = _ctx(conn, cfg, realm)
     mine = userstate.my_professions(conn)
     counts = {r[0]: r[1] for r in conn.execute("SELECT profession_id, COUNT(*) FROM recipes GROUP BY profession_id")}
@@ -699,10 +722,13 @@ def professions(conn, cfg=None, realm=None):
         priced = [r for r in recs if r["profit"] is not None]
         sure = [r for r in priced if r["confidence"] != "low"]
         names = PROFESSIONS.get(pid, ("Profession %d" % pid, "Profession %d" % pid))
+        g = gathering.gather_items(conn, cfg, pid, ctx.realm) if gathering.gather_count(pid) else []
         out.append({
             "id": pid, "name": names[0], "name_no": names[1],
             "mine": pid in mine, "my_skill": mine.get(pid),
             "recipe_count": counts.get(pid, 0), "priced_count": len(priced),
+            "gather_count": len(g), "gather_priced": sum(1 for r in g if r["price"]),
+            "gather_top_price": max((r["price"] for r in g if r["price"]), default=None),
             "profitable_count": sum(1 for r in priced if r["profit"] > 0),
             "best_profit": max((r["profit"] for r in priced), default=None),
             "reliable_count": len(sure),

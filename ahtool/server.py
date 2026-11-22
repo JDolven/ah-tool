@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse, urlsplit
 
 from . import alerts as alerts_mod
-from . import analytics, market, notify, shopping, tooltip, userstate, webstate
+from . import analytics, gathering, market, notify, shopping, tooltip, userstate, webstate
 
 # Web version: endpoints that only make sense on the PC that runs WoW, or that would expose your own trades.
 WEB_BLOCKED = {
@@ -1067,6 +1067,9 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                 return r
             if path == "/api/professions":
                 return A.professions(conn, cfg, realm)
+            m = re.fullmatch(r"/api/professions/(\d+)/gather", path)
+            if m:
+                return gathering.gather_items(conn, cfg, int(m.group(1)), realm)
             m = re.fullmatch(r"/api/professions/(\d+)", path)
             if m:
                 return A.profession_recipes_user(conn, cfg, int(m.group(1)), qs.get("mode", "current"), realm,

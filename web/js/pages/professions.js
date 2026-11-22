@@ -13,6 +13,8 @@ export const PROF_ICONS = {
 };
 
 const detailState = { mode: 'current', onlyProfit: false, text: '', mineOnly: false, hideLow: true };
+const gatherState = { text: '', upToSkill: false };
+const KIND_LABEL = { herb: 'Herb', ore: 'Ore', stone: 'Stone', gem: 'Gem', fish: 'Fish', leather: 'Leather', hide: 'Hide', scale: 'Scale' };
 
 export async function renderList(ctx) {
   const { el } = ctx;
@@ -40,8 +42,8 @@ export async function renderList(ctx) {
   }
   const sorted = profs.slice().sort((a, b) => {
     if (!!a.mine !== !!b.mine) return a.mine ? -1 : 1;
-    const ra = a.recipe_count > 0 ? 1 : 0;
-    const rb = b.recipe_count > 0 ? 1 : 0;
+    const ra = a.recipe_count > 0 || a.gather_count > 0 ? 1 : 0;
+    const rb = b.recipe_count > 0 || b.gather_count > 0 ? 1 : 0;
     if (ra !== rb) return rb - ra;
     return (bestOf(b) ?? -Infinity) - (bestOf(a) ?? -Infinity);
   });
@@ -49,6 +51,28 @@ export async function renderList(ctx) {
     .map((p) => {
       const empty = !p.recipe_count;
       const pricedPct = p.recipe_count ? p.priced_count / p.recipe_count : 0;
+      if (!p.recipe_count && p.gather_count) {
+        const pricedShare = p.gather_priced / p.gather_count;
+        return `<a class="prof-card ${p.mine ? 'is-mine' : ''}" href="#/professions/${encodeURIComponent(p.id)}">
+        <div class="prof-top">
+          <span class="prof-icon" aria-hidden="true">${PROF_ICONS[p.id] || '◇'}</span>
+          <div class="prof-top-text">
+            <div class="prof-name">${esc(p.name)}</div>
+            ${p.mine ? `<div class="prof-sub">Your skill ${isNum(p.my_skill) ? num(p.my_skill) : '–'}</div>` : ''}
+          </div>
+          ${p.mine ? '<span class="badge b-mine" title="One of your professions">✓ Mine</span>' : ''}
+        </div>
+        <div class="prof-stats">
+          <div><span class="ps-val">${num(p.gather_count)}</span><span class="ps-lbl">to gather</span></div>
+          <div><span class="ps-val">${num(p.gather_priced)}</span><span class="ps-lbl">on the AH</span></div>
+        </div>
+        <div class="prof-best">
+          <span class="ps-lbl">Highest price</span>
+          <span>${isNum(p.gather_top_price) ? money(p.gather_top_price) : '<span class="muted">–</span>'}</span>
+        </div>
+        <div class="meter" title="${num(p.gather_priced)} of ${num(p.gather_count)} have an AH price"><div class="meter-fill" style="width:${(pricedShare * 100).toFixed(0)}%"></div></div>
+      </a>`;
+      }
       return `<a class="prof-card ${empty ? 'is-empty' : ''} ${p.mine ? 'is-mine' : ''}" href="#/professions/${encodeURIComponent(p.id)}">
         <div class="prof-top">
           <span class="prof-icon" aria-hidden="true">${PROF_ICONS[p.id] || '◇'}</span>
@@ -96,7 +120,8 @@ export async function renderDetail(ctx) {
         <p class="lead" id="pd-lead"></p>
       </div>
     </header>
-    <section class="card filters">
+    <div id="pd-gather"></div>
+    <section class="card filters" id="pd-filters">
       <div class="filter-row">
         <div class="seg" role="radiogroup" aria-label="Price basis">
           <button class="seg-btn ${detailState.mode === 'current' ? 'on' : ''}" data-mode="current" role="radio" aria-checked="${detailState.mode === 'current'}">Current price</button>
@@ -114,6 +139,9 @@ export async function renderDetail(ctx) {
     </section>
     <div class="result-bar" id="pd-summary"></div>
     <section class="card card-flush" id="pd-table">${skeletonRows(12, 6)}</section>`;
+
+  let profInfo = null;
+  const gatherReady = renderGather(ctx, id, () => profInfo);
 
   const table = new DataTable(el.querySelector('#pd-table'), recipeColumns({ shop: true }), {
     sortKey: 'profit',
@@ -136,10 +164,13 @@ export async function renderDetail(ctx) {
   api.professions().then((profs) => {
     if (!ctx.alive()) return;
     const p = (profs || []).find((x) => String(x.id) === String(id));
+    profInfo = p || null;
     const name = p ? p.name : `Profession #${id}`;
     el.querySelector('#pd-title').innerHTML = `<span class="prof-icon lg" aria-hidden="true">${PROF_ICONS[id] || '◇'}</span> ${esc(name)}`;
     el.querySelector('#pd-crumb').textContent = name;
-    el.querySelector('#pd-lead').innerHTML = p
+    el.querySelector('#pd-lead').innerHTML = p && !p.recipe_count && p.gather_count
+      ? `${num(p.gather_count)} ${p.gather_count === 1 ? 'thing' : 'things'} to gather, with where to find them and what they sell for${p.mine ? ` · <span class="badge b-mine">✓ Mine – skill ${isNum(p.my_skill) ? num(p.my_skill) : '–'}</span>` : ''}`
+      : p
       ? `${num(p.recipe_count)} recipes · ${num(p.priced_count)} with complete pricing · ${num(p.profitable_count)} profitable${p.mine ? ` · <span class="badge b-mine">✓ Mine – skill ${isNum(p.my_skill) ? num(p.my_skill) : '–'}</span>` : ''}`
       : '';
     document.title = `${name} – AH Tool`;
@@ -184,7 +215,14 @@ export async function renderDetail(ctx) {
         return;
       }
       if (!data.length) {
-        el.querySelector('#pd-table').innerHTML = emptyState('No recipes for this profession', 'Gathering professions (Herbalism, Mining, Skinning, Fishing) have no recipes to calculate.');
+        if (await gatherReady) {
+          // A pure gathering profession: the list above is the page; hide the empty recipe part.
+          for (const s of ['#pd-rec-title', '#pd-filters', '#pd-summary', '#pd-table']) { const n = el.querySelector(s); if (n) n.hidden = true; }
+          return;
+        }
+        el.querySelector('#pd-table').innerHTML = ['5', '7', '11', '12'].includes(String(id))
+          ? emptyState('Nothing to list yet', 'None of the items for this profession are in the item data. Item names are downloaded on the first start.')
+          : emptyState('No recipes for this profession', 'Recipe data is built at startup from AtlasLootClassic.');
         el.querySelector('#pd-summary').innerHTML = '';
         return;
       }
@@ -226,6 +264,90 @@ export async function renderDetail(ctx) {
   await load();
 }
 
+const GATHER_TITLE = {
+  5: 'Herbs you can pick', 7: 'Ore, stone and gems you can mine', 11: 'Fish you can catch', 12: 'Leather, hides and scales you can skin',
+};
+
+/** "What can be gathered" list for Herbalism, Mining, Fishing and Skinning. Resolves to true when it shows rows. */
+async function renderGather(ctx, id, getProf) {
+  const { el } = ctx;
+  let rows;
+  try {
+    rows = await api.gather(id);
+  } catch (err) {
+    return false;
+  }
+  if (!ctx.alive() || !Array.isArray(rows) || !rows.length) return false;
+  const approx = rows.some((r) => r.skill_approx);
+  const box = el.querySelector('#pd-gather');
+  box.innerHTML = `
+    <h2 class="section-title">${esc(GATHER_TITLE[id] || 'What you can gather')}</h2>
+    <section class="card filters">
+      <div class="filter-row">
+        <label class="toggle" id="g-mine-wrap" hidden title="Hide what needs more skill than yours (set under My Professions)"><input type="checkbox" id="g-mine" ${gatherState.upToSkill ? 'checked' : ''}><span class="toggle-ui"></span> Up to my skill</label>
+        <label class="field field-grow">
+          <span class="field-label sr-only">Search</span>
+          <input type="search" id="g-txt" placeholder="Search by name or zone…" value="${esc(gatherState.text)}">
+        </label>
+      </div>
+      <p class="filter-note">${approx
+        ? (String(id) === '11'
+          ? 'Skill is the usual fishing level of the waters where the fish is caught (~ = approximate). You can fish there earlier, but you get away more often.'
+          : 'Skill follows the level of the beast: about level × 5 (~ = approximate).')
+        : 'Skill is what you need to gather the node or plant.'} Prices are the lowest current AH price and the 14-day market price.</p>
+    </section>
+    <div class="result-bar" id="g-summary"></div>
+    <section class="card card-flush" id="g-table"></section>`;
+
+  const table = new DataTable(box.querySelector('#g-table'), [
+    {
+      key: 'name', label: 'Item', defaultDir: 'asc', sort: (r) => String(r.name || '').toLowerCase(),
+      render: (r) => `${itemLink(r.id, r.name, r.quality)}${confBadge(r.confidence)}${r.price_flag ? ' ' + flagChip(r.price_flag) : ''}<div class="cell-sub">${esc(KIND_LABEL[r.kind] || '')}</div>`,
+    },
+    { key: 'skill', label: 'Skill', align: 'right', defaultDir: 'asc', render: (r) => (isNum(r.skill) ? `${r.skill_approx ? '~' : ''}${num(r.skill)}` : '<span class="muted">–</span>') },
+    { key: 'where', label: 'Where', hideSm: true, sort: (r) => String(r.where || '').toLowerCase(), render: (r) => `<span class="muted">${esc(r.where || '')}</span>` },
+    { key: 'price', label: 'Price', align: 'right', render: (r) => money(r.price) },
+    { key: 'baseline', label: 'Market price', align: 'right', hideSm: true, render: (r) => money(r.baseline) },
+    { key: 'available', label: 'Available', align: 'right', hideMd: true, render: (r) => num(r.available) },
+    { key: 'vendor_sell', label: 'Vendor', align: 'right', hideMd: true, title: 'What a vendor pays', render: (r) => money(r.vendor_sell) },
+  ], {
+    sortKey: 'skill',
+    sortDir: 'asc',
+    rowKey: (r) => r.id,
+    empty: emptyState('Nothing matches', 'Try another search, or turn off “Up to my skill”.'),
+  });
+
+  const apply = () => {
+    const p = getProf();
+    const mySkill = p && p.mine && isNum(p.my_skill) ? p.my_skill : null;
+    box.querySelector('#g-mine-wrap').hidden = mySkill === null;
+    const t = gatherState.text.trim().toLowerCase();
+    const shown = rows.filter((r) => {
+      if (gatherState.upToSkill && mySkill !== null && isNum(r.skill) && r.skill > mySkill) return false;
+      return !t || `${r.name || ''} ${r.where || ''}`.toLowerCase().includes(t);
+    });
+    table.setRows(shown);
+    const priced = shown.filter((r) => isNum(r.price));
+    const best = priced.reduce((b, r) => (!b || r.price > b.price ? r : b), null);
+    box.querySelector('#g-summary').innerHTML = `<span><strong>${num(shown.length)}</strong> items</span>
+      <span class="muted">${num(priced.length)} with an AH price</span>
+      ${best ? `<span>Highest price: ${itemLink(best.id, best.name, best.quality)} ${money(best.price)}</span>` : ''}`;
+  };
+  apply();
+  box.querySelector('#g-mine').addEventListener('change', (e) => {
+    gatherState.upToSkill = e.target.checked;
+    apply();
+  });
+  box.querySelector('#g-txt').addEventListener('input', debounce((e) => {
+    gatherState.text = e.target.value;
+    apply();
+  }, 150));
+  el.querySelector('#pd-filters').insertAdjacentHTML('beforebegin', `<h2 class="section-title" id="pd-rec-title">${String(id) === '7' ? 'Smelting' : 'Recipes'}</h2>`);
+  // the profession info (my skill) may arrive after the list
+  api.professions().then(() => ctx.alive() && apply()).catch(() => {});
+  return true;
+}
+
 export function recipeName(r) {
   const n = r.num_created > 1 ? ` <span class="muted">×${num(r.num_created, 1)}</span>` : '';
   if (r.created_item_id) return itemLink(r.created_item_id, r.name || r.created_name, r.created_quality) + n;
@@ -249,7 +371,21 @@ export function recipeColumns(opts = {}) {
   }
   cols.push(
     { key: 'cost', label: 'Cost', align: 'right', hideSm: !!opts.shop, render: (r) => `${money(r.cost)}${!r.cost_complete ? '<span class="warn-mark" title="Incomplete cost">*</span>' : ''}` },
-    { key: 'sell', label: 'Sell value', align: 'right', hideSm: !!opts.shop, render: (r) => (r.created_item_id ? money(r.sell) : '<span class="muted" title="Does not create an item (e.g. an enchant)">–</span>') },
+    {
+      key: 'sell',
+      label: 'Sell value',
+      align: 'right',
+      hideSm: !!opts.shop,
+      sort: (r) => (r.sell_source === 'vendor' ? r.vendor_value : r.sell),
+      render: (r) => {
+        if (!r.created_item_id) return '<span class="muted" title="Does not create an item (e.g. an enchant)">–</span>';
+        if (r.sell_source === 'vendor') {
+          const why = isNum(r.sell) ? 'Selling to a vendor pays more than the AH after the cut' : 'No AH price – profit uses the vendor price';
+          return `<span title="${why}">${money(r.vendor_value)} <span class="src src-vendor">Vendor</span></span>`;
+        }
+        return money(r.sell);
+      },
+    },
     {
       key: 'profit',
       label: 'Profit',
@@ -311,7 +447,8 @@ export function recipeExpand(r) {
       </tbody>
       <tfoot>
         <tr><td colspan="4">Total cost${!r.cost_complete ? ' <span class="warn-text">(incomplete)</span>' : ''}</td><td class="r">${money(r.cost)}</td></tr>
-        ${r.created_item_id ? `<tr><td colspan="4">Sale after 5% AH cut ${confBadge(r.sell_confidence)} ${flagChip(r.sell_price_flag)}</td><td class="r">${isNum(r.sell) ? money(Math.round(r.sell * 0.95)) : '–'}</td></tr>` : ''}
+        ${r.created_item_id ? `<tr class="${r.sell_source === 'ah' ? '' : 'muted'}"><td colspan="4">Sale after 5% AH cut ${confBadge(r.sell_confidence)} ${flagChip(r.sell_price_flag)}${r.sell_source === 'ah' ? ' <span class="tag-mini ok">used</span>' : ''}</td><td class="r">${isNum(r.sell) ? money(Math.round(r.sell * 0.95)) : '–'}</td></tr>` : ''}
+        ${r.created_item_id && r.vendor_value ? `<tr class="${r.sell_source === 'vendor' ? '' : 'muted'}"><td colspan="4">Sell to vendor${r.sell_source === 'vendor' ? ' <span class="tag-mini ok">used</span>' : ''}</td><td class="r">${money(r.vendor_value)}</td></tr>` : ''}
       </tfoot>
     </table>
   </div>${trend}</div>`;

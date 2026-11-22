@@ -248,6 +248,10 @@ def ensure(conn, cfg, force=False):
                 rebuilt_items = rebuilt_items or table == "items"
             except Exception as ex:
                 log("%s build failed: %r" % (table, ex))
+    if rebuilt_items:  # custom items named from AH scans (logger) are not in the static data
+        from . import market
+        market.apply_names(conn)
+        conn.commit()
     # Tooltips also patch items.quality/item_level (Forever overrides), so rebuild them after an items rebuild.
     if force or rebuilt_items or not tooltips_current(conn):
         try:

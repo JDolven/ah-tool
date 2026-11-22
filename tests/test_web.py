@@ -241,7 +241,7 @@ code, res = x("GET", "/api/mycrafts", None, {"professions": {"x": "y", "4": 9999
 check(code == 200 and res["r"] == [], "garbage state ignored (%s)" % code)
 try:  # the server answers 413 without reading the body, so the client may see a broken pipe instead
     code = call("POST", "/api/x", raw=b"x" * (2 << 20))[0]
-except urllib.error.URLError:
+except (urllib.error.URLError, ConnectionError):  # Windows may raise ConnectionAbortedError (WinError 10053)
     code = 413
 check(code == 413, "oversized call refused (%s)" % code)
 

@@ -101,7 +101,9 @@ Python API exported by DATA agent:
 - discount = 1 − current/baseline. Stale if last_day < latest day in DB for realm − 2.
 - Unit cost of a reagent = min(AH current price, vendor_items price) – source `"ah"`/`"vendor"`/`"none"`.
   Recipe cost = Σ count × unit cost; `cost_complete` false if any reagent has no price.
-- Sell value = AH current price of created item × num_created; profit = sell × (1 − ah_cut) − cost; margin = profit/cost.
+- Sell value = AH current price of created item × num_created; vendor_value = items.vendor_sell × num_created.
+  profit = max(sell × (1 − ah_cut), vendor_value) − cost; margin = profit/cost. `sell_source` = "ah" | "vendor" | null
+  says which one was used (vendor also when there is no AH price). The daily profit trend uses the same rule.
   No created item (e.g. enchants) → sell/profit null. Use baseline instead of current for "market price" view option.
 - Deals (`/api/deals`) reasons:
   - `under_vendor`: current price × (1) < items.vendor_sell → guaranteed profit selling to vendor (profit = vendor_sell − price).
@@ -118,9 +120,13 @@ Python API exported by DATA agent:
    stats:{baseline,avg7,avg30,min30,max30,median30,days_of_data,volatility,trend7_pct}, history:[{date,low,high,available}],
    snapshots:[{ts,price,available}], crafted_by:[recipe objects], used_in:[{spell_id,name,profession,count}], postings:[{ts,price,quantity}]}`
 - `GET /api/professions` → `[{id,name,name_no,recipe_count,priced_count,profitable_count,best_profit}]`
+- `GET /api/professions/<id>/gather` → what a gathering profession (5 Herbalism, 7 Mining, 11 Fishing, 12 Skinning)
+  can gather, `[]` for others: `[{id,name,quality,price,available,last_date,baseline,discount,confidence,price_flag,
+  skill,skill_approx,where,kind,vendor_sell}]`. Curated Classic list in `ahtool/gathering.py`, resolved by item name.
+  `GET /api/professions` items also carry `gather_count`, `gather_priced`, `gather_top_price`.
 - `GET /api/professions/<id>?mode=current|baseline` → `[recipe]`, recipe =
   `{spell_id,name,created_item_id,created_name,created_quality,num_created,skill:{min,low,high},
-    reagents:[{item_id,name,quality,count,unit_price,source,total,is_deal}], cost,cost_complete,sell,profit,margin,sell_available}`
+    reagents:[{item_id,name,quality,count,unit_price,source,total,is_deal}], cost,cost_complete,sell,vendor_value,sell_source,profit,margin,sell_available}`
   (name = created item name or spell name)
 - `GET /api/deals?threshold=0.25&min_value=0&reason=` → `[{item_id,name,quality,price,baseline,discount,available,days_of_data,
    reasons:[..], vendor_profit, professions:[..], score}]`
