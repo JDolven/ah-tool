@@ -88,6 +88,13 @@ def _web_default_realm(conn):
     return r[0] if r else None
 
 
+def _is_web_db(conn):
+    try:
+        return conn.execute("SELECT 1 FROM main.meta WHERE key='sync_epoch'").fetchone() is not None
+    except Exception:  # noqa
+        return False
+
+
 def get_realm(conn, realm=None):
     if realm:
         return realm
@@ -102,6 +109,13 @@ def get_realm(conn, realm=None):
 
 
 def list_realms(conn):
+    # web version: only realms the owner pushed data for - contributors cannot add entries (sync.owner_realms)
+    if _is_web_db(conn):
+        from . import sync
+        owned = sync.owner_realms(conn)
+        if owned is not None:
+            d = _web_default_realm(conn)
+            return sorted(set(owned) | ({d} if d else set()))
     rs = [r[0] for r in conn.execute("SELECT DISTINCT realm FROM price_current ORDER BY realm")]
     for r in conn.execute("SELECT DISTINCT realm FROM ingests"):
         if r[0] and r[0] not in rs:
@@ -441,11 +455,13 @@ def search(conn, cfg=None, q="", limit=50, realm=None):
                      key=lambda i: -ctx.cur[i][0])[:limit]
         return [_row(ctx, i) for i in ids]
     ql = q.lower()
+    # an item id: plain ASCII digits only (str.isdigit also accepts '²' etc., and int() refuses > 4300 digits)
+    qid = int(q) if q.isascii() and q.isdigit() and len(q) <= 10 else None
     scored = []
     for iid, c in ctx.cur.items():
         nm = _name(ctx, iid)
         s = None
-        if q.isdigit() and int(q) == iid:
+        if qid is not None and qid == iid:
             s = 0
         elif nm and ql in nm.lower():
             nl = nm.lower()

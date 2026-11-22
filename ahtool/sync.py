@@ -14,8 +14,10 @@ Masked:   ah_scans.char is blanked, and the seller name of every auction/sale po
           characters is blanked (""), so the web version cannot tell which auctions are whose. The characters are
           taken from the scans, own auctions and AH mail on that PC, plus `sync_hide_sellers` in its config.json.
 
-Merging (server): price_daily keeps the lowest low / highest high / highest available per realm+item+day,
-price_current keeps the newest observation per item, snapshots and scans are unique by key. Analysis settings and
+Merging (server): every key's prices are kept apart (price_daily_src, price_current_src); price_daily shows the
+lowest low / highest high / highest available over all keys per realm+item+day, price_current the newest observation
+per item that is not dated in the future. Snapshots are unique by realm/item/ts, scans by realm/faction/ts per key.
+`ahkey purge` deletes a key's rows and recomputes the merge from what the others sent. Analysis settings and
 the static item/recipe data come only from the owner (AHTOOL_SYNC_TOKEN or an owner key), also while the web version
 has none. Every row is validated column by column (see SPEC below), on the server and when pulling; the server
 remembers which key pushed each row (src_key), so only that key or an owner can change a scan later, and
@@ -27,8 +29,9 @@ resends everything.
 
 Two-way: every PC also pulls what the others pushed (GET /api/sync/pull). The server stamps every row a push changes
 with that push's sequence number (`seq`), and each PC remembers the last one it has (meta `pull:<url>`), so only new
-rows travel. Pulled prices are merged with the same rules as on the server; pulled scans are stored with
-source='web', are never pushed back, and are never diffed against your own scans (their sales come with them).
+rows travel. Pulled prices are merged with the same rules as on the server and remembered (sync_pulled_*), so they
+are never pushed back as this PC's own; pulled scans are stored with source='web', are never pushed back, never
+diffed against your own scans (their sales come with them), and give way to your own scan with the same key.
 """
 import gzip
 import hashlib
@@ -104,15 +107,21 @@ class BadPayload(ValueError):
 # local rows the server would refuse, so one odd local row never blocks a whole push.
 
 INT32 = 2 ** 31 - 1
-PRICE_MAX = 10 ** 11          # copper; 10M gold, above any game's gold cap
+# copper. The game's gold cap is 2^31-1 copper (~214k gold): no buyout, bid or unit price can be higher. Keeping
+# prices (and STACK below) this small also keeps sums like SUM(count*unit_price) far away from SQLite's 2^63 limit.
+PRICE_MAX = INT32
 QTY_MAX = 10 ** 9
+STACK_MAX = 10000             # items in one auction / sale (real stacks are at most a few hundred)
 TS_MIN = 1_000_000_000        # 2001: older timestamps are garbage
 DAY_EPOCH_TS = 1577836800     # 2020-01-01 UTC: day 0 of Auctionator's day numbers
 FUTURE_TS_SLACK = 300         # a pushed timestamp may be at most 5 minutes in the future (clock skew)
+SCAN_TS_SLACK = 60            # scans are pushed after they happened: at most 1 minute of clock skew
 PULL_TS_SLACK = 3600          # pulled rows: the server already checked them, allow more skew between PCs
 MAX_STR = 64
 SERVER_MAX_ROWS = 2 * MAX_BATCH_ROWS  # per pushed batch (static data excluded); one huge scan may exceed the client cap
+MAX_SCANS_PER_BATCH = 50      # new scans stored per pushed batch; the rest waits for the next push
 STATIC_MAX_ROWS = 2_000_000
+CURSOR_MAX = 2 ** 63 - 1
 ICON_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -135,7 +144,7 @@ TS, TSn = _I(TS_MIN, "ts"), _I(TS_MIN, "ts", True)
 DAY = _I(0, "day")
 PRICE, PRICEn, PRICE0n = _I(1, PRICE_MAX), _I(1, PRICE_MAX, True), _I(0, PRICE_MAX, True)
 QTY, QTYn = _I(0, QTY_MAX), _I(0, QTY_MAX, True)
-STACK = _I(1, 10 ** 6)
+STACK = _I(1, STACK_MAX)
 FLAG = _I(0, 1)
 REALM = _S(lo=1)
 
@@ -157,8 +166,11 @@ SPEC = {
 
 
 def _limits(slack=FUTURE_TS_SLACK, now=None):
+    """ts/day: the latest timestamp / Auctionator day a row may carry. today: the current UTC day (a price_current row
+    dated later is "from the future" and never beats one that is not, see _CURRENT_NEWER)."""
     now = int(time.time() if now is None else now)
-    return {"ts": now + slack, "day": (now - DAY_EPOCH_TS) // 86400 + 1}
+    return {"ts": now + slack, "day": (now + slack - DAY_EPOCH_TS) // 86400 + 1, "now": now,
+            "today": (now - DAY_EPOCH_TS) // 86400}
 
 
 def _bad_value(v, spec, lim):
@@ -306,14 +318,22 @@ def build_batches(conn, cfg, remote, full=False, mine=None):
                 "meta": dict(meta, **{k: v for k, v in conn.execute(
                     "SELECT key, value FROM meta WHERE key='tooltip_version'")})})
 
-    # --- Auctionator prices (rows the server would refuse - wrong types, future dates - stay local)
+    # --- Auctionator prices (rows the server would refuse - wrong types, future dates - stay local). Rows that are
+    # still exactly what was pulled from the web version are not sent back as this PC's own: they belong to whoever
+    # pushed them, and echoing them would keep e.g. purged prices alive under this PC's key.
+    _ensure_client_schema(conn)
     lim = _limits()
     since = mine.get("snap_ts")
-    snaps = _rows(conn, "SELECT %s FROM snapshots WHERE ts>? ORDER BY ts" % ",".join(SNAPSHOTS),
-                  (since if since is not None else -1,))
+    snaps = _rows(conn, "SELECT s.realm, s.item_id, s.ts, s.price, s.available FROM snapshots s WHERE s.ts>? AND NOT "
+                        "EXISTS (SELECT 1 FROM sync_pulled_snap p WHERE p.realm=s.realm AND p.item_id=s.item_id AND "
+                        "p.ts=s.ts) ORDER BY s.ts", (since if since is not None else -1,))
     if snaps and isinstance(snaps[-1][2], int):
         new_state["snap_ts"] = min(snaps[-1][2], lim["ts"])
-    current = _valid_rows(_rows(conn, "SELECT %s FROM price_current" % ",".join(PRICE_CURRENT)), "price_current", lim)
+    current = _valid_rows(_rows(
+        conn, "SELECT c.realm, c.item_id, c.price, c.available, c.last_day, c.updated_at FROM price_current c "
+              "LEFT JOIN sync_pulled_current p ON p.realm=c.realm AND p.item_id=c.item_id WHERE p.realm IS NULL "
+              "OR c.price IS NOT p.price OR c.available IS NOT p.available OR c.last_day IS NOT p.last_day "
+              "OR c.updated_at IS NOT p.updated_at"), "price_current", lim)
     snaps = _valid_rows(snaps, "snapshots", lim)
     batches.append({"price_current": current[:MAX_BATCH_ROWS], "snapshots": []})
     for i in range(MAX_BATCH_ROWS, len(current), MAX_BATCH_ROWS):
@@ -325,8 +345,16 @@ def build_batches(conn, cfg, remote, full=False, mine=None):
     for realm, mx in conn.execute("SELECT realm, MAX(day) FROM price_daily GROUP BY realm").fetchall():
         wm = (mine.get("daily") or {}).get(realm)
         frm = wm - DAY_OVERLAP if isinstance(wm, int) else -10 ** 9
-        daily.extend(_valid_rows(_rows(conn, "SELECT %s FROM price_daily WHERE realm=? AND day>=? ORDER BY day, "
-                                       "item_id" % ",".join(PRICE_DAILY), (realm, frm)), "price_daily", lim))
+        # a value that is the one pulled from the web version is left out (NULL): the server keeps this PC's own
+        rows = _rows(conn, "SELECT d.realm, d.item_id, d.day, "
+                           "CASE WHEN d.low IS p.low THEN NULL ELSE d.low END, "
+                           "CASE WHEN d.high IS p.high THEN NULL ELSE d.high END, "
+                           "CASE WHEN d.available IS p.available THEN NULL ELSE d.available END "
+                           "FROM price_daily d LEFT JOIN sync_pulled_daily p ON p.realm=d.realm AND "
+                           "p.item_id=d.item_id AND p.day=d.day WHERE d.realm=? AND d.day>=? ORDER BY d.day, "
+                           "d.item_id", (realm, frm))
+        daily.extend(_valid_rows([r for r in rows if r[3] is not None or r[4] is not None or r[5] is not None],
+                                 "price_daily", lim))
         new_state["daily"][realm] = min(mx, lim["day"]) if isinstance(mx, int) else mx
     for i in range(0, len(daily), MAX_BATCH_ROWS):
         batches.append({"price_daily": daily[i:i + MAX_BATCH_ROWS]})
@@ -371,7 +399,7 @@ def build_batches(conn, cfg, remote, full=False, mine=None):
             item["auctions"] = _valid_rows([r[:7] + [_mask(r[7], own)] for r in _rows(
                 conn, "SELECT %s FROM ah_auctions WHERE scan_id=?" % ",".join(AUCTIONS), (sid,))], "auctions", lim)
         n = len(item["items"]) + len(item["auctions"]) + len(item["sales"])
-        if cur and cur_rows + n > MAX_BATCH_ROWS:
+        if cur and (cur_rows + n > MAX_BATCH_ROWS or len(cur) >= MAX_SCANS_PER_BATCH):
             batches.append({"scans": cur})
             cur, cur_rows = [], 0
         cur.append(item)
@@ -393,6 +421,26 @@ def build_batches(conn, cfg, remote, full=False, mine=None):
     for b in batches[1:]:
         b["protocol"] = PROTOCOL
     return batches, new_state
+
+
+# Client only: what was last pulled from the web version per row, so a row that still holds exactly that is known to
+# be someone else's (not pushed back as this PC's own; replaced by the server's newer merged value on the next pull).
+CLIENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS sync_pulled_current(realm TEXT, item_id INTEGER, price INTEGER, available INTEGER,
+    last_day INTEGER, updated_at INTEGER, PRIMARY KEY(realm, item_id));
+CREATE TABLE IF NOT EXISTS sync_pulled_daily(realm TEXT, item_id INTEGER, day INTEGER, low INTEGER, high INTEGER,
+    available INTEGER, PRIMARY KEY(realm, item_id, day));
+CREATE TABLE IF NOT EXISTS sync_pulled_snap(realm TEXT, item_id INTEGER, ts INTEGER, PRIMARY KEY(realm, item_id, ts));
+"""
+
+
+def _ensure_client_schema(conn):
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_pulled_snap'").fetchone():
+        return
+    conn.executescript(CLIENT_SCHEMA)
+    with conn:
+        # an app that pulled before these tables existed pulls everything once more, so they get filled
+        conn.execute("DELETE FROM meta WHERE key LIKE 'pull:%'")
 
 
 MAX_RESPONSE = 256 << 20  # one answer from the web version (a pull page is far smaller)
@@ -441,19 +489,26 @@ def _request(cfg, method, path, payload=None, timeout=180):
     if payload is not None:
         data = gzip.compress(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"), 6)
         headers["Content-Type"] = "application/gzip"
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with _opener.open(req, timeout=timeout) as r:
-            body = _read_capped(r)
-    except urllib.error.HTTPError as e:
-        body = e.read(300).decode("utf-8", "replace")
+    waited, attempt = 0.0, 0
+    while True:
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
-            body = json.loads(body).get("error", body)
-        except ValueError:
-            pass
-        raise SyncError("%s %s -> HTTP %d: %s" % (method, url, e.code, body))
-    except (urllib.error.URLError, OSError) as e:
-        raise SyncError("%s %s failed: %s" % (method, url, getattr(e, "reason", e)))
+            with _opener.open(req, timeout=timeout) as r:
+                body = _read_capped(r)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 503:
+                # the web version handles one push at a time: wait (Retry-After, else backoff) and try again
+                delay = _retry_delay(e.headers.get("Retry-After") if e.headers else None, attempt)
+                if waited + delay <= BUSY_MAX_WAIT:
+                    e.close()
+                    _sleep(delay)
+                    waited += delay
+                    attempt += 1
+                    continue
+            _http_error(method, url, e)
+        except (urllib.error.URLError, OSError) as e:
+            raise SyncError("%s %s failed: %s" % (method, url, getattr(e, "reason", e)))
     try:
         out = json.loads(body.decode("utf-8"), parse_constant=_no_constant)
         if not isinstance(out, dict):
@@ -462,6 +517,33 @@ def _request(cfg, method, path, payload=None, timeout=180):
     except ValueError:
         # typically a login page: the web version's host is behind a login that does not let the sync path through
         raise SyncError("%s %s did not answer with JSON - is the site behind a login?" % (method, url))
+
+
+BUSY_MAX_WAIT = 60.0  # seconds a request waits in total for a busy (503) web version before giving up
+_sleep = time.sleep
+
+
+def _retry_delay(retry_after, attempt):
+    """Seconds to wait before retrying a 503: Retry-After (seconds, 0.5..30), else 1, 2, 4, ... 16 s."""
+    try:
+        v = float(retry_after) if retry_after is not None and len(str(retry_after)) <= 8 else None
+    except ValueError:
+        v = None
+    if v is None or not math.isfinite(v):
+        v = min(2 ** attempt, 16)
+    return max(0.5, min(v, 30.0))
+
+
+def _http_error(method, url, e):
+    try:
+        body = e.read(300).decode("utf-8", "replace")
+    except Exception:  # noqa
+        body = ""
+    try:
+        body = json.loads(body).get("error", body)
+    except (ValueError, AttributeError):
+        pass
+    raise SyncError("%s %s -> HTTP %d: %s" % (method, url, e.code, body))
 
 
 def _no_constant(name):
@@ -573,18 +655,294 @@ def _summary(res):
 
 # ================================================================ server (web version)
 
+SCHEMA_VERSION = 3  # meta sync_schema: 3 = per-key price tables, scans unique per key, invalid rows swept
+LEGACY_SRC = -1     # src_key in the per-key tables for rows pushed before src_key existed
+
+SERVER_SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS price_daily_src(realm TEXT, item_id INTEGER, day INTEGER, src_key INTEGER NOT NULL,
+    low INTEGER, high INTEGER, available INTEGER, PRIMARY KEY(realm, item_id, day, src_key));
+CREATE INDEX IF NOT EXISTS ix_price_daily_src_key ON price_daily_src(src_key);
+CREATE TABLE IF NOT EXISTS price_current_src(realm TEXT, item_id INTEGER, src_key INTEGER NOT NULL, price INTEGER,
+    available INTEGER, last_day INTEGER, updated_at INTEGER, PRIMARY KEY(realm, item_id, src_key));
+CREATE INDEX IF NOT EXISTS ix_price_current_src_key ON price_current_src(src_key);
+CREATE INDEX IF NOT EXISTS ix_ah_scans_seq ON ah_scans(seq);
+CREATE INDEX IF NOT EXISTS ix_ah_scans_key ON ah_scans(realm, faction, ts);
+CREATE INDEX IF NOT EXISTS ix_ah_scans_src ON ah_scans(src_key);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ah_scans_src ON ah_scans(realm, faction, ts, COALESCE(src_key, -1));
+CREATE INDEX IF NOT EXISTS ix_ingests_src ON ingests(src_key);
+"""
+_SCANS_DDL = ("CREATE TABLE main.%s(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, realm TEXT, faction TEXT, "
+              "char TEXT, source TEXT, total INTEGER, n INTEGER, partial INTEGER NOT NULL DEFAULT 0, "
+              "raw_kept INTEGER NOT NULL DEFAULT 1, diffed INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0, "
+              "src_key INTEGER)")
+
+
+def _log(msg):
+    print("sync: %s" % msg, file=sys.stderr, flush=True)
+
+
 def ensure_schema(conn):
+    """Server: columns, tables and indexes the web version needs, and the one-time migration of an older web DB.
+
+    Runs at start (run_web.py) and before every sync request (cheap once the DB is current). Upgrading to schema 3:
+    scans become unique per (realm, faction, ts, key) instead of globally, prices get per-key tables (each key's own
+    rows; price_daily / price_current hold the merge of them), and rows stored before validation existed are swept
+    (sweep_invalid)."""
+    try:
+        r = conn.execute("SELECT value FROM main.meta WHERE key='sync_schema'").fetchone()
+    except sqlite3.OperationalError:
+        r = None
+    if r and r[0] == str(SCHEMA_VERSION):
+        return
     # Server only: which push last changed a row (seq, for /api/sync/pull) and which key pushed it (src_key). The
     # local app's tables never get them. Added with ALTER TABLE so an existing web database keeps working.
     for cols, tables, ddl in (("seq", SEQ_TABLES, "seq INTEGER NOT NULL DEFAULT 0"),
-                              ("src_key", SRC_TABLES, "src_key INTEGER")):
+                              ("src_key", SRC_TABLES + ("ingests",), "src_key INTEGER")):
         for t in tables:
             if cols not in [r[1] for r in conn.execute("PRAGMA main.table_info(%s)" % t)]:
                 conn.execute("ALTER TABLE main.%s ADD COLUMN %s" % (t, ddl))
     conn.executescript(SERVER_SCHEMA)
-    if not conn.execute("SELECT 1 FROM main.meta WHERE key='sync_epoch'").fetchone():
-        with conn:
-            conn.execute("INSERT OR IGNORE INTO main.meta(key,value) VALUES('sync_epoch',?)", (os.urandom(8).hex(),))
+    cur = conn.cursor()
+    cur.execute("BEGIN IMMEDIATE")
+    try:
+        r = cur.execute("SELECT value FROM main.meta WHERE key='sync_schema'").fetchone()
+        if not (r and r[0] == str(SCHEMA_VERSION)):
+            _migrate_v3(cur)
+            cur.execute("INSERT OR IGNORE INTO main.meta(key,value) VALUES('sync_epoch',?)", (os.urandom(8).hex(),))
+            cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_schema',?)", (str(SCHEMA_VERSION),))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_v3(cur):
+    sql = cur.execute("SELECT sql FROM main.sqlite_master WHERE type='table' AND name='ah_scans'").fetchone()[0]
+    if "UNIQUE" in re.sub(r"\s+", "", sql).upper():
+        # the local app's ah_scans is UNIQUE(realm, faction, ts): on the server two keys may each have a scan there
+        cols = [r[1] for r in cur.execute("PRAGMA main.table_info(ah_scans)")]
+        keep = ",".join(c for c in ("id",) + ("ts", "realm", "faction", "char") + SCAN[3:] + ("seq", "src_key")
+                        if c in cols)
+        cur.execute("DROP TABLE IF EXISTS main.ah_scans_v3")
+        cur.execute(_SCANS_DDL % "ah_scans_v3")
+        cur.execute("INSERT INTO main.ah_scans_v3(%s) SELECT %s FROM main.ah_scans" % (keep, keep))
+        cur.execute("DROP TABLE main.ah_scans")
+        cur.execute("ALTER TABLE main.ah_scans_v3 RENAME TO ah_scans")
+    for stmt in SERVER_SCHEMA_V3.strip().split(";"):
+        if stmt.strip():
+            cur.execute(stmt)
+    # every merged row becomes the row of the key that last changed it (rows from before src_key: LEGACY_SRC)
+    cur.execute("INSERT OR IGNORE INTO main.price_daily_src(realm,item_id,day,src_key,low,high,available) "
+                "SELECT realm,item_id,day,COALESCE(src_key,?),low,high,available FROM main.price_daily", (LEGACY_SRC,))
+    cur.execute("INSERT OR IGNORE INTO main.price_current_src(realm,item_id,src_key,price,available,last_day,"
+                "updated_at) SELECT realm,item_id,COALESCE(src_key,?),price,available,last_day,updated_at "
+                "FROM main.price_current", (LEGACY_SRC,))
+    _sweep(cur)
+    _set_owner_realms(cur, _owner_realms_from_data(cur))
+
+
+# ---------------------------------------------------------------- rows stored before validation existed
+
+def sweep_invalid(conn):
+    """Server: delete every stored row that the current SPEC refuses (rows pushed before validation existed: string
+    ids, huge numbers, future dates, ...), so they can never break a pull or an aggregate. -> {table: rows deleted}.
+
+    Runs once by itself when ensure_schema upgrades a web DB (run_web.py calls ensure_schema at start); can be run
+    again any time."""
+    ensure_schema(conn)
+    cur = conn.cursor()
+    cur.execute("BEGIN IMMEDIATE")
+    try:
+        out = _sweep(cur)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return out
+
+
+def _bad_rowids(cur, table, cols, spec, lim, key="rowid"):
+    return [r[0] for r in cur.execute("SELECT %s, %s FROM main.%s" % (key, ",".join(cols), table))
+            if _bad_row(list(r[1:]), spec, lim)]
+
+
+def _delete_ids(cur, table, ids, key="rowid"):
+    n = 0
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        n += cur.execute("DELETE FROM main.%s WHERE %s IN (%s)" % (table, key, ",".join("?" * len(part))),
+                         part).rowcount
+    return n
+
+
+def _sweep(cur):
+    lim = _limits()
+    out = {}
+    _touch_reset(cur)
+    for table, cols, spec, keys_tbl, nkey in (
+            ("price_daily", PRICE_DAILY, SPEC["price_daily"], "_pd_keys", 3),
+            ("price_daily_src", PRICE_DAILY, SPEC["price_daily"], "_pd_keys", 3),
+            ("price_current", PRICE_CURRENT, SPEC["price_current"], "_pc_keys", 2),
+            ("price_current_src", PRICE_CURRENT, SPEC["price_current"], "_pc_keys", 2),
+            ("snapshots", SNAPSHOTS, SPEC["snapshots"], None, 0)):
+        bad = _bad_rowids(cur, table, cols, spec, lim)
+        if not bad:
+            continue
+        if keys_tbl:
+            # merged rows of a valid realm/item(/day) are rebuilt from the per-key rows that are left
+            for i in range(0, len(bad), 500):
+                part = bad[i:i + 500]
+                cur.execute("INSERT OR IGNORE INTO temp.%s SELECT %s FROM main.%s WHERE rowid IN (%s) AND "
+                            "typeof(realm)='text' AND typeof(item_id)='integer'%s"
+                            % (keys_tbl, ",".join(cols[:nkey]), table, ",".join("?" * len(part)),
+                               " AND typeof(day)='integer'" if nkey == 3 else ""), part)
+        out[table] = _delete_ids(cur, table, bad)
+    seq = None
+    if out.get("price_daily") or out.get("price_daily_src") or out.get("price_current") or out.get("price_current_src"):
+        seq = _next_seq(cur)
+        _recompute_daily(cur, seq)
+        _recompute_current(cur, seq, lim)
+    # scans: a bad scan row goes with everything that belongs to it; bad child rows go alone
+    bad_scans = _bad_rowids(cur, "ah_scans", SCAN, SPEC["scan"], lim, key="id")
+    if bad_scans:
+        out["ah_scans"] = _drop_scans(cur, bad_scans, out)
+    for table, cols, what in (("ah_scan_items", SCAN_ITEMS, "scan items"), ("ah_auctions", AUCTIONS, "auctions")):
+        bad = _bad_rowids(cur, table, cols, SPEC[what], lim)
+        if bad:
+            out[table] = out.get(table, 0) + _delete_ids(cur, table, bad)
+    bad = [r[0] for r in cur.execute(
+        "SELECT s.rowid, p.ts, s.item_id, s.suffix, s.count, s.unit_price, s.owner, s.kind FROM main.ah_sales s "
+        "LEFT JOIN main.ah_scans p ON p.id=s.prev_scan_id") if _bad_row(list(r[1:]), SPEC["sales"], lim)]
+    if bad:
+        out["ah_sales"] = out.get("ah_sales", 0) + _delete_ids(cur, "ah_sales", bad)
+    if any(out.values()):
+        _log("removed stored rows that fail validation: %s" % ", ".join("%d %s" % (n, t) for t, n in out.items() if n))
+        cur.execute("INSERT INTO main.ingests(ts,file_mtime,realm,items,changed) VALUES(?,NULL,NULL,0,?)",
+                    (int(time.time()), sum(out.values())))
+    return out
+
+
+def _drop_scans(cur, sids, out):
+    for i in range(0, len(sids), 500):
+        part = sids[i:i + 500]
+        sq = ",".join("?" * len(part))
+        for t in ("ah_auctions", "ah_scan_items", "ah_sales"):
+            out[t] = out.get(t, 0) + cur.execute("DELETE FROM main.%s WHERE scan_id IN (%s)" % (t, sq),
+                                                 part).rowcount
+        cur.execute("UPDATE main.ah_sales SET prev_scan_id=NULL WHERE prev_scan_id IN (%s)" % sq, part)
+    return _delete_ids(cur, "ah_scans", list(sids), key="id")
+
+
+# ---------------------------------------------------------------- per-key prices -> merged prices
+#
+# price_daily_src / price_current_src hold each key's own rows. price_daily / price_current (what the site shows and
+# what /api/sync/pull sends) are rebuilt from them for every realm/item(/day) a push or a purge touched:
+#   price_daily:   lowest low, highest high, highest available over all keys
+#   price_current: the newest observation - (last_day, updated_at) - among the keys' rows that are not from the
+#                  future (last_day after today UTC, or updated_at after now; updated_at is clamped to the time the
+#                  server received it). A row from the future only shows while there is nothing else.
+# So `ahkey purge` removes exactly that key's values: the merge is recomputed from what the other keys sent.
+
+def _touch_reset(cur):
+    cur.execute("CREATE TEMP TABLE IF NOT EXISTS _pd_keys(realm TEXT, item_id INTEGER, day INTEGER, "
+                "PRIMARY KEY(realm, item_id, day))")
+    cur.execute("CREATE TEMP TABLE IF NOT EXISTS _pc_keys(realm TEXT, item_id INTEGER, PRIMARY KEY(realm, item_id))")
+    cur.execute("DELETE FROM temp._pd_keys")
+    cur.execute("DELETE FROM temp._pc_keys")
+
+
+def _next_seq(cur):
+    r = cur.execute("SELECT value FROM main.meta WHERE key='sync_seq'").fetchone()
+    seq = (int(r[0]) if r and str(r[0]).isdigit() else 0) + 1
+    cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_seq',?)", (str(seq),))
+    return seq
+
+
+def _changes(cur):
+    return cur.connection.total_changes
+
+
+def _recompute_daily(cur, seq):
+    """Merged price_daily for every key in temp._pd_keys. -> merged rows inserted/changed/deleted."""
+    n0 = _changes(cur)
+    cur.execute(
+        "INSERT INTO main.price_daily(realm,item_id,day,low,high,available,seq,src_key) "
+        "SELECT s.realm, s.item_id, s.day, MIN(s.low), MAX(s.high), MAX(s.available), ?, "
+        "CASE WHEN COUNT(DISTINCT s.src_key)=1 THEN NULLIF(MAX(s.src_key), ?) END "
+        "FROM main.price_daily_src s JOIN temp._pd_keys k ON k.realm=s.realm AND k.item_id=s.item_id AND k.day=s.day "
+        "WHERE 1 GROUP BY s.realm, s.item_id, s.day "
+        "ON CONFLICT(realm,item_id,day) DO UPDATE SET low=excluded.low, high=excluded.high, "
+        "available=excluded.available, seq=excluded.seq, src_key=excluded.src_key "
+        "WHERE price_daily.low IS NOT excluded.low OR price_daily.high IS NOT excluded.high "
+        "OR price_daily.available IS NOT excluded.available", (seq, LEGACY_SRC))
+    cur.execute("DELETE FROM main.price_daily WHERE (realm, item_id, day) IN (SELECT realm, item_id, day FROM "
+                "temp._pd_keys) AND NOT EXISTS (SELECT 1 FROM main.price_daily_src s WHERE s.realm=price_daily.realm "
+                "AND s.item_id=price_daily.item_id AND s.day=price_daily.day)")
+    return _changes(cur) - n0
+
+
+def _recompute_current(cur, seq, lim):
+    """Merged price_current for every key in temp._pc_keys. -> merged rows inserted/changed/deleted."""
+    n0 = _changes(cur)
+    cur.execute(
+        "INSERT INTO main.price_current(realm,item_id,price,available,last_day,updated_at,seq,src_key) "
+        "SELECT realm, item_id, price, available, last_day, updated_at, ?, NULLIF(src_key, ?) FROM ("
+        "SELECT s.*, ROW_NUMBER() OVER (PARTITION BY s.realm, s.item_id ORDER BY "
+        "(COALESCE(s.last_day,0) <= ? AND COALESCE(s.updated_at,0) <= ?) DESC, COALESCE(s.last_day,0) DESC, "
+        "COALESCE(s.updated_at,0) DESC, s.src_key) AS rn "
+        "FROM main.price_current_src s JOIN temp._pc_keys k ON k.realm=s.realm AND k.item_id=s.item_id) "
+        "WHERE rn=1 "
+        "ON CONFLICT(realm,item_id) DO UPDATE SET price=excluded.price, available=excluded.available, "
+        "last_day=excluded.last_day, updated_at=excluded.updated_at, seq=excluded.seq, src_key=excluded.src_key "
+        "WHERE excluded.price IS NOT price_current.price OR excluded.available IS NOT price_current.available "
+        "OR excluded.last_day IS NOT price_current.last_day", (seq, LEGACY_SRC, lim["today"], lim["ts"]))
+    cur.execute("DELETE FROM main.price_current WHERE (realm, item_id) IN (SELECT realm, item_id FROM temp._pc_keys) "
+                "AND NOT EXISTS (SELECT 1 FROM main.price_current_src s WHERE s.realm=price_current.realm "
+                "AND s.item_id=price_current.item_id)")
+    return _changes(cur) - n0
+
+
+# ---------------------------------------------------------------- owners
+
+def _owner_keys_sql(col="src_key"):
+    """SQL condition: the row was pushed by an owner (AHTOOL_SYNC_TOKEN = 0, an owner key) or before src_key existed."""
+    return ("(%s IS NULL OR %s<=0 OR %s IN (SELECT id FROM main.sync_keys WHERE role='owner'))" % (col, col, col))
+
+
+def _owner_realms(cur):
+    r = cur.execute("SELECT value FROM main.meta WHERE key='sync_owner_realms'").fetchone()
+    try:
+        v = json.loads(r[0]) if r else []
+    except ValueError:
+        v = []
+    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+
+
+def _set_owner_realms(cur, realms):
+    cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_owner_realms',?)",
+                (json.dumps(sorted(set(realms))[:MAX_OWNER_REALMS]),))
+
+
+def _owner_realms_from_data(cur):
+    rs = set()
+    for t in ("price_current_src", "price_daily_src"):
+        rs.update(r[0] for r in cur.execute("SELECT DISTINCT realm FROM main.%s WHERE %s" % (t, _owner_keys_sql()))
+                  if isinstance(r[0], str))
+    rs.update(r[0] for r in cur.execute("SELECT DISTINCT realm FROM main.ah_scans WHERE %s" % _owner_keys_sql())
+              if isinstance(r[0], str))
+    return rs
+
+
+MAX_OWNER_REALMS = 100
+
+
+def owner_realms(conn):
+    """Web version: realms the owner pushed data for (analytics.list_realms shows only these), or None if unknown."""
+    try:
+        r = conn.execute("SELECT value FROM main.meta WHERE key='sync_owner_realms'").fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return _owner_realms(conn) if r else None
 
 
 def _src(source):
@@ -593,7 +951,8 @@ def _src(source):
 
 
 def remote_state(conn, source):
-    """What the server has, and what it accepts from this pusher."""
+    """What the server has, and what it accepts from this pusher. `scans` lists only this pusher's own scans (plus
+    those from before src_key existed): another key's scan at the same time never makes a PC skip its own."""
     ensure_schema(conn)
     meta = dict(conn.execute("SELECT key, value FROM main.meta WHERE key IN "
                              "('sync_static_hash','sync_push_ts','sync_epoch')"))
@@ -602,7 +961,8 @@ def remote_state(conn, source):
             "accept_static": bool(source["owner"]), "accept_cfg": bool(source["owner"]),
             "last_push_ts": int(meta["sync_push_ts"]) if str(meta.get("sync_push_ts") or "").isdigit() else None,
             "scans": [list(r) for r in conn.execute(
-                "SELECT realm, faction, ts, raw_kept, diffed FROM main.ah_scans ORDER BY ts")]}
+                "SELECT realm, faction, ts, raw_kept, diffed FROM main.ah_scans WHERE src_key IS ? OR src_key IS NULL "
+                "ORDER BY ts", (_src(source),))]}
 
 
 def _ins(cur, table, cols, rows, verb="INSERT"):
@@ -619,26 +979,38 @@ def _list(v, what):
     return v
 
 
+def _keys_ok(obj, allowed, what):
+    if not isinstance(obj, dict):
+        raise BadPayload("%s must be objects" % what)
+    extra = [k for k in obj if k not in allowed]
+    if extra:
+        raise BadPayload("%s: unknown field %r" % (what, str(extra[0])[:40]))
+
+
+PUSH_KEYS = ("protocol", "cfg", "meta", "static", "price_current", "price_daily", "snapshots", "scans",
+             "scan_updates")
+META_KEYS = META_MAX_KEYS + ("tooltip_version",)
+
+
 def _count_rows(payload):
     n = 0
     for k in ("price_current", "price_daily", "snapshots"):
         n += len(_list(payload.get(k), k))
     for s in _list(payload.get("scans"), "scans"):
-        if not isinstance(s, dict):
-            raise BadPayload("scans must be objects")
+        _keys_ok(s, ("scan", "items", "auctions", "sales"), "scans")
         n += 1 + sum(len(_list(s.get(k), k)) for k in ("items", "auctions", "sales"))
     for u in _list(payload.get("scan_updates"), "scan_updates"):
-        if not isinstance(u, dict):
-            raise BadPayload("scan_updates must be objects")
+        _keys_ok(u, ("key", "drop_raw", "sales"), "scan_updates")
         n += 1 + len(_list(u.get("sales"), "sales"))
     return n
 
 
 SCAN_KEY = (_S(), _S(32), _I(TS_MIN, "ts"))
-# a price_current row may always replace one that claims to be from the future (left over from before validation)
+# price_current: a row replaces another if it is newer by (last_day, updated_at), or if the stored one is "from the
+# future" (dated after today UTC / updated after now) - such a row must never block real observations.
 _CURRENT_NEWER = ("(COALESCE(excluded.last_day,0), COALESCE(excluded.updated_at,0)) >= "
-                  "(COALESCE(price_current.last_day,0), COALESCE(price_current.updated_at,0)) "
-                  "OR COALESCE(price_current.last_day,0) > %d OR COALESCE(price_current.updated_at,0) > %d")
+                  "(COALESCE({t}.last_day,0), COALESCE({t}.updated_at,0)) "
+                  "OR COALESCE({t}.last_day,0) > %d OR COALESCE({t}.updated_at,0) > %d")
 
 
 def apply(conn, cfg, payload, source):
@@ -648,6 +1020,7 @@ def apply(conn, cfg, payload, source):
     Every row is validated first (types, ranges, nothing in the future); one bad row refuses the whole batch."""
     if not isinstance(payload, dict) or payload.get("protocol") != PROTOCOL:
         raise BadPayload("unsupported sync protocol - update the AH Tool on this PC")
+    _keys_ok(payload, PUSH_KEYS, "sync batch")
     n_rows = _count_rows(payload)
     if n_rows > SERVER_MAX_ROWS:
         raise BadPayload("sync batch has %d rows, at most %d are accepted" % (n_rows, SERVER_MAX_ROWS))
@@ -660,20 +1033,17 @@ def apply(conn, cfg, payload, source):
     cur = conn.cursor()
     cur.execute("BEGIN IMMEDIATE")
     try:
-        r = cur.execute("SELECT value FROM main.meta WHERE key='sync_seq'").fetchone()
-        seq = (int(r[0]) if r and str(r[0]).isdigit() else 0) + 1
-        cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_seq',?)", (str(seq),))
+        seq = _next_seq(cur)
         if "cfg" in payload and owner:
             c = payload["cfg"]
-            if not isinstance(c, dict):
+            if not isinstance(c, dict) or len(c) > 64:
                 raise BadPayload("cfg must be an object")
             new_cfg = {k: c[k] for k in CFG_KEYS if isinstance(c.get(k), (int, float)) and not isinstance(c[k], bool)
                        and math.isfinite(c[k]) and abs(c[k]) < 1e9}
             cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_cfg',?)", (json.dumps(new_cfg),))
         if "meta" in payload:
             m = payload["meta"]
-            if not isinstance(m, dict):
-                raise BadPayload("meta must be an object")
+            _keys_ok(m, META_KEYS, "meta")
             for k in META_MAX_KEYS:
                 v = _meta_int(m.get(k), lim)  # never later than now: a future value would win forever
                 if v is None:
@@ -707,50 +1077,55 @@ def apply(conn, cfg, payload, source):
                     cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('tooltip_version',?)", (str(tv),))
                 applied["static"] = sum(len(v) for v in checked.values())
 
-        before = conn.total_changes
+        changed = 0
         realms = {}
+        _touch_reset(cur)
         if "price_current" in payload:
             rows = _checked(payload["price_current"], "price_current", lim)
-            # newest observation wins; unchanged rows are not touched, so they do not count as new data
+            for r in rows:
+                if r[5] is not None and r[5] > lim["now"]:
+                    r[5] = lim["now"]  # "observed in the future" is clamped to when the server received it
+            # this key's own row: its newest observation (a row from the future is always replaced)
             cur.executemany(
-                "INSERT INTO main.price_current(realm,item_id,price,available,last_day,updated_at,seq,src_key) "
-                "VALUES(?,?,?,?,?,?,%d,%d) " % (seq, src) +
-                "ON CONFLICT(realm,item_id) DO UPDATE SET price=excluded.price, available=excluded.available, "
-                "last_day=excluded.last_day, updated_at=excluded.updated_at, seq=excluded.seq, "
-                "src_key=excluded.src_key WHERE (" + _CURRENT_NEWER % (lim["day"], lim["ts"]) + ") "
-                "AND (excluded.price IS NOT price_current.price OR excluded.available IS NOT price_current.available "
-                "OR excluded.last_day IS NOT price_current.last_day)", rows)
+                "INSERT INTO main.price_current_src(realm,item_id,price,available,last_day,updated_at,src_key) "
+                "VALUES(?,?,?,?,?,?,%d) ON CONFLICT(realm,item_id,src_key) DO UPDATE SET price=excluded.price, "
+                "available=excluded.available, last_day=excluded.last_day, updated_at=excluded.updated_at WHERE "
+                % src + _CURRENT_NEWER.format(t="price_current_src") % (lim["today"], lim["ts"]), rows)
+            cur.executemany("INSERT OR IGNORE INTO temp._pc_keys VALUES(?,?)", [r[:2] for r in rows])
+            changed += _recompute_current(cur, seq, lim)
             for r in rows:
                 realms[r[0]] = realms.get(r[0], 0) + 1
         if "price_daily" in payload:
             rows = _checked(payload["price_daily"], "price_daily", lim)
             cur.executemany(
-                "INSERT INTO main.price_daily(realm,item_id,day,low,high,available,seq,src_key) "
-                "VALUES(?,?,?,?,?,?,%d,%d) ON CONFLICT(realm,item_id,day) DO UPDATE SET seq=excluded.seq, "
-                "src_key=excluded.src_key, %s" % (seq, src, MERGE_DAILY), rows)
+                "INSERT INTO main.price_daily_src(realm,item_id,day,low,high,available,src_key) "
+                "VALUES(?,?,?,?,?,?,%d) ON CONFLICT(realm,item_id,day,src_key) DO UPDATE SET %s"
+                % (src, MERGE_DAILY.replace("price_daily.", "price_daily_src.")), rows)
+            cur.executemany("INSERT OR IGNORE INTO temp._pd_keys VALUES(?,?,?)", [r[:3] for r in rows])
+            changed += _recompute_daily(cur, seq)
             applied["price_daily"] = len(rows)
             for r in rows:
                 realms.setdefault(r[0], 0)
         if "snapshots" in payload:
             rows = _checked(payload["snapshots"], "snapshots", lim)
+            n0 = _changes(cur)
             _ins(cur, "snapshots", SNAPSHOTS + ("src_key",), [r + [src] for r in rows], "INSERT OR IGNORE")
+            changed += _changes(cur) - n0
             applied["snapshots"] = len(rows)
-        changed = conn.total_changes - before
-        if changed:
-            # One ingest row per push that changed prices: the analytics cache and the per-browser alert check
-            # key on MAX(ingests.id).
-            realm = max(realms, key=lambda k: realms[k]) if realms else None
-            cur.execute("INSERT INTO main.ingests(ts,file_mtime,realm,items,changed) VALUES(?,NULL,?,?,?)",
-                        (int(time.time()), realm, realms.get(realm, 0), changed))
-            if owner and realm:
-                # the web version's default realm follows the owner, never a contributor (analytics.get_realm)
-                cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_owner_realm',?)", (realm,))
+            for r in rows:
+                realms.setdefault(r[0], 0)
 
-        def scan_row(key):
+        def scan_row(key, mine_only=False):
+            """-> (id, src_key) of the scan with that key: this pusher's own, else (owners) one from before src_key,
+            else (owners, mine_only=False) any."""
             if not isinstance(key, list) or _bad_row(key, SCAN_KEY, lim):
                 raise BadPayload("scan key must be [realm, faction, ts]")
-            return cur.execute("SELECT id, src_key FROM main.ah_scans WHERE realm=? AND faction=? AND ts=?",
-                               key).fetchone()
+            rows = cur.execute("SELECT id, src_key FROM main.ah_scans WHERE realm=? AND faction=? AND ts=? "
+                               "ORDER BY src_key IS ? DESC, src_key IS NULL DESC, id", key + [src]).fetchall()
+            for r in rows:
+                if r[1] == src or r[1] is None or (owner and not mine_only):
+                    return r
+            return rows[0] if rows and not mine_only else None
 
         def put_sales(sid, realm, faction, ts, rows):
             cur.execute("DELETE FROM main.ah_sales WHERE scan_id=?", (sid,))
@@ -761,13 +1136,21 @@ def apply(conn, cfg, payload, source):
             cur.executemany("INSERT INTO main.ah_sales(scan_id,prev_scan_id,ts,item_id,suffix,count,unit_price,owner,"
                             "kind) VALUES(?,?,?,?,?,?,?,?,?)", out)
 
+        scans = []
         for s in _list(payload.get("scans"), "scans"):
             row = _checked([s.get("scan")], "scan", lim)[0]
-            items = _checked(_list(s.get("items"), "scan items"), "scan items", lim)
-            auctions = _checked(_list(s.get("auctions"), "auctions"), "auctions", lim)
-            sales = _checked(_list(s.get("sales"), "sales"), "sales", lim)
+            if row[0] > lim["now"] + SCAN_TS_SLACK:
+                raise BadPayload("scan: ts is in the future (%d)" % row[0])
+            scans.append((row, _checked(_list(s.get("items"), "scan items"), "scan items", lim),
+                          _checked(_list(s.get("auctions"), "auctions"), "auctions", lim),
+                          _checked(_list(s.get("sales"), "sales"), "sales", lim)))
+        for row, items, auctions, sales in scans:
             ts, realm, faction = row[0], row[1], row[2]
-            if scan_row([realm, faction, ts]) is not None:
+            if scan_row([realm, faction, ts], mine_only=True) is not None:
+                continue  # this key already pushed it (or it is from before src_key)
+            if applied.get("scans", 0) >= MAX_SCANS_PER_BATCH:
+                # the PC sends the rest again with its next push (it only skips scans the server lists as its own)
+                applied["scans_deferred"] = applied.get("scans_deferred", 0) + 1
                 continue
             # char is always blank here: the scanning character belongs to the pusher
             cur.execute("INSERT INTO main.ah_scans(ts,realm,faction,char,source,total,n,partial,raw_kept,diffed,seq,"
@@ -780,6 +1163,7 @@ def apply(conn, cfg, payload, source):
             put_sales(sid, realm, faction, ts, sales)
             applied["scans"] = applied.get("scans", 0) + 1
             applied["auctions"] = applied.get("auctions", 0) + len(auctions)
+            realms.setdefault(realm, 0)
         for u in _list(payload.get("scan_updates"), "scan_updates"):
             sales = _checked(u["sales"], "sales", lim) if "sales" in u else None
             r = scan_row(u.get("key"))
@@ -797,16 +1181,37 @@ def apply(conn, cfg, payload, source):
             if sales is not None:
                 put_sales(sid, realm, faction, ts, sales)
                 cur.execute("UPDATE main.ah_scans SET diffed=1, seq=? WHERE id=?", (seq, sid))
-        # Never hold more raw auctions than the owner's app does, whoever pushed them.
+        # Never hold more raw auctions than the owner's app does - counted per key, so one key's scans never push
+        # out another's.
         try:
             keep = max(2, min(int((new_cfg or cfg or {}).get("logger_keep_raw_scans") or 6), 1000))
         except (TypeError, ValueError, OverflowError):
             keep = 6
-        for realm, faction in cur.execute("SELECT DISTINCT realm, faction FROM main.ah_scans").fetchall():
-            for (sid,) in cur.execute("SELECT id FROM main.ah_scans WHERE realm=? AND faction=? AND raw_kept=1 "
-                                      "ORDER BY ts DESC LIMIT -1 OFFSET ?", (realm, faction, keep)).fetchall():
+        for realm, faction, skey in cur.execute("SELECT DISTINCT realm, faction, src_key FROM main.ah_scans "
+                                                "WHERE raw_kept=1").fetchall():
+            for (sid,) in cur.execute("SELECT id FROM main.ah_scans WHERE realm=? AND faction=? AND src_key IS ? AND "
+                                      "raw_kept=1 ORDER BY ts DESC LIMIT -1 OFFSET ?",
+                                      (realm, faction, skey, keep)).fetchall():
                 cur.execute("DELETE FROM main.ah_auctions WHERE scan_id=?", (sid,))
                 cur.execute("UPDATE main.ah_scans SET raw_kept=0, seq=? WHERE id=?", (seq, sid))
+        if changed:
+            # One ingest row per push that changed prices: the analytics cache and the per-browser alert check
+            # key on MAX(ingests.id). A contributor keeps only its newest one, so pushes do not pile up rows.
+            price_realms = {k: v for k, v in realms.items() if v}
+            realm = max(price_realms, key=lambda k: price_realms[k]) if price_realms else (
+                min(realms) if realms else None)
+            cur.execute("INSERT INTO main.ingests(ts,file_mtime,realm,items,changed,src_key) VALUES(?,NULL,?,?,?,?)",
+                        (int(time.time()), realm, realms.get(realm, 0), changed, src))
+            if not owner:
+                cur.execute("DELETE FROM main.ingests WHERE src_key=? AND id<?", (src, cur.lastrowid))
+            if owner and realm:
+                # the web version's default realm follows the owner, never a contributor (analytics.get_realm)
+                cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_owner_realm',?)", (realm,))
+        if owner and realms:
+            # the realm list of the web version: realms the owner has data for (analytics.list_realms)
+            have = _owner_realms(cur)
+            if set(realms) - set(have):
+                _set_owner_realms(cur, set(have) | set(realms))
         now = int(time.time())
         cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_push_ts',?)", (str(now),))
         if source.get("key_id"):
@@ -824,28 +1229,37 @@ def apply(conn, cfg, payload, source):
 
 
 def purge_key(conn, key_ids):
-    """Server (ahkey purge): delete every row the given sync keys pushed or last changed. -> {table: rows}.
+    """Server (ahkey purge): delete every row the given sync keys pushed. -> {table: rows deleted}.
 
-    Rows pushed before src_key existed (NULL) are not tracked and stay. PCs that already pulled the rows keep them."""
+    Prices: the keys' own rows are deleted and the merged rows are rebuilt from what the other keys sent (a merged
+    row only goes when no other key has a value for it). Rows pushed before src_key existed are not tracked and stay.
+    PCs that already pulled the rows keep them, but take the rebuilt rows on their next pull wherever they still hold
+    exactly what they pulled."""
     ensure_schema(conn)
     ids = sorted({int(k) for k in key_ids})
     out = {}
     if not ids:
         return out
     q = ",".join("?" * len(ids))
+    lim = _limits()
     cur = conn.cursor()
     cur.execute("BEGIN IMMEDIATE")
     try:
+        seq = _next_seq(cur)
         sids = [r[0] for r in cur.execute("SELECT id FROM main.ah_scans WHERE src_key IN (%s)" % q, ids)]
-        for i in range(0, len(sids), 500):
-            part = sids[i:i + 500]
-            sq = ",".join("?" * len(part))
-            for t in ("ah_auctions", "ah_scan_items", "ah_sales"):
-                out[t] = out.get(t, 0) + cur.execute("DELETE FROM main.%s WHERE scan_id IN (%s)" % (t, sq),
-                                                     part).rowcount
-            cur.execute("UPDATE main.ah_sales SET prev_scan_id=NULL WHERE prev_scan_id IN (%s)" % sq, part)
-        for t in ("ah_scans", "price_daily", "price_current", "snapshots"):
-            out[t] = cur.execute("DELETE FROM main.%s WHERE src_key IN (%s)" % (t, q), ids).rowcount
+        out["ah_scans"] = _drop_scans(cur, sids, out)
+        _touch_reset(cur)
+        cur.execute("INSERT OR IGNORE INTO temp._pd_keys SELECT realm, item_id, day FROM main.price_daily_src "
+                    "WHERE src_key IN (%s)" % q, ids)
+        cur.execute("INSERT OR IGNORE INTO temp._pc_keys SELECT realm, item_id FROM main.price_current_src "
+                    "WHERE src_key IN (%s)" % q, ids)
+        out["price_daily"] = cur.execute("DELETE FROM main.price_daily_src WHERE src_key IN (%s)" % q, ids).rowcount
+        out["price_current"] = cur.execute("DELETE FROM main.price_current_src WHERE src_key IN (%s)" % q,
+                                           ids).rowcount
+        out["merged_rows_changed"] = _recompute_daily(cur, seq) + _recompute_current(cur, seq, lim)
+        out["snapshots"] = cur.execute("DELETE FROM main.snapshots WHERE src_key IN (%s)" % q, ids).rowcount
+        out["ingests"] = cur.execute("DELETE FROM main.ingests WHERE src_key IN (%s)" % q, ids).rowcount
+        _set_owner_realms(cur, _owner_realms_from_data(cur))
         if any(out.values()):
             # a new ingest row makes the running web server drop its cached analytics
             cur.execute("INSERT INTO main.ingests(ts,file_mtime,realm,items,changed) VALUES(?,NULL,NULL,0,?)",
@@ -858,64 +1272,96 @@ def purge_key(conn, key_ids):
 
 
 PULL_LIMIT = 50000
+CURSOR_KEYS = ("pd", "pc", "sn", "sc")
+
+
+def _cursor_int(v, what):
+    if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= CURSOR_MAX:
+        raise BadPayload("cursor %s must hold integers 0..2^63-1" % what)
+    return v
 
 
 def pull_page(conn, cursor, limit=PULL_LIMIT):
-    """Server: rows changed after `cursor`, oldest change first, at most ~limit rows per table."""
+    """Server: rows changed after `cursor`, oldest change first, at most ~limit rows per table.
+
+    A stored row that fails validation (left from before it existed) is skipped and logged, never sent: one such row
+    would make every PC refuse the page forever."""
     ensure_schema(conn)
-    c = cursor if isinstance(cursor, dict) else {}
+    if cursor is None:
+        cursor = {}
+    if not isinstance(cursor, dict):
+        raise BadPayload("cursor must be an object")
+    c = {k: cursor[k] for k in CURSOR_KEYS if k in cursor}
 
     def pair(k):
         v = c.get(k)
-        try:
-            return int(v[0]), int(v[1])
-        except (TypeError, ValueError, IndexError):
+        if v is None:
             return -1, -1
+        if not isinstance(v, list) or len(v) != 2:
+            raise BadPayload("cursor %s must be [seq, id]" % k)
+        return _cursor_int(v[0], k), _cursor_int(v[1], k)
 
-    limit = max(100, min(int(limit or PULL_LIMIT), PULL_LIMIT))
+    pairs = {k: pair(k) for k in ("pd", "pc", "sc")}
+    sn = -1 if c.get("sn") is None else _cursor_int(c["sn"], "sn")
+    try:
+        limit = int(limit) if isinstance(limit, int) or (isinstance(limit, str) and limit.isdigit()
+                                                        and len(limit) <= 9) else PULL_LIMIT
+    except (TypeError, ValueError):
+        limit = PULL_LIMIT
+    limit = max(100, min(limit or PULL_LIMIT, PULL_LIMIT))
+    lim = _limits()
     epoch = conn.execute("SELECT value FROM main.meta WHERE key='sync_epoch'").fetchone()[0]
     out = {"protocol": PROTOCOL, "epoch": epoch, "cursor": dict(c), "more": False}
+    skipped = {}
+
+    def ok(rows, what):
+        good = [r for r in rows if _bad_row(r, SPEC[what], lim) is None]
+        if len(good) != len(rows):
+            skipped[what] = skipped.get(what, 0) + len(rows) - len(good)
+        return good
 
     def page(key, cols, table):
         rows = conn.execute("SELECT seq, rowid, %s FROM main.%s WHERE (seq, rowid) > (?, ?) ORDER BY seq, rowid "
-                            "LIMIT ?" % (",".join(cols), table), pair(key) + (limit,)).fetchall()
+                            "LIMIT ?" % (",".join(cols), table), pairs[key] + (limit,)).fetchall()
         if rows:
             out["cursor"][key] = [rows[-1][0], rows[-1][1]]
         out["more"] = out["more"] or len(rows) >= limit
-        return [list(r[2:]) for r in rows]
+        return ok([list(r[2:]) for r in rows], table)
 
     out["price_daily"] = page("pd", PRICE_DAILY, "price_daily")
     out["price_current"] = page("pc", PRICE_CURRENT, "price_current")
-    try:
-        sn = int(c.get("sn", -1))
-    except (TypeError, ValueError):
-        sn = -1
     rows = conn.execute("SELECT rowid, %s FROM main.snapshots WHERE rowid>? ORDER BY rowid LIMIT ?"
                         % ",".join(SNAPSHOTS), (sn, limit)).fetchall()
     if rows:
         out["cursor"]["sn"] = rows[-1][0]
     out["more"] = out["more"] or len(rows) >= limit
-    out["snapshots"] = [list(r[1:]) for r in rows]
+    out["snapshots"] = ok([list(r[1:]) for r in rows], "snapshots")
 
     scans, budget = [], limit
     for r in conn.execute("SELECT seq, id, %s FROM main.ah_scans WHERE (seq, id) > (?, ?) ORDER BY seq, id"
-                          % ",".join(SCAN), pair("sc")).fetchall():
+                          % ",".join(SCAN), pairs["sc"]).fetchall():
         if scans and budget <= 0:
             out["more"] = True
             break
+        out["cursor"]["sc"] = [r[0], r[1]]
         sid, row = r[1], list(r[2:])
+        if _bad_row(row, SPEC["scan"], lim):
+            skipped["scan"] = skipped.get("scan", 0) + 1
+            continue
         item = {"scan": row,
-                "items": _rows(conn, "SELECT %s FROM main.ah_scan_items WHERE scan_id=?" % ",".join(SCAN_ITEMS),
-                               (sid,)),
-                "auctions": _rows(conn, "SELECT %s FROM main.ah_auctions WHERE scan_id=?" % ",".join(AUCTIONS),
-                                  (sid,)) if row[7] else None,
-                "sales": _rows(conn, "SELECT p.ts, s.item_id, s.suffix, s.count, s.unit_price, s.owner, s.kind "
-                                     "FROM main.ah_sales s LEFT JOIN main.ah_scans p ON p.id=s.prev_scan_id "
-                                     "WHERE s.scan_id=?", (sid,))}
+                "items": ok(_rows(conn, "SELECT %s FROM main.ah_scan_items WHERE scan_id=?" % ",".join(SCAN_ITEMS),
+                                  (sid,)), "scan items"),
+                "auctions": ok(_rows(conn, "SELECT %s FROM main.ah_auctions WHERE scan_id=?" % ",".join(AUCTIONS),
+                                     (sid,)), "auctions") if row[7] else None,
+                "sales": ok(_rows(conn, "SELECT p.ts, s.item_id, s.suffix, s.count, s.unit_price, s.owner, s.kind "
+                                        "FROM main.ah_sales s LEFT JOIN main.ah_scans p ON p.id=s.prev_scan_id "
+                                        "WHERE s.scan_id=?", (sid,)), "sales")}
         budget -= len(item["items"]) + len(item["auctions"] or []) + len(item["sales"]) + 1
         scans.append(item)
-        out["cursor"]["sc"] = [r[0], r[1]]
     out["scans"] = scans
+    if skipped:
+        _log("pull: left out stored rows that fail validation (run sync.sweep_invalid): %s"
+             % ", ".join("%d %s" % (n, t) for t, n in skipped.items()))
     return out
 
 
@@ -925,11 +1371,48 @@ def _pull_key(cfg):
     return "pull:" + hashlib.sha1((cfg.get("sync_url") or "").rstrip("/").encode()).hexdigest()[:16]
 
 
+def _mn(a, b):
+    return b if a is None else (a if b is None else min(a, b))
+
+
+def _mx(a, b):
+    return b if a is None else (a if b is None else max(a, b))
+
+
+def _merge3(a, b):
+    return (_mn(a[0], b[0]), _mx(a[1], b[1]), _mx(a[2], b[2]))
+
+
+def _num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+
+def current_is_future(last_day, updated_at, lim=None):
+    """A price_current row dated after today (UTC) or updated after now (+slack): it never blocks a real observation."""
+    lim = lim or _limits()
+    return _num(last_day) > lim["today"] or _num(updated_at) > lim["ts"]
+
+
+def current_newer(new, old, lim=None):
+    """price_current rule, the same on the server, in apply_pull and (should be) in ingest.py: may observation `new`
+    replace stored row `old`? Both (price, available, last_day, updated_at). Newest by (last_day, updated_at) wins,
+    but a row from the future (current_is_future) never wins over one that is not, and is always replaceable."""
+    if old is None or current_is_future(old[2], old[3], lim):
+        return True
+    if current_is_future(new[2], new[3], lim):
+        return False
+    return (_num(new[2]), _num(new[3])) >= (_num(old[2]), _num(old[3]))
+
+
 def apply_pull(conn, page, keep_raw=6):
     """Merge one pulled page into the local DB. Returns {"prices": changed rows, "scans": new/updated scans}.
 
     Every row is validated like on the server (types, ranges, nothing in the future); one bad row refuses the page
-    (BadPayload) and nothing of it is stored."""
+    (BadPayload) and nothing of it is stored.
+
+    Prices: what was pulled is remembered per row (sync_pulled_*). A local row that still holds exactly what was
+    pulled last time is someone else's data and simply takes the server's new value (so a purge on the server reaches
+    this PC too); a row with your own observations in it is merged with the same rules as on the server."""
     if not isinstance(page, dict):
         raise BadPayload("pull page must be an object")
     lim = _limits(PULL_TS_SLACK)
@@ -945,28 +1428,58 @@ def apply_pull(conn, page, keep_raw=6):
                       _checked(_list(s.get("items"), "scan items"), "scan items", lim),
                       None if auctions is None else _checked(_list(auctions, "auctions"), "auctions", lim),
                       _checked(_list(s.get("sales"), "sales"), "sales", lim)))
+    _ensure_client_schema(conn)
     cur = conn.cursor()
     cur.execute("BEGIN IMMEDIATE")
     try:
-        before = conn.total_changes
-        cur.executemany(
-            "INSERT INTO price_current(realm,item_id,price,available,last_day,updated_at) VALUES(?,?,?,?,?,?) "
-            "ON CONFLICT(realm,item_id) DO UPDATE SET price=excluded.price, available=excluded.available, "
-            "last_day=excluded.last_day, updated_at=excluded.updated_at "
-            "WHERE (" + _CURRENT_NEWER % (lim["day"], lim["ts"]) + ") "
-            "AND (excluded.price IS NOT price_current.price OR excluded.available IS NOT price_current.available "
-            "OR excluded.last_day IS NOT price_current.last_day)", pc)
+        prices = 0
         realms = {}
-        for r in pc:
-            realms[r[0]] = realms.get(r[0], 0) + 1
-        cur.executemany("INSERT INTO price_daily(realm,item_id,day,low,high,available) VALUES(?,?,?,?,?,?) "
-                        "ON CONFLICT(realm,item_id,day) DO UPDATE SET " + MERGE_DAILY, pd)
-        for r in pd:
-            realms.setdefault(r[0], 0)
+        for realm, iid, price, avail, last_day, upd in pc:
+            new = (price, avail, last_day, upd)
+            old = cur.execute("SELECT price, available, last_day, updated_at FROM price_current WHERE realm=? AND "
+                              "item_id=?", (realm, iid)).fetchone()
+            rec = cur.execute("SELECT price, available, last_day, updated_at FROM sync_pulled_current WHERE realm=? "
+                              "AND item_id=?", (realm, iid)).fetchone()
+            old = tuple(old) if old else None
+            if old is None:
+                cur.execute("INSERT INTO price_current(realm,item_id,price,available,last_day,updated_at) "
+                            "VALUES(?,?,?,?,?,?)", (realm, iid) + new)
+                prices += 1
+            elif old != new and ((rec is not None and tuple(rec) == old) or current_newer(new, old, lim)):
+                cur.execute("UPDATE price_current SET price=?, available=?, last_day=?, updated_at=? WHERE realm=? "
+                            "AND item_id=?", new + (realm, iid))
+                prices += old[:3] != new[:3]
+            cur.execute("INSERT OR REPLACE INTO sync_pulled_current VALUES(?,?,?,?,?,?)", (realm, iid) + new)
+            realms[realm] = realms.get(realm, 0) + 1
+        for realm, iid, day, low, high, avail in pd:
+            new = (low, high, avail)
+            old = cur.execute("SELECT low, high, available FROM price_daily WHERE realm=? AND item_id=? AND day=?",
+                              (realm, iid, day)).fetchone()
+            rec = cur.execute("SELECT low, high, available FROM sync_pulled_daily WHERE realm=? AND item_id=? AND "
+                              "day=?", (realm, iid, day)).fetchone()
+            old, rec = (tuple(old) if old else None), (tuple(rec) if rec else None)
+            if old is None:
+                cur.execute("INSERT INTO price_daily(realm,item_id,day,low,high,available) VALUES(?,?,?,?,?,?)",
+                            (realm, iid, day) + new)
+                prices += 1
+                rec = new
+            else:
+                if rec is not None and rec == old:
+                    val, rec = new, new  # only pulled data in it: the server's merge replaces it
+                else:
+                    val, rec = _merge3(old, new), (new if rec is None else _merge3(rec, new))
+                if val != old:
+                    cur.execute("UPDATE price_daily SET low=?, high=?, available=? WHERE realm=? AND item_id=? AND "
+                                "day=?", val + (realm, iid, day))
+                    prices += 1
+            cur.execute("INSERT OR REPLACE INTO sync_pulled_daily VALUES(?,?,?,?,?,?)", (realm, iid, day) + rec)
+            realms.setdefault(realm, 0)
+        n0 = conn.total_changes
         cur.executemany("INSERT INTO snapshots(realm,item_id,ts,price,available) SELECT ?,?,?,?,? WHERE NOT EXISTS "
                         "(SELECT 1 FROM snapshots WHERE realm=? AND item_id=? AND ts=?)",
                         [r + r[:3] for r in sn])
-        prices = conn.total_changes - before
+        prices += conn.total_changes - n0
+        cur.executemany("INSERT OR IGNORE INTO sync_pulled_snap VALUES(?,?,?)", [r[:3] for r in sn])
 
         def local_scan(realm, faction, ts):
             return cur.execute("SELECT id, COALESCE(source,''), raw_kept FROM ah_scans WHERE realm=? AND faction=? "
@@ -1036,6 +1549,7 @@ def pull(conn, cfg, full=False, max_pages=300):
     At most `max_pages` pages per call; the rest follows on the next pull (the cursor is saved after each page)."""
     if not cfg.get("sync_url") or not cfg.get("sync_token"):
         raise SyncError("sync_url and sync_token must be set in config.json")
+    _ensure_client_schema(conn)
     r = conn.execute("SELECT value FROM meta WHERE key=?", (_pull_key(cfg),)).fetchone()
     try:
         st = json.loads(r[0]) if r and not full else {}

@@ -16,8 +16,11 @@ yours, and their own trades never leave it. Analysis settings and the static ite
 (and from AHTOOL_SYNC_TOKEN, which is always owner).
 
 The web version records which key pushed each scan and price row (src_key), so a scan can only be changed later by
-the key that pushed it (or an owner), and `purge` removes everything a key pushed or last changed - e.g. poisoned
-prices. Rows pushed before src_key existed are not tracked. PCs that already pulled the rows keep their copy.
+the key that pushed it (or an owner), and `purge` removes everything a key pushed - e.g. poisoned prices. Prices are
+stored per key and merged for display, so a purge recomputes the merged prices from what the other keys sent (it
+neither leaves the purged key's values in a merged row nor deletes other keys' history). It also removes the key's
+ingest rows. Rows pushed before src_key existed are not tracked. PCs that already pulled the rows keep their copy,
+except rows they still hold exactly as pulled: those take the recomputed value on their next pull.
 """
 import argparse
 import hashlib

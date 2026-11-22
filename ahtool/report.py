@@ -57,12 +57,19 @@ def _r(v, n=4):
 
 
 def _scans(conn, realm):
-    q = "SELECT id, ts, n, faction, realm FROM ah_scans WHERE partial=0"
+    """Full scans, oldest first. Only your own (web version: the owner's) when the newest of those is recent
+    (market.PREFER_OWN_S before the newest scan of anyone), so other players' scans never pick the faction or the
+    window, and never mix their sales into yours."""
+    q = "SELECT id, ts, n, faction, realm, %s AS pref FROM ah_scans WHERE partial=0" % market.preferred_scans_sql(conn)
     args = ()
     if realm:
         q += " AND realm=?"
         args = (realm,)
-    return [dict(r) for r in conn.execute(q + " ORDER BY ts", args)]
+    scans = [dict(r) for r in conn.execute(q + " ORDER BY ts", args)]
+    own = [s for s in scans if s["pref"]]
+    if own and own[-1]["ts"] >= scans[-1]["ts"] - market.PREFER_OWN_S:
+        return own
+    return scans
 
 
 def _covered(scans, window):
@@ -84,10 +91,11 @@ def _sales(conn, scan_ids):
     per = defaultdict(lambda: {"sold": 0, "value": 0})
     auctions = 0
     for iid, cnt, val, n in conn.execute(
-            "SELECT item_id, SUM(count), SUM(count*unit_price), COUNT(*) FROM ah_sales "
+            # TOTAL (float sum), not SUM: SUM raises "integer overflow" past 2^63 (sales may come from other players)
+            "SELECT item_id, TOTAL(count), TOTAL(count*unit_price), COUNT(*) FROM ah_sales "
             "WHERE scan_id IN (%s) AND kind='sold' GROUP BY item_id" % marks, scan_ids):
-        per[iid]["sold"] = cnt or 0
-        per[iid]["value"] = val or 0
+        per[iid]["sold"] = int(cnt or 0)
+        per[iid]["value"] = int(round(val or 0))
         auctions += n
     return per, auctions
 

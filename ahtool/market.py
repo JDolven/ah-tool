@@ -103,7 +103,8 @@ def _seq(v):
     return []
 
 
-MAX_ROW_MULT = 1000  # "N*row" repeats a row N times; a real scan never has 1000 identical auctions
+MAX_ROW_MULT = 1000  # "N*row" repeats a row N times; larger groups are capped (identical commodity stacks)
+MAX_SCAN_ROWS = 500000  # rows per scan after expansion (memory bound)
 
 
 def parse_rows(d, with_status=False):
@@ -119,8 +120,9 @@ def parse_rows(d, with_status=False):
                 mult = int(row[:star])
             except ValueError:
                 continue
-            if not 0 < mult <= MAX_ROW_MULT:
-                continue  # malformed (or a memory bomb): skip the row
+            if mult <= 0:
+                continue  # malformed: skip the row
+            mult = min(mult, MAX_ROW_MULT)  # cap, never drop: a dropped group would look like sales later
             row = row[star + 1:]
         f = row.split(",")
         if len(f) < 8:
@@ -133,7 +135,9 @@ def parse_rows(d, with_status=False):
             continue
         if with_status:
             r = r + (_i(f[8]) if len(f) > 8 else 0,)
-        out.extend([r] * mult)
+        out.extend([r] * min(mult, MAX_SCAN_ROWS - len(out)))
+        if len(out) >= MAX_SCAN_ROWS:
+            break
     return out
 
 
@@ -265,6 +269,13 @@ def _diff_pending(conn):
     return n_sales
 
 
+def _drop_scan(cur, sid):
+    for t in ("ah_auctions", "ah_scan_items", "ah_sales"):
+        cur.execute("DELETE FROM %s WHERE scan_id=?" % t, (sid,))
+    cur.execute("UPDATE ah_sales SET prev_scan_id=NULL WHERE prev_scan_id=?", (sid,))
+    cur.execute("DELETE FROM ah_scans WHERE id=?", (sid,))
+
+
 def _name_map(conn):
     m = {}
     for iid, name in conn.execute("SELECT id, name FROM items WHERE name IS NOT NULL ORDER BY id DESC"):
@@ -293,9 +304,15 @@ def ingest(conn, cfg, force=False):
             cur.execute("BEGIN IMMEDIATE")
             for s in sorted((x for x in _seq(data.get("scans")) if isinstance(x, dict)), key=lambda x: _i(x.get("t"))):
                 ts, realm, faction = _i(s.get("t")), _s(s.get("realm")), _s(s.get("faction"))
-                if not ts or cur.execute("SELECT 1 FROM ah_scans WHERE realm=? AND faction=? AND ts=?",
-                                         (realm, faction, ts)).fetchone():
+                if not ts:
                     continue
+                have = cur.execute("SELECT id, COALESCE(source,'') FROM ah_scans WHERE realm=? AND faction=? AND ts=?",
+                                   (realm, faction, ts)).fetchone()
+                if have and have[1] != "web":
+                    continue
+                if have:
+                    # a scan pulled from the web version (someone else's, or a fake one) never blocks your own
+                    _drop_scan(cur, have[0])
                 rows = parse_rows(s.get("d"))
                 # GetReplicateItemTimeLeft may return 0-based bands; normalise to 1..4
                 if rows and min(r[6] for r in rows) == 0 and max(r[6] for r in rows) <= 3:
@@ -374,15 +391,38 @@ def _realm_filter(conn, realm):
     return None
 
 
-def latest_scan(conn, realm=None):
+PREFER_OWN_S = 6 * 3600  # your own (web version: the owner's) newest scan is used if it is at most this old
+
+
+def preferred_scans_sql(conn):
+    """SQL condition on ah_scans for the scans to prefer: the local app's own scans (not pulled from the web version);
+    on the web version the owner's (AHTOOL_SYNC_TOKEN, an owner key, or pushed before keys were tracked)."""
+    try:
+        web = conn.execute("SELECT 1 FROM meta WHERE key='sync_epoch'").fetchone() is not None
+        if web and "src_key" in [r[1] for r in conn.execute("PRAGMA table_info(ah_scans)")]:
+            return ("(src_key IS NULL OR src_key<=0 OR src_key IN (SELECT id FROM sync_keys WHERE role='owner'))")
+    except Exception:  # noqa - no meta / sync_keys table
+        pass
+    return "COALESCE(source,'')<>'web'"
+
+
+def latest_scan(conn, realm=None, faction=None):
+    """Newest complete scan with raw auctions. Your own (web version: the owner's) if one is at most PREFER_OWN_S old,
+    else anyone's - so scans pushed or pulled from other players never hide yours."""
     ensure_schema(conn)
     realm = _realm_filter(conn, realm)
     q = "SELECT * FROM ah_scans WHERE partial=0 AND raw_kept=1"
-    args = ()
+    args = []
     if realm:
         q += " AND realm=?"
-        args = (realm,)
-    r = conn.execute(q + " ORDER BY ts DESC LIMIT 1", args).fetchone()
+        args.append(realm)
+    if faction:
+        q += " AND faction=?"
+        args.append(faction)
+    r = conn.execute(q + " AND ts>=? AND " + preferred_scans_sql(conn) + " ORDER BY ts DESC LIMIT 1",
+                     args + [int(time.time()) - PREFER_OWN_S]).fetchone()
+    if not r:
+        r = conn.execute(q + " ORDER BY ts DESC LIMIT 1", args).fetchone()
     return dict(r) if r else None
 
 
@@ -528,10 +568,11 @@ def activity(conn, cfg, days=7, limit=100, realm=None):
     since = _since(days)
     cov = _scan_coverage(conn, realm, since)
     dobs = max(1, cov["days_observed"])
+    # TOTAL (a float sum), not SUM: SUM raises "integer overflow" past 2^63, and sales come from other players too
     rows = conn.execute(
-        "SELECT a.item_id, SUM(CASE WHEN kind='sold' THEN count ELSE 0 END) AS sold, "
-        "SUM(CASE WHEN kind='sold' THEN count*unit_price ELSE 0 END) AS value, "
-        "SUM(CASE WHEN kind='expired' THEN count ELSE 0 END) AS expired, "
+        "SELECT a.item_id, TOTAL(CASE WHEN kind='sold' THEN count ELSE 0 END) AS sold, "
+        "TOTAL(CASE WHEN kind='sold' THEN count*unit_price ELSE 0 END) AS value, "
+        "TOTAL(CASE WHEN kind='expired' THEN count ELSE 0 END) AS expired, "
         "COUNT(DISTINCT CASE WHEN kind='sold' THEN owner END) AS sellers, i.name, i.quality "
         "FROM ah_sales a LEFT JOIN items i ON i.id=a.item_id WHERE a.ts>=? GROUP BY a.item_id "
         "HAVING sold>0 ORDER BY value DESC LIMIT ?", (since, int(limit))).fetchall()
@@ -542,10 +583,10 @@ def activity(conn, cfg, days=7, limit=100, realm=None):
             "SELECT item_id, qty, min_unit FROM ah_scan_items WHERE scan_id=?", (scan["id"],))}
     items = []
     for r in rows:
-        sold, exp = r["sold"], r["expired"]
+        sold, exp, value = int(r["sold"]), int(r["expired"]), int(round(r["value"]))
         sup = supply.get(r["item_id"])
         items.append({"item_id": r["item_id"], "name": r["name"], "quality": r["quality"] if r["quality"] is not None else 1,
-                      "sold": sold, "value": r["value"], "avg_unit": round(r["value"] / sold, 1) if sold else None,
+                      "sold": sold, "value": value, "avg_unit": round(value / sold, 1) if sold else None,
                       "per_day": round(sold / dobs, 1), "expired": exp,
                       "sell_through": round(sold / (sold + exp), 3) if sold + exp else None,
                       "sellers": r["sellers"], "listed_now": sup[0] if sup else 0,
@@ -554,18 +595,18 @@ def activity(conn, cfg, days=7, limit=100, realm=None):
     sellers = []
     if scan:
         for r in conn.execute(
-                "SELECT owner, COUNT(*) AS auctions, COUNT(DISTINCT item_id) AS items, SUM(buyout) AS value "
+                "SELECT owner, COUNT(*) AS auctions, COUNT(DISTINCT item_id) AS items, TOTAL(buyout) AS value "
                 "FROM ah_auctions WHERE scan_id=? AND owner<>'' GROUP BY owner ORDER BY value DESC LIMIT 50",
                 (scan["id"],)):
-            sellers.append({"owner": r[0], "auctions": r[1], "items": r[2], "value": r[3] or 0})
-    totals = conn.execute("SELECT SUM(CASE WHEN kind='sold' THEN count*unit_price ELSE 0 END), "
+            sellers.append({"owner": r[0], "auctions": r[1], "items": r[2], "value": int(round(r[3] or 0))})
+    totals = conn.execute("SELECT TOTAL(CASE WHEN kind='sold' THEN count*unit_price ELSE 0 END), "
                           "SUM(CASE WHEN kind='sold' THEN 1 ELSE 0 END), SUM(CASE WHEN kind='expired' THEN 1 ELSE 0 END), "
                           "SUM(CASE WHEN kind='relisted' THEN 1 ELSE 0 END) FROM ah_sales WHERE ts>=?",
                           (since,)).fetchone()
     scans = [{"ts": r[0], "auctions": r[1], "partial": bool(r[2]), "char": r[3], "source": r[4]}
              for r in conn.execute("SELECT ts, n, partial, char, source FROM ah_scans ORDER BY ts DESC LIMIT 30")]
     return {"days": days, "coverage": cov, "scan": _scan_info(scan), "installed": addon_installed(cfg),
-            "totals": {"value": totals[0] or 0, "sold_auctions": totals[1] or 0, "expired_auctions": totals[2] or 0,
+            "totals": {"value": int(round(totals[0] or 0)), "sold_auctions": totals[1] or 0, "expired_auctions": totals[2] or 0,
                        "relisted_auctions": totals[3] or 0},
             "items": items, "sellers": sellers, "scans": scans}
 

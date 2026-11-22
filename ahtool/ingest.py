@@ -162,6 +162,7 @@ def _ingest(conn, cfg, force=False):
                 "SELECT item_id, price, available, last_day, updated_at FROM price_current WHERE realm=?", (realm,))}
             daily, current, snaps = [], [], []
             today = _today(now)
+            now_slack = now + 300  # same 5-minute slack as sync.current_is_future
             for iid, v in items.items():
                 try:  # one malformed item never aborts the import of the others
                     row = _item_rows(realm, iid, v)
@@ -173,8 +174,9 @@ def _ingest(conn, cfg, force=False):
                 daily.extend(drows)
                 p = prev.get(iid)
                 # A newer observation pulled from the web version (another player's scan) is kept, but a
-                # future-dated one (last_day > today: never genuine) never blocks the user's own import.
-                if p is not None and (p[2] or 0) <= today and (p[2] or 0, p[3] or 0) > (last_day, mtime):
+                # future-dated one (last_day > today or updated_at ahead of now: never genuine) never blocks the
+                # user's own import.
+                if p is not None and (p[2] or 0) <= today and (p[3] or 0) <= now_slack and (p[2] or 0, p[3] or 0) > (last_day, mtime):
                     continue
                 if p is None or p[0] != price or p[1] != avail or p[2] != last_day:
                     current.append((realm, iid, price, avail, last_day, mtime))
