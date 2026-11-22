@@ -118,6 +118,10 @@ Python API exported by DATA agent:
    stats:{baseline,avg7,avg30,min30,max30,median30,days_of_data,volatility,trend7_pct}, history:[{date,low,high,available}],
    snapshots:[{ts,price,available}], crafted_by:[recipe objects], used_in:[{spell_id,name,profession,count}], postings:[{ts,price,quantity}]}`
 - `GET /api/professions` → `[{id,name,name_no,recipe_count,priced_count,profitable_count,best_profit}]`
+- `GET /api/professions/<id>/gather` → what a gathering profession (5 Herbalism, 7 Mining, 11 Fishing, 12 Skinning)
+  can gather, `[]` for others: `[{id,name,quality,price,available,last_date,baseline,discount,confidence,price_flag,
+  skill,skill_approx,where,kind,vendor_sell}]`. Curated Classic list in `ahtool/gathering.py`, resolved by item name.
+  `GET /api/professions` items also carry `gather_count`, `gather_priced`, `gather_top_price`.
 - `GET /api/professions/<id>?mode=current|baseline` → `[recipe]`, recipe =
   `{spell_id,name,created_item_id,created_name,created_quality,num_created,skill:{min,low,high},
     reagents:[{item_id,name,quality,count,unit_price,source,total,is_deal}], cost,cost_complete,sell,profit,margin,sell_available}`

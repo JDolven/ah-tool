@@ -544,6 +544,14 @@ else:
     check("leveling route 501 when module missing", st == 501 and "error" in body, (st, body))
     check("leveling to-shopping 501", req("POST", "/api/leveling/4/to-shopping")[0] == 501)
 
+# gathering professions: what can be gathered, resolved by item name
+g = ok("GET", "/api/professions/5/gather")
+check("herbalism gather list resolves Bruiseweed", any(r["name"] == "Bruiseweed" and r["skill"] == 100 and r["where"] for r in g), g)
+check("gather rows carry prices", all("price" in r and "baseline" in r for r in g))
+check("non-gathering profession has no gather list", ok("GET", "/api/professions/4/gather") == [])
+pl = {p["id"]: p for p in ok("GET", "/api/professions")}
+check("gather_count counts resolved items", pl[5]["gather_count"] == len(g) and pl[4]["gather_count"] == 0, pl[5])
+
 # clean up user state
 ok("PUT", "/api/myprofessions", [])
 check("myprofessions cleared", ok("GET", "/api/myprofessions") == [])

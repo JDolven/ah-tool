@@ -1228,3 +1228,9 @@ button.sr-row { width: 100%; border: 0; background: transparent; text-align: lef
   .rp { box-shadow: none; max-width: none; break-inside: auto; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .rp section, .rp-box { break-inside: avoid; }
 }
+
+/* Professions: gathering list */
+#pd-gather .section-title, #pd-rec-title { margin: 4px 0 10px; }
+#pd-rec-title { margin-top: 24px; }
+#pd-rec-title[hidden] { display: none; }
+#pd-filters[hidden], #pd-summary[hidden], #pd-table[hidden], #g-mine-wrap[hidden] { display: none; }

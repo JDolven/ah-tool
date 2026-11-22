@@ -689,6 +689,7 @@ def mycrafts(conn, cfg=None, mode="current", limit=50, realm=None):
 
 
 def professions(conn, cfg=None, realm=None):
+    from . import gathering  # gathering imports analytics
     ctx = _ctx(conn, cfg, realm)
     mine = userstate.my_professions(conn)
     counts = {r[0]: r[1] for r in conn.execute("SELECT profession_id, COUNT(*) FROM recipes GROUP BY profession_id")}
@@ -699,10 +700,13 @@ def professions(conn, cfg=None, realm=None):
         priced = [r for r in recs if r["profit"] is not None]
         sure = [r for r in priced if r["confidence"] != "low"]
         names = PROFESSIONS.get(pid, ("Profession %d" % pid, "Profession %d" % pid))
+        g = gathering.gather_items(conn, cfg, pid, ctx.realm) if gathering.gather_count(pid) else []
         out.append({
             "id": pid, "name": names[0], "name_no": names[1],
             "mine": pid in mine, "my_skill": mine.get(pid),
             "recipe_count": counts.get(pid, 0), "priced_count": len(priced),
+            "gather_count": len(g), "gather_priced": sum(1 for r in g if r["price"]),
+            "gather_top_price": max((r["price"] for r in g if r["price"]), default=None),
             "profitable_count": sum(1 for r in priced if r["profit"] > 0),
             "best_profit": max((r["profit"] for r in priced), default=None),
             "reliable_count": len(sure),

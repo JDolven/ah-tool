@@ -106,6 +106,9 @@ const ITEM_ROWS = [
   [13860, 'Runecloth Cloak', 2, 56, 4, 1, 2300, 0, 1, 21000, 4, 1.0],
   [14472, 'Pattern: Runecloth Cloak', 2, 56, 9, 2, 1000, 0, 1, 18000, 3, 1.0],
   [8170, 'Rugged Leather', 1, 50, 7, 6, 375, 0, 20, 3800, 300, 1.0],
+  [6291, 'Raw Brilliant Smallfish', 1, 5, 0, 0, 1, 0, 20, 12, 260, 0.9],
+  [13422, 'Stonescale Eel', 1, 45, 7, 11, 40, 0, 20, 1900, 180, 1.0],
+  [2318, 'Light Leather', 1, 10, 7, 6, 15, 0, 20, 140, 520, 0.95],
   [2320, 'Coarse Thread', 1, 5, 7, 5, 2, 10, 20, null, 0, 1],
   [2321, 'Fine Thread', 1, 15, 7, 5, 25, 100, 20, null, 0, 1],
   [4340, 'Gray Dye', 1, 15, 7, 11, 8, 35, 20, null, 0, 1],
@@ -640,6 +643,36 @@ function item(id) {
   };
 }
 
+// name -> [skill, where, kind] for the gathering lists (a few of the real ones, see ahtool/gathering.py)
+const GATHER = {
+  5: [['Peacebloom', 1, 'Starting zones', 'herb'], ['Silverleaf', 1, 'Starting zones', 'herb'],
+    ['Mageroyal', 50, 'Barrens, Westfall, Darkshore, Silverpine', 'herb'], ['Briarthorn', 70, 'Barrens, Darkshore, Redridge, Hillsbrad', 'herb'],
+    ['Stranglekelp', 85, 'Under water along coasts', 'herb'], ['Bruiseweed', 100, 'Barrens, Ashenvale, Wetlands, Hillsbrad', 'herb'],
+    ['Kingsblood', 125, 'Ashenvale, Hillsbrad, Arathi, Stranglethorn', 'herb'], ['Liferoot', 150, 'Near water: Wetlands, Arathi, Stranglethorn, Dustwallow', 'herb'],
+    ['Goldthorn', 170, 'Arathi, Stranglethorn, Badlands, Feralas', 'herb'], ["Khadgar's Whisker", 185, 'Arathi, Stranglethorn, Swamp of Sorrows, Feralas', 'herb'],
+    ["Arthas' Tears", 220, 'Felwood, Plaguelands', 'herb'], ['Sungrass', 230, "Feralas, Hinterlands, Un'Goro, Silithus, Plaguelands", 'herb'],
+    ['Blindweed', 235, "Swamp of Sorrows, Un'Goro", 'herb'], ['Gromsblood', 250, 'Felwood, Desolace, Blasted Lands, Ashenvale', 'herb'],
+    ['Golden Sansam', 260, "Feralas, Azshara, Un'Goro, Burning Steppes", 'herb'], ['Mountain Silversage', 280, "Winterspring, Un'Goro, Azshara, Burning Steppes", 'herb'],
+    ['Plaguebloom', 285, 'Plaguelands, Felwood', 'herb'], ['Black Lotus', 300, 'Rare: Winterspring, Burning Steppes, Silithus, Eastern Plaguelands', 'herb']],
+  7: [['Copper Ore', 1, 'Copper vein: starting zones, Barrens, Westfall', 'ore'], ['Aquamarine', 155, 'Gold and mithril deposits (gem)', 'gem'],
+    ['Thorium Ore', 245, 'Small thorium vein (245), rich thorium vein (275)', 'ore'], ['Dense Stone', 245, 'Thorium veins', 'stone'],
+    ['Arcane Crystal', 275, 'Rich thorium vein (rare)', 'gem']],
+  11: [['Raw Brilliant Smallfish', 1, 'Inland waters of the starting zones', 'fish'], ['Stonescale Eel', 205, 'Schools along coasts: Tanaris, Feralas, Azshara', 'fish']],
+  12: [['Light Leather', 1, 'Beasts up to about level 25', 'leather'], ['Rugged Leather', 250, 'Beasts about level 50-60', 'leather']],
+};
+const GATHER_APPROX = new Set([11, 12]);
+
+function gatherRows(pid) {
+  const byName = new Map([...ITEMS.values()].map((it) => [it.name, it.id]));
+  return (GATHER[pid] || []).filter(([n]) => byName.has(n)).map(([n, skill, where, kind]) => {
+    const id = byName.get(n);
+    const r = itemRow(id);
+    const base = r.baseline;
+    return { ...r, discount: base && r.price ? (base - r.price) / base : null, confidence: 'high', price_flag: null,
+      skill, skill_approx: GATHER_APPROX.has(pid), where, kind, vendor_sell: ITEMS.get(id).vendor_sell };
+  });
+}
+
 function professions() {
   return PROFESSIONS.map(([id, name, name_no]) => {
     const recs = RECIPES.filter((r) => r[2] === id).map((r) => recipeObj(r));
@@ -657,6 +690,9 @@ function professions() {
       best_profit_reliable: relProfits.length ? Math.max(...relProfits) : null,
       mine: MY_PROFS.has(id),
       my_skill: MY_PROFS.has(id) ? MY_PROFS.get(id) : null,
+      gather_count: gatherRows(id).length,
+      gather_priced: gatherRows(id).filter((r) => r.price).length,
+      gather_top_price: Math.max(0, ...gatherRows(id).map((r) => r.price || 0)) || null,
     };
   });
 }
@@ -1303,6 +1339,7 @@ export function mockApi(method, fullPath, body) {
     return t;
   }
   if (p === '/api/professions') return professions();
+  if ((m = p.match(/^\/api\/professions\/(\d+)\/gather$/))) return gatherRows(Number(m[1]));
   if ((m = p.match(/^\/api\/professions\/(\d+)$/))) return profession(Number(m[1]), q.get('mode') || 'current', q.get('mine') === '1');
   if (p === '/api/deals') return deals(Number(q.get('threshold') ?? 0.25), Number(q.get('min_value') || 0), q.get('reason') || '', q.get('include_low') === '1');
   if ((m = p.match(/^\/api\/recipe\/(\d+)\/trend$/))) return recipeTrend(Number(m[1]), Math.max(7, Math.min(90, Number(q.get('days')) || 30)));

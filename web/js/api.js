@@ -169,6 +169,7 @@ export const api = {
   professions: () => get('/api/professions'),
   profession: (id, mode = 'current', mine = false) =>
     get(`/api/professions/${enc(id)}?mode=${enc(mode)}${mine ? '&mine=1' : ''}`),
+  gather: (id) => get(`/api/professions/${enc(id)}/gather`),
   deals: (threshold = 0.25, minValue = 0, reason = '', includeLow = false) =>
     get(`/api/deals?threshold=${threshold}&min_value=${Math.round(minValue)}&reason=${enc(reason)}${includeLow ? '&include_low=1' : ''}`),
   market: () => get('/api/stats/market'),
