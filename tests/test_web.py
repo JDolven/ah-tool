@@ -58,7 +58,8 @@ lua = """AHToolLoggerDB = {
 lp = os.path.join(tmp, "AHToolLogger.lua")
 with open(lp, "w", encoding="utf-8") as f:
     f.write(lua)
-lcfg = {"logger_savedvariables": lp, "ah_cut": 0.05, "deal_threshold": 0.3, "baseline_days": 14,
+# these sync tests check merge rules on Auctionator-style rows: scan-derived prices are tested elsewhere
+lcfg = {"prices_from_logger": False, "logger_savedvariables": lp, "ah_cut": 0.05, "deal_threshold": 0.3, "baseline_days": 14,
         "trend_min_profit": 50, "addons_dir": "", "sync_hide_sellers": ["Altsy"],
         "savedvariables": "C:\\secret\\path\\Auctionator.lua"}
 r = market.ingest(lconn, lcfg)
@@ -276,7 +277,7 @@ olua = """AHToolLoggerDB = { ["v"] = 1, ["scans"] = { %s },
 olp = os.path.join(tmp, "Ola.lua")
 with open(olp, "w", encoding="utf-8") as f:
     f.write(olua)
-ocfg = {"logger_savedvariables": olp, "addons_dir": "", "deal_threshold": 0.9, "sync_url": BASE, "sync_token": k_ola}
+ocfg = {"prices_from_logger": False, "logger_savedvariables": olp, "addons_dir": "", "deal_threshold": 0.9, "sync_url": BASE, "sync_token": k_ola}
 market.ingest(oconn, ocfg)
 cfg_before = w.execute("SELECT value FROM meta WHERE key='sync_cfg'").fetchone()[0]
 code, st_ola, _ = call("GET", "/api/sync/state", headers={"Authorization": "Bearer " + k_ola})

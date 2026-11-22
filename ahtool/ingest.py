@@ -144,7 +144,10 @@ def ingest(conn, cfg, force=False):
 
 
 def _ingest(conn, cfg, force=False):
-    path = cfg["savedvariables"]
+    path = cfg.get("savedvariables") or ""
+    if not path or not os.path.isfile(path):
+        # Auctionator is optional: AH Tool Logger scans give prices too (scanprices)
+        return {"realm": None, "items": 0, "changed": 0, "skipped": True, "missing": True}
     st = os.stat(path)
     mtime = int(st.st_mtime)
     # Rows from the web version (sync.pull) have no file_mtime: compare with the last import of the file itself.

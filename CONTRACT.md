@@ -351,6 +351,20 @@ Auctionator only gives one min price per scan + daily max quantity, so outliers 
 - API: `GET /api/item/<id>/market?qty=&days=14`, `GET /api/market/activity?days=7&limit=100`, `GET /api/market/my?days=30`; `/api/status` gains `logger`;
   `/api/shopping` reagents gain `listing` (buy_cost or null), totals gain `listing_cost`, `listing_short_items`, plus `listing_scan`, `listing_scan_fresh`.
 - Config: `logger_savedvariables` (default: next to Auctionator.lua), `logger_keep_raw_scans` 6, `logger_max_age_h` 24.
+- Prices from scans (`ahtool/scanprices.py`, run at the end of every logger import): each own (`source<>'web'`),
+  complete (`partial=0`) scan with a realm, not yet `ah_scans.priced`, becomes Auctionator-style rows from
+  `ah_scan_items` (min_unit, qty): `price_daily` merged with MERGE_DAILY, `price_current` when (day, ts) is newer
+  than the stored (last_day, updated_at) or that row is future-dated, `snapshots` on change, one `ingests` row per
+  realm key (file_mtime NULL). Key: `"<realm> <faction>"` when Auctionator keys that way (or has no data yet) or the
+  faction is Neutral, else `"<realm>"`. Config `prices_from_logger` (default true). Auctionator.lua is optional:
+  `ingest.ingest` returns `{skipped, missing}` without it.
+- Empty realm names (GetRealmName() returned "" on Forever): the logger import uses the newest realm named in the
+  file, else the newest own scan's, else Auctionator's realm without the faction suffix, and repairs stored rows.
+- Logger 1.2: scans and own auctions carry the auction house's faction (`UnitFactionGroup("npc")` when the house
+  opens; no faction = `Neutral`; fallback: the zone, then the player's faction). The realm falls back to
+  `GetNormalizedRealmName()`, then the last non-empty name seen.
+- Default realm (local): among realms with an `ingests` row with items, the one with the newest `price_current`
+  data (MAX last_day, then MAX updated_at). Web: the owner's realm moves only towards newer data.
 - UI: item page "Live market" (web/js/market.js), `#/market` Market Activity, `#/sales` My Sales, shopping "Real cost".
 
 ---

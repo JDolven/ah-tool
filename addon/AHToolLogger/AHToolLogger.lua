@@ -21,7 +21,7 @@ local MODERN = type(C_AuctionHouse) == "table" and type(C_AuctionHouse.Replicate
 local LEGACY = not MODERN and type(QueryAuctionItems) == "function"
 
 local frame = CreateFrame("Frame")
-local state = { pending = false, reading = false, ownScan = false, ahOpen = false, others = nil }
+local state = { pending = false, reading = false, ownScan = false, ahOpen = false, others = nil, houseFaction = nil }
 
 local function msg(s)
   DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99AH Tool Logger|r: " .. s)
@@ -49,8 +49,41 @@ local function suffixOf(link)
   return tonumber(s) or 0
 end
 
-local function who()
-  return GetRealmName() or "", UnitFactionGroup("player") or "", UnitName("player") or ""
+-- Neutral auction houses (goblin towns): their auctioneers have no faction. English names, used only when the
+-- auctioneer itself can't be asked.
+local NEUTRAL_TOWNS = { ["Booty Bay"] = true, ["Gadgetzan"] = true, ["Everlook"] = true }
+
+-- The auction house you are at, not your own faction: Booty Bay, Gadgetzan and Everlook share one neutral house
+-- that must not be mixed with the Alliance or Horde one (diffs and sales estimates would be wrong).
+local function houseFaction()
+  if UnitExists and UnitExists("npc") then
+    local f = UnitFactionGroup("npc")
+    if f == "Alliance" or f == "Horde" then return f end
+    return "Neutral"
+  end
+  local sub = (GetMinimapZoneText and GetMinimapZoneText()) or (GetSubZoneText and GetSubZoneText()) or ""
+  if NEUTRAL_TOWNS[sub] then return "Neutral" end
+  return UnitFactionGroup("player") or ""
+end
+
+-- GetRealmName() has returned "" on some servers: fall back to the normalized name, then to the last one seen.
+local function realmName()
+  local r = GetRealmName and GetRealmName() or ""
+  if r == "" and GetNormalizedRealmName then r = GetNormalizedRealmName() or "" end
+  local d = db()
+  if r ~= "" then
+    d.realm = r
+  else
+    r = d.realm or ""
+  end
+  return r
+end
+
+-- atHouse: data read at the Auction House (scans, own auctions) carries the house's faction
+local function who(atHouse)
+  local faction = UnitFactionGroup("player") or ""
+  if atHouse then faction = state.houseFaction or houseFaction() end
+  return realmName(), faction, UnitName("player") or ""
 end
 
 local function makeRow(itemId, link, count, minBid, buyout, bid, tl, owner)
@@ -149,7 +182,7 @@ local function readFullScan()
       n = n + r[2]
     end
     seen = nil
-    local realm, faction, char = who()
+    local realm, faction, char = who(true)
     local scans = db().scans
     scans[#scans + 1] = { t = t, realm = realm, faction = faction, char = char, src = source, api = MODERN and "modern" or "legacy",
                           total = total, n = n, d = table.concat(out, ";"), nm = table.concat(nameList, ";") }
@@ -329,7 +362,7 @@ local function readOwned()
   else
     return
   end
-  local realm, faction, char = who()
+  local realm, faction, char = who(true)
   db().owned[realm .. "-" .. char] = { t = time(), realm = realm, faction = faction, char = char, n = #rows,
                                        d = table.concat(rows, ";") }
 end
@@ -412,9 +445,11 @@ frame:SetScript("OnEvent", function(_, event)
     end
   elseif event == "AUCTION_HOUSE_SHOW" then
     state.ahOpen = true
+    state.houseFaction = houseFaction()  -- the auctioneer is the "npc" unit only while the house is open
     C_Timer.After(0, function() pcall(buildUI) end)
   elseif event == "AUCTION_HOUSE_CLOSED" then
     state.ahOpen = false
+    state.houseFaction = nil
     if state.pending then
       state.pending = false
       if api.event then frame:UnregisterEvent(api.event) end

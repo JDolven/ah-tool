@@ -53,6 +53,34 @@ _lock = threading.Lock()
 
 def ensure_schema(conn):
     conn.executescript(SCHEMA)
+    from . import scanprices
+    scanprices.ensure_schema(conn)
+
+
+def _realm_fallback(cur, data):
+    """The realm to use when the game reported none (GetRealmName() has returned "" on Forever): the newest realm
+    named in the logger file, else the newest own scan's, else Auctionator's realm without its faction suffix."""
+    best = (-1, "")
+    for group in ("scans", "owned", "mail"):
+        vals = data.get(group)
+        vals = vals.values() if isinstance(vals, dict) else _seq(vals)
+        for v in vals:
+            if isinstance(v, dict) and _s(v.get("realm")):
+                best = max(best, (_i(v.get("t")), _s(v.get("realm"))))
+    if best[1]:
+        return best[1]
+    r = cur.execute("SELECT realm FROM ah_scans WHERE realm<>'' AND COALESCE(source,'')<>'web' "
+                    "ORDER BY ts DESC LIMIT 1").fetchone()
+    if r:
+        return r[0]
+    r = cur.execute("SELECT realm FROM ingests WHERE items>0 AND file_mtime IS NOT NULL ORDER BY id DESC "
+                    "LIMIT 1").fetchone()
+    if r and r[0]:
+        for f in (" Alliance", " Horde", " Neutral"):
+            if r[0].endswith(f):
+                return r[0][:-len(f)]
+        return r[0]
+    return ""
 
 
 def logger_path(cfg):
@@ -333,7 +361,10 @@ def ingest(conn, cfg, force=False):
     with _lock:
         ensure_schema(conn)
         r = conn.execute("SELECT value FROM meta WHERE key='logger_mtime'").fetchone()
-        if not force and r and r[0] == str(mtime):
+        # an unchanged file is read again once when stored scans still need a realm or prices (after an upgrade)
+        todo = conn.execute("SELECT 1 FROM ah_scans WHERE COALESCE(source,'')<>'web' AND (realm='' OR "
+                            "(priced=0 AND partial=0)) LIMIT 1").fetchone()
+        if not force and r and r[0] == str(mtime) and not (todo and (cfg or {}).get("prices_from_logger") is not False):
             return {"skipped": True}
         data = luaparse.parse_file(path).get("AHToolLoggerDB") or {}
         if not isinstance(data, dict):
@@ -349,8 +380,15 @@ def ingest(conn, cfg, force=False):
                     for iid, v in parse_names(s.get("nm")).items():
                         names.setdefault(iid, v)
             new_names = _store_names(cur, names)
+            fallback = _realm_fallback(cur, data)
+            if fallback:
+                # scans stored with an empty realm before this fix take the realm too (never over an existing one)
+                cur.execute("UPDATE OR IGNORE ah_scans SET realm=? WHERE realm='' AND COALESCE(source,'')<>'web'",
+                            (fallback,))
+                cur.execute("UPDATE my_mail SET realm=? WHERE COALESCE(realm,'')=''", (fallback,))
+                cur.execute("UPDATE my_auctions SET realm=? WHERE COALESCE(realm,'')=''", (fallback,))
             for s in sorted((x for x in _seq(data.get("scans")) if isinstance(x, dict)), key=lambda x: _i(x.get("t"))):
-                ts, realm, faction = _i(s.get("t")), _s(s.get("realm")), _s(s.get("faction"))
+                ts, realm, faction = _i(s.get("t")), _s(s.get("realm")) or fallback, _s(s.get("faction"))
                 if not ts:
                     continue
                 have = cur.execute("SELECT id, COALESCE(source,'') FROM ah_scans WHERE realm=? AND faction=? AND ts=?",
@@ -405,7 +443,7 @@ def ingest(conn, cfg, force=False):
                 cur.execute("INSERT INTO my_mail VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (str(key), _i(m.get("t")), _s(m.get("type")), item, iid, _i(m.get("count"), 1),
                              _i(m.get("price")), _i(m.get("buyout")), _i(m.get("deposit")), _i(m.get("fee")),
-                             _s(m.get("player")), _s(m.get("char")), _s(m.get("realm"))))
+                             _s(m.get("player")), _s(m.get("char")), _s(m.get("realm")) or fallback))
                 new_mail += 1
 
             owned = data.get("owned")
@@ -420,9 +458,12 @@ def ingest(conn, cfg, force=False):
                 cur.execute("DELETE FROM my_auctions WHERE char_key=?", (str(key),))
                 rows = parse_rows(o.get("d"), with_status=True)
                 cur.executemany("INSERT INTO my_auctions VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                                [(str(key), ts, _s(o.get("char")), _s(o.get("realm")), r[0], r[1], r[2], r[3], r[4],
+                                [(str(key), ts, _s(o.get("char")), _s(o.get("realm")) or fallback, r[0], r[1], r[2],
+                                  r[3], r[4],
                                   r[5], r[6], r[8]) for r in rows])
                 n_owned += len(rows)
+            from . import scanprices
+            priced = scanprices.derive(cur, cfg)
             cur.execute("INSERT OR REPLACE INTO meta VALUES('logger_mtime', ?)", (str(mtime),))
             cur.execute("INSERT OR REPLACE INTO meta VALUES('logger_ingest_ts', ?)", (str(int(time.time())),))
             conn.commit()
@@ -430,7 +471,7 @@ def ingest(conn, cfg, force=False):
             conn.rollback()
             raise
     return {"skipped": False, "scans": new_scans, "sold": sold, "mail": new_mail, "owned": n_owned,
-            "names": new_names}
+            "names": new_names, "prices": priced}
 
 
 # ---------------------------------------------------------------- queries
