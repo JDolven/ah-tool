@@ -382,7 +382,8 @@ Auctionator only gives one min price per scan + daily max quantity, so outliers 
   `^[A-Za-z0-9_-]+$` or is stored NULL), `meta` (max of last_ingest_ts, logger_ingest_ts, clamped to now), `price_current`, `price_daily`,
   `snapshots` (insert or ignore, unique realm/item/ts), `scans:[{scan,items,auctions,sales}]` (at most
   `MAX_SCANS_PER_BATCH` = 50 new scans stored per batch, the rest counts as `applied.scans_deferred` and is resent by
-  the PC next time; scan ts at most now+60 s), `scan_updates:[{key,drop_raw?,sales?}]`. Unknown keys (top level, in a
+  the PC next time; a scan with ts over now+`SCAN_TS_SLACK` (60 s) is skipped and counted in `scans_deferred` too, the
+  client does not send such scans), `scan_updates:[{key,drop_raw?,sales?}]`. Unknown keys (top level, in a
   scan / scan update object, in meta) -> 400. **Per-key prices:** server tables `price_daily_src` /
   `price_current_src` hold each key's own rows (src_key, -1 = from before keys were tracked); `price_daily` /
   `price_current` are the merge, recomputed for every realm/item(/day) a push or purge touches: daily = min low, max
@@ -395,7 +396,17 @@ Auctionator only gives one min price per scan + daily max quantity, so outliers 
   keeps only its newest); an owner push also sets meta `sync_owner_realm` and adds its realms to meta
   `sync_owner_realms` (the web version's realm list, `analytics.list_realms`). **Schema:** `sync.ensure_schema` (at
   start in run_web.py and per sync request) migrates once to meta `sync_schema`=3 (rebuild ah_scans without the
-  global UNIQUE, fill the per-key tables, `sweep_invalid`: delete stored rows that fail SPEC).
+  global UNIQUE, fill the per-key tables with the merged rows as `LEGACY_SRC` - versions before round 3 filed them
+  under the merged row's last-writer src_key, which cannot be undone -, `sweep_invalid`: delete stored rows that fail
+  SPEC), then 4 (table `sync_scan_deletes(id, seq, origin, realm, faction, ts)`; scans sharing (realm, faction, ts)
+  get a new seq). Every scan deletion (`_drop_scans`: purge, sweep) records a row there and bumps the seq of the
+  remaining scans with that key.
+  **Push handling (server.py):** body read + gunzip outside `_PUSH_LOCK` with a read slot (`MAX_PUSH_READS`=3, plus
+  one owner-only slot), one push per key in flight (else 503), `sync.too_many_values` (contributors: commas + `[` +
+  `{` <= `SERVER_MAX_ROWS`*10+10000, else 413), then `_PUSH_LOCK` (owners waiting go first) for parse + apply.
+  Pulls: `PULL_SLOTS`=2 pages built at once (wait `PULL_WAIT` 10 s, then 503 + Retry-After), sent after the slot is
+  released. Proxy: every TCP peer at most MAX_CONN_PER_IP connections (MAX_CONN_PER_PROXY=64 with a trusted proxy);
+  `AHTOOL_TRUSTED_PROXIES` limits whose X-Forwarded-For is used.
   **Validation** (`sync.SPEC`, server `apply` and client `apply_pull`): every row column by column - ints are real ints
   (no bool/float/str/NaN) in range (ids 1..2^31-1, prices 1..2^31-1 copper in price tables / 0..2^31-1 in
   scans - the gold cap; keeps SUM(count*unit_price) far from 2^63, and aggregates use TOTAL() -, auction and sale
@@ -421,8 +432,17 @@ Auctionator only gives one min price per scan + daily max quantity, so outliers 
   = `{epoch, daily:{realm:max_day}, snap_ts}`; another epoch (reset server DB) or `--full` -> send everything.
 - **Pull:** server-only column `seq` on price_daily, price_current, ah_scans = the push (meta `sync_seq`) that last
   changed the row. `GET /api/sync/pull?cursor={pd:[seq,rowid],pc:[seq,rowid],sn:rowid,sc:[seq,id]}` -> `{protocol,
-  epoch, cursor, more, price_daily, price_current, snapshots, scans:[{scan,items,auctions|null,sales}]}`, <= PULL_LIMIT
-  rows per table. Client (`sync.pull` / `apply_pull`): same merges locally, snapshots insert-if-missing, scans
+  epoch, cursor, more, price_daily, price_current, snapshots, scans:[{origin,scan,items,auctions|null,sales}]}`, <=
+  PULL_LIMIT rows per table. Only one scan per (realm, faction, ts) is sent (`_SCAN_WINNER`: an owner's/pre-key scan
+  before a contributor's, else the lowest id). `&v=3` (`PULL_VERSION`, sent by current clients) adds
+  `pull_version: 3`, `scan_deletes:[[origin,realm,faction,ts]]` (cursor `sd`: id) and caps the scans part at
+  ~PULL_LIMIT rows: a larger scan ends with `more: true` and continues in the next page(s) as
+  `{origin, cont: true, items, auctions?, sales}` (cursor `sp:[id, seq, items_off, auctions_off, sales_off]`; if the
+  scan changed meanwhile it is sent again from the start). Without `v` the old format: whole scans. Client: local
+  nullable column `ah_scans.sync_origin` (= server scan id); a first entry replaces a pulled ('web') copy at that key
+  completely (items, auctions, sales), `cont` entries append to the copy with that origin, a delete removes the
+  pulled copy at that key whose origin matches (or is NULL); own scans are never touched. Pages without origin (older
+  servers) keep the old merge. Client (`sync.pull` / `apply_pull`): same merges locally, snapshots insert-if-missing, scans
   inserted as source='web' (char '', diffed=1; own scans coming back are skipped; your own logger scan replaces a
   pulled one with the same key); what was pulled per row is kept in local tables `sync_pulled_current|daily|snap`: a
   row still equal to it takes the server's value as is, and push leaves such values out (daily: that column NULL),

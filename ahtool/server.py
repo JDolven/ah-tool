@@ -40,6 +40,12 @@ MAX_SYNC_JSON = int(os.environ.get("AHTOOL_MAX_SYNC_MB") or 24) << 20
 MAX_SYNC_BODY = MAX_SYNC_JSON  # the gzip body can never legitimately be larger than what it unpacks to
 SYNC_CONTENT_TYPE = "application/gzip"  # what sync._request sends; plain application/json is accepted as well
 PUSH_WAIT = 15               # seconds a push waits for the one running before it is told 503 "busy, retry"
+# Sync bodies are received (and unpacked) before the push waits for _PUSH_LOCK, so a client sending slowly holds only
+# its own read slot. MAX_PUSH_READS bounds the bodies held in memory at once (each up to MAX_SYNC_BODY packed +
+# MAX_SYNC_JSON unpacked); one more slot is kept for owner keys; every key has at most one push in flight.
+MAX_PUSH_READS = 3
+PULL_SLOTS = 2               # /api/sync/pull pages built at once (each can need ~100 MB while it is serialised)
+PULL_WAIT = 10               # seconds a pull waits for a slot before it is told 503 "busy, retry" (the client retries)
 SOCKET_TIMEOUT = 30          # seconds of silence before a connection is dropped (idle keep-alive, every recv)
 HEADER_TIMEOUT = 10          # request line + headers must arrive within this many seconds of the first byte
 BODY_TIMEOUT_MIN = 10        # a body must arrive within max(MIN, size / BODY_MIN_RATE) seconds, at most MAX
@@ -51,13 +57,56 @@ DRAIN_MAX = 4 << 20          # an oversized body up to this size is read away be
 LINGER_SECONDS = 2           # larger: answer, half-close and keep reading this long before closing (no RST)
 MAX_WEB_CONNECTIONS = 128    # concurrent connections served at once in the web version
 MAX_CONN_PER_IP = int(os.environ.get("AHTOOL_MAX_PER_IP") or 16)  # web version, per client address
+# Behind a trusted reverse proxy the per-address cap applies to the X-Forwarded-For address; every TCP peer (the
+# proxy itself, or anyone reaching the backend port directly) still gets this larger cap on connections.
+MAX_CONN_PER_PROXY = int(os.environ.get("AHTOOL_MAX_PER_PROXY") or 64)
 UNSAFE_METHODS = ("POST", "PUT", "DELETE")
 DEFAULT_PORTS = {"http": 80, "https": 443}
 _CL_RE = re.compile(r"[0-9]{1,15}")
 
-# At most one sync push is read, unpacked, parsed and applied at a time (memory), and a bounded number of /api/x
-# bodies are parsed at once.
-_PUSH_LOCK = threading.Semaphore(1)
+
+
+class _PushGate:
+    """The one slot for parsing + applying a sync batch. Owners waiting for it go before contributors."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._busy = False
+        self._owners_waiting = 0
+
+    def acquire(self, owner=False, timeout=None):
+        end = None if timeout is None else time.monotonic() + timeout
+        with self._cv:
+            if owner:
+                self._owners_waiting += 1
+            try:
+                while self._busy or (not owner and self._owners_waiting):
+                    left = None if end is None else end - time.monotonic()
+                    if left is not None and left <= 0:
+                        return False
+                    self._cv.wait(left)
+                self._busy = True
+                return True
+            finally:
+                if owner:
+                    self._owners_waiting -= 1
+                    self._cv.notify_all()  # a contributor may go now if no other owner waits
+
+    def release(self):
+        with self._cv:
+            self._busy = False
+            self._cv.notify_all()
+
+
+# At most one sync push is parsed and applied at a time (memory: json.loads of a batch); a bounded number of bodies
+# is received/held at once (_PUSH_READS, one more for owners); at most one push per key is in flight; a bounded
+# number of pull pages is built at once; a bounded number of /api/x bodies is parsed at once.
+_PUSH_LOCK = _PushGate()
+_PUSH_READS = threading.BoundedSemaphore(MAX_PUSH_READS)
+_PUSH_READS_OWNER = threading.BoundedSemaphore(1)
+_PUSH_INFLIGHT = set()
+_PUSH_INFLIGHT_LOCK = threading.Lock()
+_PULL_SLOTS = threading.BoundedSemaphore(PULL_SLOTS)
 _TUNNEL_SLOTS = threading.BoundedSemaphore(MAX_TUNNEL_PARSE)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -205,6 +254,36 @@ def parse_origin(value):
     return scheme, u.hostname.lower().rstrip("."), port or DEFAULT_PORTS[scheme]
 
 
+def _trusted_proxies(v):
+    """AHTOOL_TRUSTED_PROXIES: comma-separated addresses or networks (10.0.0.5, 172.16.0.0/12) of the reverse proxies
+    whose X-Forwarded-For is believed. -> list of ip_network, or None (not set: every peer is believed)."""
+    import ipaddress
+    v = str(v if v is not None else "").strip()
+    if not v:
+        return None
+    out = []
+    for part in v.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            raise ValueError("AHTOOL_TRUSTED_PROXIES: not an IP address or network: %r" % part[:60])
+    return out
+
+
+def _peer_in(peer, nets):
+    import ipaddress
+    try:
+        a = ipaddress.ip_address(peer.split("%")[0])
+    except ValueError:
+        return False
+    if getattr(a, "ipv4_mapped", None):
+        a = a.ipv4_mapped
+    return any(a.version == n.version and a in n for n in nets)
+
+
 def _trusted_hops(v):
     """AHTOOL_TRUST_PROXY: 1/true/yes = one reverse proxy in front, a number = that many; else 0 (XFF ignored)."""
     v = str(v if v is not None else "").strip().lower()
@@ -269,7 +348,14 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
     # in Host/X-Forwarded-Host. AHTOOL_PUBLIC_URL (run_web.py puts it in cfg) names it.
     public_origin = parse_origin(cfg.get("public_url")) if web and cfg.get("public_url") else None
     trust_hops = _trusted_hops(cfg.get("trust_proxy")) if web else 0
+    # only these TCP peers' X-Forwarded-For is believed (AHTOOL_TRUSTED_PROXIES; unset: any peer's)
+    trusted_nets = _trusted_proxies(cfg.get("trusted_proxies", os.environ.get("AHTOOL_TRUSTED_PROXIES"))) \
+        if web else None
+    if trusted_nets and not trust_hops:
+        trust_hops = 1  # naming the proxies means there is one in front
     per_ip_cap = MAX_CONN_PER_IP
+    # every TCP peer: the normal cap, or behind a proxy (all visitors share its address) the larger proxy cap
+    per_peer_cap = MAX_CONN_PER_PROXY if trust_hops else MAX_CONN_PER_IP
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -504,8 +590,8 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
             """The visitor's address: the TCP peer, or behind trust_hops reverse proxies the address the outermost
             trusted proxy saw (the entry it appended to X-Forwarded-For; earlier entries are client-supplied)."""
             peer = self.client_address[0]
-            if not trust_hops:
-                return peer
+            if not trust_hops or (trusted_nets is not None and not _peer_in(peer, trusted_nets)):
+                return peer  # no proxy configured, or this peer is not one of them: its X-Forwarded-For is a claim
             xff = [e.strip() for e in ",".join(self.headers.get_all("X-Forwarded-For") or []).split(",") if e.strip()]
             if not xff:
                 return peer
@@ -693,35 +779,24 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                         cursor = json.loads(qs.get("cursor") or "{}")
                     except ValueError:
                         raise BadRequest("cursor must be JSON")
-                    return self._json(sync.pull_page(conn, cursor, qs.get("limit") or sync.PULL_LIMIT))
+                    # A page is built and serialised by a bounded number of requests at once (memory, CPU); it is
+                    # sent after the slot is given back, so a slow reader never holds one.
+                    if not _PULL_SLOTS.acquire(timeout=PULL_WAIT):
+                        return self._busy("busy with other pulls, retry")
+                    try:
+                        page = sync.pull_page(conn, cursor, qs.get("limit") or sync.PULL_LIMIT, version=qs.get("v"))
+                        body = json.dumps(page, ensure_ascii=False).encode("utf-8")
+                        del page
+                    finally:
+                        _PULL_SLOTS.release()
+                    return self._send(200, body, "application/json; charset=utf-8", {"Cache-Control": "no-store"})
                 if method == "POST" and path == "/api/sync/push":
                     gz = self._ctype_ok((SYNC_CONTENT_TYPE,), -1)
                     if not gz and not self._ctype_ok(("application/json",), -1):
                         return self._fail(415, "Content-Type must be " + SYNC_CONTENT_TYPE)
                     if self._body_pending > MAX_SYNC_BODY:
                         return self._fail(413, "request body too large")
-                    # One push at a time: reading, unpacking, parsing and applying a batch needs up to several
-                    # hundred MB; parallel pushes could exhaust the container's memory.
-                    if not _PUSH_LOCK.acquire(timeout=PUSH_WAIT):
-                        return self._busy("busy with another push, retry")
-                    try:
-                        try:
-                            raw = self._read_body(MAX_SYNC_BODY)
-                            if gz:
-                                raw = gunzip_capped(raw, MAX_SYNC_JSON)
-                        except TooLarge as e:
-                            return self._fail(413, str(e))
-                        try:
-                            payload = sync.loads_strict(raw.decode("utf-8"))
-                        except (ValueError, UnicodeDecodeError, RecursionError):
-                            raise BadRequest("sync batch is not valid JSON")
-                        del raw
-                        res = sync.apply(conn, cfg, payload, source)
-                        del payload
-                    finally:
-                        _PUSH_LOCK.release()
-                    analytics.invalidate()
-                    return self._json(res)
+                    return self._push(conn, source, gz)
                 return self._json({"error": "unknown endpoint"}, 404)
             except TimeoutError:
                 raise  # body not received in time: handle_one_request drops the connection
@@ -738,6 +813,54 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
             finally:
                 if conn is not None:
                     conn.close()
+
+        def _push(self, conn, source, gz):
+            """POST /api/sync/push. The body is received and unpacked first, holding only a read slot (a client that
+            sends slowly blocks nobody else's push); only parsing and applying take the one _PUSH_LOCK."""
+            from . import sync
+            owner = bool(source.get("owner"))
+            kid = int(source.get("key_id") or 0)
+            with _PUSH_INFLIGHT_LOCK:
+                if kid in _PUSH_INFLIGHT:
+                    return self._busy("another push with this key is still running, retry")
+                _PUSH_INFLIGHT.add(kid)
+            try:
+                slot = _PUSH_READS_OWNER if owner and _PUSH_READS_OWNER.acquire(blocking=False) else None
+                if slot is None:
+                    if not _PUSH_READS.acquire(timeout=PUSH_WAIT):
+                        return self._busy("busy with other pushes, retry")
+                    slot = _PUSH_READS
+                try:
+                    try:
+                        raw = self._read_body(MAX_SYNC_BODY)
+                        if gz:
+                            raw = gunzip_capped(raw, MAX_SYNC_JSON)
+                    except TooLarge as e:
+                        return self._fail(413, str(e))
+                    # cheap upper bound on what json.loads would build, before it runs (a few kB of gzip can
+                    # unpack to millions of empty lists)
+                    why = sync.too_many_values(raw, owner)
+                    if why:
+                        return self._fail(413, why)
+                    if not _PUSH_LOCK.acquire(owner=owner, timeout=PUSH_WAIT):
+                        return self._busy("busy with another push, retry")
+                    try:
+                        try:
+                            payload = sync.loads_strict(raw.decode("utf-8"))
+                        except (ValueError, UnicodeDecodeError, RecursionError):
+                            raise BadRequest("sync batch is not valid JSON")
+                        del raw
+                        res = sync.apply(conn, cfg, payload, source)
+                        del payload
+                    finally:
+                        _PUSH_LOCK.release()
+                finally:
+                    slot.release()
+            finally:
+                with _PUSH_INFLIGHT_LOCK:
+                    _PUSH_INFLIGHT.discard(kid)
+            analytics.invalidate()
+            return self._json(res)
 
         # ------------------------------------------------------------ routes
 
@@ -955,27 +1078,41 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
         # The web version is public: bound the number of connection threads, in total and per client address.
         # Over a limit a connection gets a plain 503 and is closed instead of starting yet another thread. Behind a
         # trusted reverse proxy every connection comes from the proxy, so the per-address cap is applied per request
-        # instead, to the X-Forwarded-For address (Handler._handle).
+        # instead, to the X-Forwarded-For address (Handler._handle); every TCP peer still has MAX_CONN_PER_PROXY
+        # connections at most, so reaching the backend port directly with forged X-Forwarded-For gains little.
         slots = threading.BoundedSemaphore(MAX_WEB_CONNECTIONS) if web else None
-        per_ip = {}
+        per_ip = {}      # per visitor address, per request (behind a proxy)
+        per_peer = {}    # per TCP peer, per connection
         per_ip_lock = threading.Lock()
-        cap_peer = web and not trust_hops
+        cap_peer = web
 
-        def ip_enter(self, ip):
+        def _enter(self, table, key, cap):
             with self.per_ip_lock:
-                n = self.per_ip.get(ip, 0)
-                if n >= per_ip_cap:
+                n = table.get(key, 0)
+                if n >= cap:
                     return False
-                self.per_ip[ip] = n + 1
+                table[key] = n + 1
                 return True
 
-        def ip_leave(self, ip):
+        def _leave(self, table, key):
             with self.per_ip_lock:
-                n = self.per_ip.get(ip, 0) - 1
+                n = table.get(key, 0) - 1
                 if n > 0:
-                    self.per_ip[ip] = n
+                    table[key] = n
                 else:
-                    self.per_ip.pop(ip, None)
+                    table.pop(key, None)
+
+        def ip_enter(self, ip):
+            return self._enter(self.per_ip, ip, per_ip_cap)
+
+        def ip_leave(self, ip):
+            self._leave(self.per_ip, ip)
+
+        def peer_enter(self, ip):
+            return self._enter(self.per_peer, ip, per_peer_cap)
+
+        def peer_leave(self, ip):
+            self._leave(self.per_peer, ip)
 
         def _refuse(self, request):
             try:
@@ -991,7 +1128,7 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
         def process_request(self, request, client_address):
             if self.slots is not None and not self.slots.acquire(blocking=False):
                 return self._refuse(request)
-            if self.cap_peer and not self.ip_enter(client_address[0]):
+            if self.cap_peer and not self.peer_enter(client_address[0]):
                 self.slots.release()
                 return self._refuse(request)
             try:
@@ -1002,7 +1139,7 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
 
         def _release(self, client_address):
             if self.cap_peer:
-                self.ip_leave(client_address[0])
+                self.peer_leave(client_address[0])
             if self.slots is not None:
                 self.slots.release()
 

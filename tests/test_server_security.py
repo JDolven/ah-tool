@@ -338,7 +338,8 @@ def bomb_push():
 ts = [threading.Thread(target=bomb_push) for _ in range(3)]
 [t.start() for t in ts]
 [t.join() for t in ts]
-check(results == [413] * 3, "parallel gzip bombs all refused (%s)" % results)
+check(results.count(413) >= 1 and all(r in (413, 503) for r in results),
+      "parallel gzip bombs with one key: refused (413) or told to wait (503, one push per key) (%s)" % results)
 check(server.MAX_BODY <= 64 << 10 and server.MAX_TUNNEL_BODY >= 1 << 20, "body caps: API %d kB, /api/x %d kB"
       % (server.MAX_BODY >> 10, server.MAX_TUNNEL_BODY >> 10))
 XH = dict(J, Origin="https://ah.example.org", **{"Sec-Fetch-Site": "same-origin"})
@@ -542,6 +543,157 @@ for name, raw, want in (("bad request line", b"GARBAGE\r\n\r\n", b"400"),
               and b"application/json" in head and b"<html" not in out.lower() and b"Python" not in head and closed,
               "%s (%s): %s with security headers, JSON, closed (%r)"
               % (name, "web" if port == WPORT else "local", want.decode(), out[:60]))
+
+# ================================================================ round 3
+from ahtool import keys, sync  # noqa: E402
+
+_kc = db.connect(os.path.join(tmp, "w.db"))
+sync.ensure_schema(_kc)
+K_MAL = keys.create(_kc, "R3Mal")
+K_CAT = keys.create(_kc, "R3Cat")
+_kc.close()
+MAL = {"Authorization": "Bearer " + K_MAL, "Content-Type": "application/gzip"}
+CAT = {"Authorization": "Bearer " + K_CAT, "Content-Type": "application/gzip"}
+OK_BATCH = gzip.compress(b'{"protocol": 2}')
+
+
+def trickle_push(headers, length=1 << 20):
+    """A push whose body arrives slowly: headers and a few bytes, the socket left open."""
+    s = socket.create_connection(("127.0.0.1", WPORT))
+    s.sendall(b"POST /api/sync/push HTTP/1.1\r\nHost: x\r\n" + b"".join(
+        b"%s: %s\r\n" % (k.encode(), v.encode()) for k, v in headers.items())
+        + b"Content-Length: %d\r\n\r\n\x1f\x8b" % length)
+    return s
+
+
+# ---------------------------------------------------------------- R3.1 a slow body holds no one else's push
+slow = trickle_push(MAL)
+time.sleep(0.3)
+check(not server._PUSH_LOCK._busy, "a push still receiving its body does not hold the parse/apply lock")
+t0 = time.time()
+code, _, d = req(WPORT, "POST", "/api/sync/push", OK_BATCH, GZ)
+check(code == 200 and time.time() - t0 < 3, "owner push while a contributor trickles a body: served (%s %.1fs)"
+      % (code, time.time() - t0))
+code, _, d = req(WPORT, "POST", "/api/sync/push", OK_BATCH, CAT)
+check(code == 200, "another contributor's push is served too (%s %s)" % (code, d))
+code, r, d = req(WPORT, "POST", "/api/sync/push", OK_BATCH, MAL)
+check(code == 503 and r.getheader("Retry-After") and "this key" in d.get("error", ""),
+      "a second push with the same key while one is in flight: 503 retry (%s %s)" % (code, d))
+slow.close()
+for _ in range(30):
+    code, _, d = req(WPORT, "POST", "/api/sync/push", OK_BATCH, MAL)
+    if code == 200:
+        break
+    time.sleep(0.1)
+check(code == 200, "the key's push slot is freed when the slow push ends (%s)" % code)
+
+# all contributor read slots taken: contributors wait/503, an owner still has its own slot
+old_wait = server.PUSH_WAIT
+server.PUSH_WAIT = 0.3
+held = sum(server._PUSH_READS.acquire(timeout=5) for _ in range(server.MAX_PUSH_READS))
+try:
+    code, r, _ = req(WPORT, "POST", "/api/sync/push", OK_BATCH, CAT)
+    check(code == 503 and r.getheader("Retry-After"), "read slots all busy: contributor push 503 (%s)" % code)
+    code, _, _ = req(WPORT, "POST", "/api/sync/push", OK_BATCH, GZ)
+    check(code == 200, "read slots all busy: owner push uses the slot kept for owners (%s)" % code)
+finally:
+    for _ in range(held):
+        server._PUSH_READS.release()
+    server.PUSH_WAIT = old_wait
+
+# the parse/apply lock: a waiting owner goes before a waiting contributor
+gate = server._PushGate()
+gate.acquire()
+order = []
+
+
+def waiter(owner, delay):
+    time.sleep(delay)
+    if gate.acquire(owner=owner, timeout=5):
+        order.append("owner" if owner else "contributor")
+        time.sleep(0.05)
+        gate.release()
+
+
+ws = [threading.Thread(target=waiter, args=(False, 0)), threading.Thread(target=waiter, args=(True, 0.2))]
+[t.start() for t in ws]
+time.sleep(0.4)
+gate.release()
+[t.join() for t in ws]
+check(order == ["owner", "contributor"], "push lock: owner first (%s)" % order)
+free = gate.acquire(timeout=0)
+if free:
+    gate.release()
+check(free, "push lock is free afterwards")
+
+# ---------------------------------------------------------------- R3.2 pulls: bounded number at once
+old_pw = server.PULL_WAIT
+server.PULL_WAIT = 0.3
+held = sum(server._PULL_SLOTS.acquire(timeout=5) for _ in range(server.PULL_SLOTS))
+try:
+    code, r, d = req(WPORT, "GET", "/api/sync/pull?cursor=%7B%7D&v=3", None, AUTH)
+    check(code == 503 and r.getheader("Retry-After"), "all pull slots busy: 503 with Retry-After (%s %s)" % (code, d))
+finally:
+    for _ in range(held):
+        server._PULL_SLOTS.release()
+    server.PULL_WAIT = old_pw
+code, _, d = req(WPORT, "GET", "/api/sync/pull?cursor=%7B%7D&v=3", None, AUTH)
+check(code == 200 and d.get("pull_version") == 3 and "scan_deletes" in d, "pull slot freed, v=3 page (%s)" % code)
+
+# ---------------------------------------------------------------- R3.7 value bomb from a contributor
+vbomb = gzip.compress(b"[" + b"[]," * 4_000_000 + b"[]]", 9)
+code, _, d = req(WPORT, "POST", "/api/sync/push", vbomb, CAT)
+check(code == 413 and "too many values" in d.get("error", ""),
+      "contributor: %d kB gzip of '[],' refused before json.loads (%s %s)" % (len(vbomb) >> 10, code, d))
+
+# ---------------------------------------------------------------- R3.6 proxy mode: per-peer cap, trusted proxies
+old_px = server.MAX_CONN_PER_PROXY
+server.MAX_CONN_PER_PROXY = 2
+xsrv, XPORT = start({"web": True, "trust_proxy": "1"}, web=True, connect=lambda: db.connect(os.path.join(tmp, "w.db")))
+server.MAX_CONN_PER_PROXY = old_px
+holds = [socket.create_connection(("127.0.0.1", XPORT)) for _ in range(2)]
+time.sleep(0.3)
+out, closed = raw_exchange(XPORT, b"GET /healthz HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 10.9.9.9\r\n\r\n")
+check(out.startswith(b"HTTP/1.1 503"), "proxy mode: a TCP peer still has a connection cap (%r)" % out[:30])
+for h in holds:
+    h.close()
+
+gate2 = threading.Event()
+
+
+def gated2():
+    gate2.wait(10)
+    return db.connect(os.path.join(tmp, "w.db"))
+
+
+old_cap = server.MAX_CONN_PER_IP
+server.MAX_CONN_PER_IP = 1
+ysrv, YPORT = start({"web": True, "trust_proxy": "1", "trusted_proxies": "10.0.0.1, 192.168.0.0/16"}, web=True,
+                    connect=gated2)
+zsrv, ZPORT = start({"web": True, "trusted_proxies": "127.0.0.1"}, web=True, connect=gated2)
+server.MAX_CONN_PER_IP = old_cap
+for port, want, label in ((YPORT, 503, "peer not in AHTOOL_TRUSTED_PROXIES: its X-Forwarded-For is ignored"),
+                          (ZPORT, 200, "peer in AHTOOL_TRUSTED_PROXIES (implies one proxy): X-Forwarded-For used")):
+    gate2.clear()
+    t = threading.Thread(target=req, args=(port, "GET", "/api/settings", None, {"X-Forwarded-For": "1.2.3.4"}),
+                         daemon=True)
+    t.start()
+    time.sleep(0.3)
+    code, _, _ = req(port, "GET", "/healthz", None, {"X-Forwarded-For": "5.6.7.8"})
+    check(code == want, "%s (%s)" % (label, code))
+    gate2.set()
+    t.join(5)
+check(server._peer_in("::ffff:10.0.0.1", server._trusted_proxies("10.0.0.1"))
+      and server._peer_in("192.168.3.4", server._trusted_proxies("10.0.0.1, 192.168.0.0/16"))
+      and not server._peer_in("10.0.0.2", server._trusted_proxies("10.0.0.1"))
+      and server._trusted_proxies("") is None, "AHTOOL_TRUSTED_PROXIES parsing and matching")
+try:
+    server._trusted_proxies("10.0.0.1, proxy.local")
+    check(False, "AHTOOL_TRUSTED_PROXIES with a host name refused")
+except ValueError:
+    check(True, "AHTOOL_TRUSTED_PROXIES with a host name refused")
+for s_ in (xsrv, ysrv, zsrv):
+    s_.shutdown()
 
 for s in (lsrv, wsrv, bsrv, csrv, psrv, tsrv, usrv):
     s.shutdown()
