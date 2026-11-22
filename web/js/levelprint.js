@@ -148,7 +148,6 @@ export function guideHtml(plan, meta) {
   const subs = plan.subcrafts || [];
   const tools = plan.tools || [];
   const warnings = plan.warnings || [];
-  const text = guideText(plan, meta);
 
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -188,10 +187,21 @@ export function guideHtml(plan, meta) {
 
   <p class="note">Crafts are rounded up from the expected number – you may need a few more or fewer. After yellow, the skill-up chance drops until the recipe turns grey. Prices are a snapshot and change with the market.</p>
 </div>
-<script>
+</body></html>`;
+}
+
+/** JSON for a value inside an inline <script>: `<` escaped so no `</script>` or `<!--` can end or alter it. */
+function jsonScript(v) {
+  return JSON.stringify(v).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+}
+
+/** Inline script for the downloaded copy only (opened from file:// it has no opener to wire its buttons).
+ * The blob page shown from the app inherits the app's CSP, which blocks inline scripts, so it never gets one. */
+function guideScript(text, file) {
+  return `<script>
 (function(){
-  var TEXT = ${JSON.stringify(text).replace(/</g, '\\u003c')};
-  var FILE = ${JSON.stringify(meta.fileName)};
+  var TEXT = ${jsonScript(text)};
+  var FILE = ${jsonScript(file)};
   var msg = document.getElementById('msg');
   function say(t){ msg.textContent = t; setTimeout(function(){ if (msg.textContent === t) msg.textContent = ''; }, 2500); }
   document.getElementById('b-print').onclick = function(){ window.print(); };
@@ -208,7 +218,7 @@ export function guideHtml(plan, meta) {
   };
 })();
 </script>
-</body></html>`;
+`;
 }
 
 /** Open the guide in a new tab. Call synchronously from a click handler (pop-up blockers). */
@@ -217,8 +227,7 @@ export function openGuide(plan, meta) {
   const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
   const w = window.open(url, '_blank');
   setTimeout(() => URL.revokeObjectURL(url), 60000);
-  // The blob page inherits the app's CSP, so its inline script (kept for the downloaded copy) is blocked there.
-  // The page is same-origin: wire its buttons from here instead.
+  // The blob page inherits the app's CSP (no inline script): it is same-origin, so wire its buttons from here.
   if (w) w.addEventListener('load', () => wireGuide(w, guideText(plan, meta), meta.fileName));
   return !!w;
 }
@@ -231,7 +240,10 @@ function wireGuide(w, text, file) {
   const say = (t) => { msg.textContent = t; w.setTimeout(() => { if (msg.textContent === t) msg.textContent = ''; }, 2500); };
   btn('b-print').onclick = () => w.print();
   btn('b-dl').onclick = () => {
-    const html = '<!doctype html>\n' + doc.documentElement.outerHTML;
+    let html = '<!doctype html>\n' + doc.documentElement.outerHTML;
+    const end = html.lastIndexOf('</body>');
+    const js = guideScript(text, file);
+    html = end < 0 ? html + js : html.slice(0, end) + js + html.slice(end);
     const a = doc.createElement('a');
     a.href = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
     a.download = file; doc.body.appendChild(a); a.click(); a.remove();

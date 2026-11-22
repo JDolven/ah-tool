@@ -8,7 +8,8 @@ Table string keys are returned as str (utf-8, errors='replace'); numeric keys as
 import math
 import re
 
-_WS = re.compile(rb"(?:[ \t\r\n]+|--\[(=*)\[.*?\]\1\]|--[^\n]*)*", re.S)
+_SPACE = re.compile(rb"[ \t\r\n]*")
+_LONG_OPEN = re.compile(rb"\[(=*)\[")
 _NAME = re.compile(rb"[A-Za-z_][A-Za-z0-9_]*")
 _NUM = re.compile(rb"-?(?:0[xX][0-9a-fA-F]+|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)")
 _INT = re.compile(rb"-?\d+")
@@ -46,7 +47,23 @@ class _P:
         self.n = len(data)
 
     def ws(self, p):
-        return _WS.match(self.d, p).end()
+        """Skip whitespace and comments in linear time (the old regex rescanned to EOF for every unterminated
+        `--[[`, which is quadratic). An unterminated long comment is an error, as in Lua."""
+        d, n = self.d, self.n
+        while True:
+            p = _SPACE.match(d, p).end()
+            if d[p:p + 2] != b"--":
+                return p
+            m = _LONG_OPEN.match(d, p + 2)
+            if m:
+                close = b"]" + m.group(1) + b"]"
+                e = d.find(close, m.end())
+                if e < 0:  # Lua rejects this too; treating it as a line comment would rescan to EOF each time
+                    raise LuaParseError("unterminated long comment at %d" % p)
+                p = e + len(close)
+            else:
+                e = d.find(b"\n", p + 2)
+                p = n if e < 0 else e + 1
 
     def value(self, p, depth=0):
         d = self.d
@@ -95,7 +112,7 @@ class _P:
                 return False, m.end()
             if t == b"nil":
                 return None, m.end()
-        if d[p:p + 4] == b"-inf":
+        if d[p:p + 4] == b"-inf":  # kept for compatibility (WoW serializes -math.huge so); ingest range-checks
             return float("-inf"), p + 4
         raise LuaParseError("unexpected %r at %d" % (d[p:p + 20], p))
 
