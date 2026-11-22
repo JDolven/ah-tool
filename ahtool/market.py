@@ -104,7 +104,8 @@ def _seq(v):
 
 
 MAX_ROW_MULT = 1000  # "N*row" repeats a row N times; larger groups are capped (identical commodity stacks)
-MAX_SCAN_ROWS = 500000  # rows per scan after expansion (memory bound)
+MAX_SCAN_ROWS = 500000  # rows per scan after expansion (memory bound); a scan cut here is stored as partial
+MAX_ROW_COUNT = 10000  # units in one auction (same cap as the sync SPEC); keeps per-item sums far from 2^63
 
 
 def parse_rows(d, with_status=False):
@@ -131,7 +132,7 @@ def parse_rows(d, with_status=False):
             r = (int(f[0]), int(f[1]), int(f[2]), int(f[3]), int(f[4]), int(f[5]), int(f[6]), f[7])
         except ValueError:
             continue
-        if r[0] <= 0 or r[2] <= 0 or any(abs(x) >= _INT_LIMIT for x in r[:7]):
+        if r[0] <= 0 or not 0 < r[2] <= MAX_ROW_COUNT or any(abs(x) >= _INT_LIMIT for x in r[:7]):
             continue
         if with_status:
             r = r + (_i(f[8]) if len(f) > 8 else 0,)
@@ -317,9 +318,12 @@ def ingest(conn, cfg, force=False):
                 # GetReplicateItemTimeLeft may return 0-based bands; normalise to 1..4
                 if rows and min(r[6] for r in rows) == 0 and max(r[6] for r in rows) <= 3:
                     rows = [r[:6] + (r[6] + 1,) + r[7:] for r in rows]
+                # Compare with the previous own scan only: a pulled web scan's n is another player's claim.
                 prev = cur.execute("SELECT n FROM ah_scans WHERE realm=? AND faction=? AND partial=0 AND ts<? "
-                                   "ORDER BY ts DESC LIMIT 1", (realm, faction, ts)).fetchone()
-                partial = 1 if (prev and prev[0] and len(rows) < 0.6 * prev[0]) or not rows else 0
+                                   "AND COALESCE(source,'')<>'web' ORDER BY ts DESC LIMIT 1",
+                                   (realm, faction, ts)).fetchone()
+                partial = 1 if ((prev and prev[0] and len(rows) < 0.6 * prev[0]) or not rows
+                                or len(rows) >= MAX_SCAN_ROWS) else 0  # a truncated scan must not be diffed
                 cur.execute("INSERT INTO ah_scans(ts,realm,faction,char,source,total,n,partial) VALUES(?,?,?,?,?,?,?,?)",
                             (ts, realm, faction, _s(s.get("char")), _s(s.get("src")), _i(s.get("total")),
                              len(rows), partial))
