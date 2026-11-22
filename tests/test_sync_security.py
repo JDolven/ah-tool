@@ -290,13 +290,14 @@ check(analytics.get_realm(w) == "Evil", "without an owner push: the realm with m
 push({"price_current": [pc(price=101)]})
 check(analytics.get_realm(w) == "Home", "owner push sets the default realm again")
 
-# local behaviour unchanged: newest ingest row
+# local: the realm with the newest data among the realms your imports carried prices for
 local_path = os.path.join(tmp, "local.db")
 make_fixture_db.build(local_path)
 lconn = db.connect(local_path)
 lconn.execute("INSERT INTO ingests(ts,file_mtime,realm,items,changed) VALUES(?,1,'Mine',1,1)", (NOW,))
+lconn.execute("INSERT INTO price_current VALUES('Mine', 2589, 100, 5, ?, ?)", (TODAY, NOW - 60))
 lconn.commit()
-check(analytics.get_realm(lconn) == "Mine", "local default realm = newest ingest row, as before")
+check(analytics.get_realm(lconn) == "Mine", "local default realm = the imported realm with the newest data")
 
 # ---------------------------------------------------------------- client: apply_pull validates, keeps the realm
 def page(**kw):

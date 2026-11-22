@@ -10,9 +10,9 @@ general.
 | What | Needed? | Used for |
 |---|---|---|
 | Python 3.12+ (Windows) | **Required** | Runs the app – standard library only, no `pip install` |
-| [Auctionator](https://www.curseforge.com/wow/addons/auctionator) addon | **Required** | All prices and price history come from Auctionator's scans (`SavedVariables/Auctionator.lua`) |
+| [Auctionator](https://www.curseforge.com/wow/addons/auctionator) addon | **One of the two** | Prices and price history from Auctionator's scans (`SavedVariables/Auctionator.lua`) |
 | [AtlasLootClassic](https://www.curseforge.com/wow/addons/atlaslootclassic) addon | **Required for Professions, Leveling Guide and Shopping List** | Recipe data (`AtlasLootClassic/Data/Profession.lua`). Without it the price pages still work |
-| AH Tool Logger addon (in this repo, `addon/AHToolLogger`) | Optional | Full scans of every auction: Market Activity, My Sales, listings, real cost, sales estimates |
+| AH Tool Logger addon (in this repo, `addon/AHToolLogger`) | **One of the two** | Full scans of every auction: current and daily prices too (see below), Market Activity, My Sales, listings, real cost, sales estimates |
 | Polestar_ItemDB addon | Optional | Better item tooltips for custom Forever items |
 | Internet on first start | Required once | Downloads item and spell names from wago.tools; tooltips load icons from wow.zamimg.com |
 
@@ -35,6 +35,11 @@ The first start downloads item and recipe data and may take a few minutes.
    - **AH Tool Logger** – click *Full Scan* on the strip under the AH window, or type `/ahtl scan`. Stores every
      auction for Market Activity, listings, real cost and sales estimates. The server allows one full scan every
      15 minutes; the button counts down. An Auctionator *Full Scan* is also picked up by the logger.
+   A logger full scan is enough on its own: the app turns each one into current and daily prices (lowest unit
+   buyout and quantity per item), so prices stay up to date without Auctionator. Where Auctionator has a newer price
+   for an item (you looked at it after the scan), that one is kept. Prices go under Auctionator's realm key
+   (e.g. `PvP Alliance`); the neutral houses (Booty Bay, Gadgetzan, Everlook) get their own (`PvP Neutral`).
+   Set `"prices_from_logger": false` in config.json to keep prices Auctionator-only.
 2. Type `/reload` (or log out). WoW only writes the files to disk then. The logger keeps the last 3 scans, so
    `/reload` at least every third scan.
 3. The tool detects the change within ~5 seconds and the page refreshes itself.

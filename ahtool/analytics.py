@@ -95,17 +95,42 @@ def _is_web_db(conn):
         return False
 
 
+_newest_cache = {}
+
+
+def _newest_realm(conn):
+    """Among the realms your imports carried prices for, the one with the newest data (latest day, then latest
+    update). Auctionator can keep an old key next to a new one (e.g. "PvP" next to "PvP Alliance" after it began to
+    key by faction, with the same history up to the switch) or save an empty one; the newest import row would pick
+    either by chance. Pulled web data never adds a realm here: apply_pull writes the PC's current realm."""
+    mx = conn.execute("SELECT MAX(id) FROM ingests").fetchone()[0]
+    if mx is None:
+        return None
+    db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+    hit = _newest_cache.get(db_file)
+    if hit and hit[0] == mx:
+        return hit[1]
+    cands = [r[0] for r in conn.execute("SELECT DISTINCT realm FROM ingests WHERE items > 0") if r[0]]
+    best = None
+    if cands:
+        best = conn.execute(
+            "SELECT realm FROM price_current WHERE realm IN (%s) GROUP BY realm "
+            "ORDER BY MAX(last_day) DESC, MAX(updated_at) DESC, COUNT(*) DESC, realm LIMIT 1"
+            % ",".join("?" * len(cands)), cands).fetchone()
+        best = best[0] if best else None
+    _newest_cache[db_file] = (mx, best)
+    return best
+
+
 def get_realm(conn, realm=None):
     if realm:
         return realm
     r = _web_default_realm(conn)
     if r:
         return r
-    # Latest ingest that actually carried prices: Auctionator can also save empty realm keys (e.g. "PvP Alliance"
-    # next to "PvP"), which would otherwise become the active realm and hide every price.
-    r = conn.execute("SELECT realm FROM ingests WHERE items > 0 ORDER BY id DESC LIMIT 1").fetchone()
-    if r and r[0]:
-        return r[0]
+    r = _newest_realm(conn)
+    if r:
+        return r
     r = conn.execute("SELECT realm FROM price_current GROUP BY realm ORDER BY COUNT(*) DESC, realm LIMIT 1").fetchone()
     if r:
         return r[0]

@@ -1162,6 +1162,7 @@ def apply(conn, cfg, payload, source):
 
         changed = 0
         realms = {}
+        newest = {}  # realm -> newest day in this push (price_current last_day, price_daily day)
         _touch_reset(cur)
         if "price_current" in payload:
             rows = _checked(payload["price_current"], "price_current", lim)
@@ -1178,6 +1179,7 @@ def apply(conn, cfg, payload, source):
             changed += _recompute_current(cur, seq, lim)
             for r in rows:
                 realms[r[0]] = realms.get(r[0], 0) + 1
+                newest[r[0]] = max(newest.get(r[0], 0), r[4] or 0)
         if "price_daily" in payload:
             rows = _checked(payload["price_daily"], "price_daily", lim)
             cur.executemany(
@@ -1189,6 +1191,7 @@ def apply(conn, cfg, payload, source):
             applied["price_daily"] = len(rows)
             for r in rows:
                 realms.setdefault(r[0], 0)
+                newest[r[0]] = max(newest.get(r[0], 0), r[2] or 0)
         if "snapshots" in payload:
             rows = _checked(payload["snapshots"], "snapshots", lim)
             n0 = _changes(cur)
@@ -1303,15 +1306,22 @@ def apply(conn, cfg, payload, source):
             # One ingest row per push that changed prices: the analytics cache and the per-browser alert check
             # key on MAX(ingests.id). A contributor keeps only its newest one, so pushes do not pile up rows.
             price_realms = {k: v for k, v in realms.items() if v}
-            realm = max(price_realms, key=lambda k: price_realms[k]) if price_realms else (
+            # the realm with the newest data in this push, then the most rows: an old Auctionator key with the same
+            # number of items (e.g. "PvP" next to "PvP Alliance") must not win a tie
+            realm = max(price_realms, key=lambda k: (newest.get(k, 0), price_realms[k], k)) if price_realms else (
                 min(realms) if realms else None)
             cur.execute("INSERT INTO main.ingests(ts,file_mtime,realm,items,changed,src_key) VALUES(?,NULL,?,?,?,?)",
                         (int(time.time()), realm, realms.get(realm, 0), changed, src))
             if not owner:
                 cur.execute("DELETE FROM main.ingests WHERE src_key=? AND id<?", (src, cur.lastrowid))
             if owner and realm:
-                # the web version's default realm follows the owner, never a contributor (analytics.get_realm)
-                cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_owner_realm',?)", (realm,))
+                # The web version's default realm follows the owner, never a contributor (analytics.get_realm), and
+                # only towards newer data: a batch that carries just an old key's history keeps the current realm.
+                was = cur.execute("SELECT value FROM main.meta WHERE key='sync_owner_realm'").fetchone()
+                was_day = cur.execute("SELECT MAX(last_day) FROM main.price_current WHERE realm=?",
+                                      (was[0],)).fetchone()[0] if was and was[0] != realm else None
+                if was_day is None or newest.get(realm, 0) >= was_day:
+                    cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_owner_realm',?)", (realm,))
         if owner and realms:
             # the realm list of the web version: realms the owner has data for (analytics.list_realms)
             have = _owner_realms(cur)
