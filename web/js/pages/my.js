@@ -84,16 +84,16 @@ export async function render(ctx) {
       .map((p) => {
         const on = mine.has(p.id);
         const sk = on ? mine.get(p.id) : SKILL_MAX;
-        return `<div class="myprof ${on ? 'on' : ''} ${p.recipe_count ? '' : 'gather'}" data-prof="${p.id}">
+        return `<div class="myprof ${on ? 'on' : ''} ${p.recipe_count ? '' : 'gather'}" data-prof="${esc(p.id)}">
           <label class="myprof-head">
-            <input type="checkbox" data-pick="${p.id}" ${on ? 'checked' : ''}>
+            <input type="checkbox" data-pick="${esc(p.id)}" ${on ? 'checked' : ''}>
             <span class="prof-icon" aria-hidden="true">${PROF_ICONS[p.id] || '◇'}</span>
             <span class="myprof-name">${esc(p.name)}<span class="prof-sub">${p.recipe_count ? `${num(p.recipe_count)} recipes` : (GATHERING.has(p.id) ? 'gathering – no recipes' : 'no recipes loaded')}</span></span>
             <span class="myprof-check" aria-hidden="true">✓</span>
           </label>
           <div class="myprof-skill">
-            <input type="range" min="0" max="${SKILL_MAX}" step="1" value="${sk}" data-skill-range="${p.id}" ${on ? '' : 'disabled'} aria-label="${esc(p.name)} skill">
-            <input type="number" min="0" max="${SKILL_MAX}" step="1" value="${sk}" data-skill-num="${p.id}" ${on ? '' : 'disabled'} aria-label="${esc(p.name)} skill value">
+            <input type="range" min="0" max="${SKILL_MAX}" step="1" value="${sk}" data-skill-range="${esc(p.id)}" ${on ? '' : 'disabled'} aria-label="${esc(p.name)} skill">
+            <input type="number" min="0" max="${SKILL_MAX}" step="1" value="${sk}" data-skill-num="${esc(p.id)}" ${on ? '' : 'disabled'} aria-label="${esc(p.name)} skill value">
           </div>
         </div>`;
       })
@@ -207,7 +207,7 @@ export async function render(ctx) {
     if (!list.some((p) => p.id === state.tab)) state.tab = list[0].id;
     bar.innerHTML = `
       <div class="seg seg-wrap" role="tablist" aria-label="Profession">${list
-        .map((p) => `<button class="seg-btn ${p.id === state.tab ? 'on' : ''}" data-tab="${p.id}" role="tab" aria-selected="${p.id === state.tab}"><span aria-hidden="true">${PROF_ICONS[p.id] || '◇'}</span> ${esc(p.name)} <span class="seg-count">${num(mine.get(p.id))}</span></button>`)
+        .map((p) => `<button class="seg-btn ${p.id === state.tab ? 'on' : ''}" data-tab="${esc(p.id)}" role="tab" aria-selected="${p.id === state.tab}"><span aria-hidden="true">${PROF_ICONS[p.id] || '◇'}</span> ${esc(p.name)} <span class="seg-count">${num(mine.get(p.id))}</span></button>`)
         .join('')}</div>
       <div class="kr-filters">
         <div class="seg seg-sm" role="radiogroup" aria-label="Show">

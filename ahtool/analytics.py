@@ -72,9 +72,35 @@ def invalidate():
         _cache.clear()
 
 
+def _web_default_realm(conn):
+    """Web version (a database that receives sync pushes): the realm the owner pushed last, else the realm with the
+    most current prices. Never the newest ingest row: every contributor's push writes one. None in the local app."""
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM main.meta WHERE key IN ('sync_epoch','sync_owner_realm')"))
+    except Exception:  # noqa - no meta table yet
+        return None
+    if "sync_epoch" not in meta:
+        return None
+    if meta.get("sync_owner_realm"):
+        return meta["sync_owner_realm"]
+    r = conn.execute("SELECT realm, COUNT(*) AS n FROM price_current GROUP BY realm ORDER BY n DESC, realm "
+                     "LIMIT 1").fetchone()
+    return r[0] if r else None
+
+
+def _is_web_db(conn):
+    try:
+        return conn.execute("SELECT 1 FROM main.meta WHERE key='sync_epoch'").fetchone() is not None
+    except Exception:  # noqa
+        return False
+
+
 def get_realm(conn, realm=None):
     if realm:
         return realm
+    r = _web_default_realm(conn)
+    if r:
+        return r
     r = conn.execute("SELECT realm FROM ingests ORDER BY id DESC LIMIT 1").fetchone()
     if r and r[0]:
         return r[0]
@@ -83,6 +109,13 @@ def get_realm(conn, realm=None):
 
 
 def list_realms(conn):
+    # web version: only realms the owner pushed data for - contributors cannot add entries (sync.owner_realms)
+    if _is_web_db(conn):
+        from . import sync
+        owned = sync.owner_realms(conn)
+        if owned is not None:
+            d = _web_default_realm(conn)
+            return sorted(set(owned) | ({d} if d else set()))
     rs = [r[0] for r in conn.execute("SELECT DISTINCT realm FROM price_current ORDER BY realm")]
     for r in conn.execute("SELECT DISTINCT realm FROM ingests"):
         if r[0] and r[0] not in rs:
@@ -422,11 +455,13 @@ def search(conn, cfg=None, q="", limit=50, realm=None):
                      key=lambda i: -ctx.cur[i][0])[:limit]
         return [_row(ctx, i) for i in ids]
     ql = q.lower()
+    # an item id: plain ASCII digits only (str.isdigit also accepts '²' etc., and int() refuses > 4300 digits)
+    qid = int(q) if q.isascii() and q.isdigit() and len(q) <= 10 else None
     scored = []
     for iid, c in ctx.cur.items():
         nm = _name(ctx, iid)
         s = None
-        if q.isdigit() and int(q) == iid:
+        if qid is not None and qid == iid:
             s = 0
         elif nm and ql in nm.lower():
             nl = nm.lower()

@@ -2,7 +2,7 @@
 
 Local program that reads Auctionator SavedVariables, stores history in SQLite, serves a local web UI.
 **Python 3.12 stdlib only** (no pip installs). Frontend: vanilla HTML/CSS/JS + Chart.js from
-`https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js`. UI language: **English**.
+`web/vendor/chart.umd.js` (Chart.js 4.4.1, vendored). UI language: **English**.
 
 Root: the repository folder.
 
@@ -378,19 +378,59 @@ Auctionator only gives one min price per scan + daily max quantity, so outliers 
   table `sync_keys(id,name,hash sha256,role owner|contributor,created_at,revoked_at,last_push_ts,pushes)`; not reachable
   via /api/x). `GET /api/sync/state` -> `{protocol, epoch, you, static_hash, accept_static, accept_cfg, last_push_ts,
   scans:[[realm,faction,ts,raw_kept,diffed]]}`. `POST /api/sync/push` (gzip JSON, one atomic batch) with any of `cfg`
-  and `static` (owner only; a contributor's static only while the server has none), `meta` (max of last_ingest_ts,
-  logger_ingest_ts), `price_current` (upsert, newest (last_day, updated_at) wins), `price_daily` (upsert: min low, max
-  high, max available), `snapshots` (insert or ignore, unique realm/item/ts), `scans:[{scan,items,auctions,sales}]`
-  (scan ids mapped by realm/faction/ts), `scan_updates:[{key,drop_raw?,sales?}]`. A push that changes prices adds one
-  server-side `ingests` row (cache + alert marker). Clients keep their own watermarks in local meta `sync:<sha1(url)>`
+  and `static` (owner only, also on an empty server; `hash` must be a sha256 hex, tooltip `icon` must match
+  `^[A-Za-z0-9_-]+$` or is stored NULL), `meta` (max of last_ingest_ts, logger_ingest_ts, clamped to now), `price_current`, `price_daily`,
+  `snapshots` (insert or ignore, unique realm/item/ts), `scans:[{scan,items,auctions,sales}]` (at most
+  `MAX_SCANS_PER_BATCH` = 50 new scans stored per batch, the rest counts as `applied.scans_deferred` and is resent by
+  the PC next time; scan ts at most now+60 s), `scan_updates:[{key,drop_raw?,sales?}]`. Unknown keys (top level, in a
+  scan / scan update object, in meta) -> 400. **Per-key prices:** server tables `price_daily_src` /
+  `price_current_src` hold each key's own rows (src_key, -1 = from before keys were tracked); `price_daily` /
+  `price_current` are the merge, recomputed for every realm/item(/day) a push or purge touches: daily = min low, max
+  high, max available over all keys; current = newest (last_day, updated_at) among rows not "from the future"
+  (last_day > today UTC or updated_at > now; such a row only shows while there is nothing else; pushed updated_at is
+  clamped to the receive time) - the same rule as `sync.current_newer` locally. **Scans** are unique per (realm,
+  faction, ts, src_key) on the server (schema 3; the local app keeps UNIQUE(realm, faction, ts)), `state.scans` lists
+  only the caller's own (and pre-key) scans, raw auctions are pruned to the newest N per realm/faction/key. A push
+  that changes merged prices adds one server-side `ingests` row (cache + alert marker, column `src_key`; a contributor
+  keeps only its newest); an owner push also sets meta `sync_owner_realm` and adds its realms to meta
+  `sync_owner_realms` (the web version's realm list, `analytics.list_realms`). **Schema:** `sync.ensure_schema` (at
+  start in run_web.py and per sync request) migrates once to meta `sync_schema`=3 (rebuild ah_scans without the
+  global UNIQUE, fill the per-key tables, `sweep_invalid`: delete stored rows that fail SPEC).
+  **Validation** (`sync.SPEC`, server `apply` and client `apply_pull`): every row column by column - ints are real ints
+  (no bool/float/str/NaN) in range (ids 1..2^31-1, prices 1..2^31-1 copper in price tables / 0..2^31-1 in
+  scans - the gold cap; keeps SUM(count*unit_price) far from 2^63, and aggregates use TOTAL() -, auction and sale
+  count 1..10000), text <= 64 chars (realm 1..64), days <= today+1, timestamps 2001..now+5 min (pull: +1 h). One bad row
+  -> the whole batch 400 (`BadPayload`; pull: `SyncError`, nothing of the page stored; the server leaves stored rows that
+  fail SPEC out of pull pages and logs them). Pull cursor values must be ints 0..2^63-1 (else 400). At most `SERVER_MAX_ROWS`
+  (2x MAX_BATCH_ROWS) rows per batch, static excluded. A stored price_current row from the future is always
+  replaced. The client leaves out local rows that would be refused and splits price_current/snapshots/scan_updates
+  into MAX_BATCH_ROWS batches. **Ownership:** server-only nullable column `src_key` on price_daily, price_current,
+  snapshots, ah_scans = the key id that pushed / last changed the row (0 = AHTOOL_SYNC_TOKEN, NULL = before this
+  column existed). `scan_updates` only apply to scans with the pusher's own src_key (owners: any); others count as
+  `applied.scan_updates_refused`. `ahkey purge <name|id>` (`keys.purge` -> `sync.purge_key`) deletes the key's rows
+  (scans with their items/auctions/sales, its per-key price rows - merged rows are recomputed from the other keys -,
+  snapshots, ingests rows), refreshes `sync_owner_realms` and adds an `ingests` row; PCs that already pulled them keep
+  them unless the local row is still exactly what was pulled (then the recomputed row replaces it on the next pull).
+  **Latest scan** (`market.latest_scan(conn, realm, faction=None)`, report.daily's scans and faction): your own
+  scans (web: owner's - src_key NULL/0/owner key) if the newest is at most `PREFER_OWN_S` (6 h) old, else anyone's.
+  **Default realm (web):** `analytics.get_realm` uses meta `sync_owner_realm`, else the realm with the most
+  price_current rows, never the newest ingest row (local app: unchanged). `apply_pull` writes its ingest row with the
+  PC's current realm, so pulled data never switches the local default realm.
+  **Client transport:** sync_url must be https (http only for localhost/127.0.0.1/::1), redirects are never followed
+  (the key would go along), answers are capped at 256 MB, at most 300 pull pages per run. Clients keep their own watermarks in local meta `sync:<sha1(url)>`
   = `{epoch, daily:{realm:max_day}, snap_ts}`; another epoch (reset server DB) or `--full` -> send everything.
 - **Pull:** server-only column `seq` on price_daily, price_current, ah_scans = the push (meta `sync_seq`) that last
   changed the row. `GET /api/sync/pull?cursor={pd:[seq,rowid],pc:[seq,rowid],sn:rowid,sc:[seq,id]}` -> `{protocol,
   epoch, cursor, more, price_daily, price_current, snapshots, scans:[{scan,items,auctions|null,sales}]}`, <= PULL_LIMIT
   rows per table. Client (`sync.pull` / `apply_pull`): same merges locally, snapshots insert-if-missing, scans
-  inserted as source='web' (char '', diffed=1; own scans coming back are skipped), one local `ingests` row with
+  inserted as source='web' (char '', diffed=1; own scans coming back are skipped; your own logger scan replaces a
+  pulled one with the same key); what was pulled per row is kept in local tables `sync_pulled_current|daily|snap`: a
+  row still equal to it takes the server's value as is, and push leaves such values out (daily: that column NULL),
+  so other players' data is never pushed back as yours (created on first use; resets the pull cursor once); one local
+  `ingests` row with
   file_mtime NULL when prices changed; cursor in meta `pull:<sha1(url)>` with epoch. Local rules: ingest.py merges
-  price_daily (`MERGE_DAILY`), skips price_current rows older than (last_day, updated_at) already stored, and compares
+  price_daily (`MERGE_DAILY`), keeps a stored price_current row p instead of its own observation only if
+  `not sync.current_is_future(p.last_day, p.updated_at) and (p.last_day, p.updated_at) > (last_day, mtime)`, and compares
   file_mtime only with non-NULL rows; market.py never diffs against or prunes own raw because of source='web' scans;
   push never sends source='web' scans.
 - Local: config `sync_url`, `sync_token`, `sync_hide_sellers`, `sync_pull` (true), `sync_pull_minutes` (5); `run.py`

@@ -12,6 +12,7 @@ Response:
 Cached in memory per analytics context (= per ingest / realm); typical cost after warm-up is well below 1 ms.
 """
 import json
+import re
 import threading
 
 from . import analytics
@@ -21,6 +22,7 @@ _lock = threading.Lock()
 _cache = {}
 _cache_key = None
 MAX_CACHE = 5000
+_ICON_RE = re.compile(r"[A-Za-z0-9_\-]+")
 
 
 def _style_q(q):
@@ -166,7 +168,9 @@ def tooltip(conn, cfg, item_id, realm=None):
     quality = s.get("quality")
     if quality is None:
         quality = it["quality"] if it else 1
-    icon = icon or FALLBACK_ICON
+    # Only plain icon names go into the URL (it ends up in the page; keep quotes/parens/slashes out).
+    if not (isinstance(icon, str) and _ICON_RE.fullmatch(icon)):
+        icon = FALLBACK_ICON
     res = {
         "id": item_id, "name": name, "quality": quality, "icon": icon, "icon_url": ICON_URL % icon,
         "item_level": s.get("item_level"), "required_level": s.get("required_level"),

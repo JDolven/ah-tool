@@ -134,12 +134,12 @@ export function guideHtml(plan, meta) {
   const profit = isNum(t.net) && t.net < 0;
 
   const stepRows = rows.map((x) => {
-    if (x.ms) return `<tr class="ms"><td class="ck"></td><td class="skill">${x.ms.skill}</td><td colspan="3">⚑ ${esc(x.ms.text)}</td></tr>`;
+    if (x.ms) return `<tr class="ms"><td class="ck"></td><td class="skill">${esc(x.ms.skill)}</td><td colspan="3">⚑ ${esc(x.ms.text)}</td></tr>`;
     const s = x.step;
     const regs = (s.reagents || []).map((g) => `${n(g.count)}× ${item(g.item_id, g.name, g.quality)}`).join(', ');
     const made = s.num_created > 1 ? ` <span class="muted">(makes ${n(s.num_created)})</span>` : '';
     const buyRecipe = isNum(s.recipe_item) ? ' <span class="warn">(recipe must be bought)</span>' : '';
-    return `<tr><td class="ck"><i></i></td><td class="skill">${s.from}–${s.to}</td>
+    return `<tr><td class="ck"><i></i></td><td class="skill">${esc(s.from)}–${esc(s.to)}</td>
       <td><b>${n(s.crafts)}×</b> ${s.created_item_id ? item(s.created_item_id, stepName(s), s.created_quality) : esc(stepName(s))}${made}${buyRecipe}${regs ? `<div class="regs">each: ${regs}</div>` : ''}</td>
       <td class="r hide-sm">${gold(s.cost_total)}</td><td class="r">${isNum(s.net_total) ? (s.net_total < 0 ? `<span class="profit">+${gold(-s.net_total)}</span>` : gold(s.net_total)) : '–'}</td></tr>`;
   }).join('');
@@ -148,7 +148,6 @@ export function guideHtml(plan, meta) {
   const subs = plan.subcrafts || [];
   const tools = plan.tools || [];
   const warnings = plan.warnings || [];
-  const text = guideText(plan, meta);
 
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -188,10 +187,21 @@ export function guideHtml(plan, meta) {
 
   <p class="note">Crafts are rounded up from the expected number – you may need a few more or fewer. After yellow, the skill-up chance drops until the recipe turns grey. Prices are a snapshot and change with the market.</p>
 </div>
-<script>
+</body></html>`;
+}
+
+/** JSON for a value inside an inline <script>: `<` escaped so no `</script>` or `<!--` can end or alter it. */
+function jsonScript(v) {
+  return JSON.stringify(v).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+}
+
+/** Inline script for the downloaded copy only (opened from file:// it has no opener to wire its buttons).
+ * The blob page shown from the app inherits the app's CSP, which blocks inline scripts, so it never gets one. */
+function guideScript(text, file) {
+  return `<script>
 (function(){
-  var TEXT = ${JSON.stringify(text).replace(/</g, '\\u003c')};
-  var FILE = ${JSON.stringify(meta.fileName)};
+  var TEXT = ${jsonScript(text)};
+  var FILE = ${jsonScript(file)};
   var msg = document.getElementById('msg');
   function say(t){ msg.textContent = t; setTimeout(function(){ if (msg.textContent === t) msg.textContent = ''; }, 2500); }
   document.getElementById('b-print').onclick = function(){ window.print(); };
@@ -208,7 +218,7 @@ export function guideHtml(plan, meta) {
   };
 })();
 </script>
-</body></html>`;
+`;
 }
 
 /** Open the guide in a new tab. Call synchronously from a click handler (pop-up blockers). */
@@ -217,5 +227,35 @@ export function openGuide(plan, meta) {
   const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
   const w = window.open(url, '_blank');
   setTimeout(() => URL.revokeObjectURL(url), 60000);
+  // The blob page inherits the app's CSP (no inline script): it is same-origin, so wire its buttons from here.
+  if (w) w.addEventListener('load', () => wireGuide(w, guideText(plan, meta), meta.fileName));
   return !!w;
+}
+
+function wireGuide(w, text, file) {
+  const doc = w.document;
+  const msg = doc.getElementById('msg');
+  const btn = (id) => doc.getElementById(id);
+  if (!msg || !btn('b-print')) return;
+  const say = (t) => { msg.textContent = t; w.setTimeout(() => { if (msg.textContent === t) msg.textContent = ''; }, 2500); };
+  btn('b-print').onclick = () => w.print();
+  btn('b-dl').onclick = () => {
+    let html = '<!doctype html>\n' + doc.documentElement.outerHTML;
+    const end = html.lastIndexOf('</body>');
+    const js = guideScript(text, file);
+    html = end < 0 ? html + js : html.slice(0, end) + js + html.slice(end);
+    const a = doc.createElement('a');
+    a.href = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+    a.download = file; doc.body.appendChild(a); a.click(); a.remove();
+    say('Saved');
+  };
+  btn('b-copy').onclick = () => {
+    const fallback = () => {
+      const t = doc.createElement('textarea'); t.value = text; doc.body.appendChild(t); t.select();
+      try { doc.execCommand('copy'); say('Copied'); } catch (e) { say('Copy failed'); }
+      t.remove();
+    };
+    if (w.navigator.clipboard && w.navigator.clipboard.writeText) w.navigator.clipboard.writeText(text).then(() => say('Copied'), fallback);
+    else fallback();
+  };
 }

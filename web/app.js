@@ -177,7 +177,7 @@ function renderSearch() {
     sBox.innerHTML = sItems
       .map((it, i) => {
         const disc = isNum(it.discount) && it.discount >= 0.1 ? `<span class="sr-disc">−${pct(it.discount)}</span>` : '';
-        return `<a class="sr-row ${i === sIndex ? 'sel' : ''}" href="#/item/${it.id}" ${ttAttr(it.id)} role="option" id="sr-${i}" aria-selected="${i === sIndex}">
+        return `<a class="sr-row ${i === sIndex ? 'sel' : ''}" href="#/item/${encodeURIComponent(it.id)}" ${ttAttr(it.id)} role="option" id="sr-${i}" aria-selected="${i === sIndex}">
           <span class="sr-name ${qClass(it.quality)}">${esc(itemName(it.name, it.id))}</span>
           <span class="sr-meta">${it.last_date ? dateLong(it.last_date) : 'never seen'}${isNum(it.available) ? ` · ${it.available} pcs` : ''}</span>
           <span class="sr-price">${money(it.price)} ${disc}</span>
@@ -228,7 +228,7 @@ sInput.addEventListener('keydown', (e) => {
   } else if (e.key === 'Enter') {
     const it = sItems[sIndex >= 0 ? sIndex : 0];
     if (it && !sBox.hidden) {
-      location.hash = `#/item/${it.id}`;
+      location.hash = `#/item/${encodeURIComponent(it.id)}`;
       sInput.value = '';
       sInput.blur();
       closeSearch();

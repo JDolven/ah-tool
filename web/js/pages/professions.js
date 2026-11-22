@@ -49,7 +49,7 @@ export async function renderList(ctx) {
     .map((p) => {
       const empty = !p.recipe_count;
       const pricedPct = p.recipe_count ? p.priced_count / p.recipe_count : 0;
-      return `<a class="prof-card ${empty ? 'is-empty' : ''} ${p.mine ? 'is-mine' : ''}" href="#/professions/${p.id}">
+      return `<a class="prof-card ${empty ? 'is-empty' : ''} ${p.mine ? 'is-mine' : ''}" href="#/professions/${encodeURIComponent(p.id)}">
         <div class="prof-top">
           <span class="prof-icon" aria-hidden="true">${PROF_ICONS[p.id] || '◇'}</span>
           <div class="prof-top-text">

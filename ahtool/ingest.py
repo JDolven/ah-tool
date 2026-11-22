@@ -24,17 +24,45 @@ def _decode_blob(v):
     return v
 
 
-def _dmap(x):
-    """{day: int} from dict (str/int keys); [] / {} / None -> {}."""
+# Range caps for numbers read from the SavedVariables file (Lua or CBOR may hold inf/NaN, 2^64-1, ...). PRICE_MAX
+# matches the unit-price cap of the sync SPEC (copper; 2^31-1 is ~214k gold, far above any real unit price).
+PRICE_MAX = 2 ** 31 - 1
+AVAIL_MAX = 2 ** 31 - 1
+DAY_MAX = 100000      # days since 2020-01-01 (year ~2293); keeps day_to_date() and SQLite INTEGER safe
+TS_MAX = 2 ** 40      # unix seconds
+
+
+def _int_in(v, lo, hi):
+    """int(v) if v is a finite int/float with lo <= v <= hi, else None. bool and strings are refused."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        i = int(v)
+    except (OverflowError, ValueError):  # inf / NaN
+        return None
+    return i if lo <= i <= hi else None
+
+
+def _day(k):
+    if isinstance(k, str):
+        k = int(k) if k.isdigit() and len(k) <= 6 else None
+    return _int_in(k, 0, DAY_MAX)
+
+
+def _dmap(x, lo=1, hi=PRICE_MAX):
+    """{day: int} from dict (str/int keys); [] / {} / None -> {}. Out-of-range keys or values are dropped."""
     if not isinstance(x, dict):
         return {}
     out = {}
     for k, v in x.items():
-        try:
-            out[int(k)] = int(v)
-        except (TypeError, ValueError):
-            pass
+        d, n = _day(k), _int_in(v, lo, hi)
+        if d is not None and n is not None:
+            out[d] = n
     return out
+
+
+def _today(now):
+    return int(now) // 86400 - (EPOCH - datetime.date(1970, 1, 1)).days
 
 
 def _item_id(key):
@@ -72,6 +100,25 @@ def _realm_items(realm_val):
         if is_pure:
             pure.add(iid)
     return items
+
+
+def _item_rows(realm, iid, v):
+    """-> (price_daily rows, price, available, last_day) for one item, or None when it has no usable price."""
+    if not isinstance(iid, int) or not 0 < iid <= 2 ** 31 - 1:
+        return None
+    h, l, a = _dmap(v.get("h")), _dmap(v.get("l")), _dmap(v.get("a"), 0, AVAIL_MAX)
+    days = set(h) | set(l)
+    drows = []
+    for d in days:
+        hi = h.get(d, l.get(d))
+        drows.append((realm, iid, d, l.get(d, hi), hi, a.get(d)))
+    last_day = max(days) if days else 0
+    price = _int_in(v.get("m"), 1, PRICE_MAX)
+    if price is None:  # missing or out-of-range "m" (inf, NaN, 2^64-1, 0, negative): use the last daily high
+        price = h.get(last_day) if days else None
+    if price is None:
+        return None
+    return drows, price, a.get(last_day), last_day
 
 
 MERGE_DAILY = ("low=MIN(COALESCE(price_daily.low,excluded.low), COALESCE(excluded.low,price_daily.low)), "
@@ -114,23 +161,23 @@ def _ingest(conn, cfg, force=False):
             prev = {r[0]: (r[1], r[2], r[3], r[4]) for r in cur.execute(
                 "SELECT item_id, price, available, last_day, updated_at FROM price_current WHERE realm=?", (realm,))}
             daily, current, snaps = [], [], []
+            today = _today(now)
+            now_slack = now + 300  # same 5-minute slack as sync.current_is_future
             for iid, v in items.items():
-                h, l, a = _dmap(v.get("h")), _dmap(v.get("l")), _dmap(v.get("a"))
-                days = set(h) | set(l)
-                for d in days:
-                    hi = h.get(d, l.get(d))
-                    daily.append((realm, iid, d, l.get(d, hi), hi, a.get(d)))
-                last_day = max(days) if days else 0
-                price = v.get("m")
-                if not isinstance(price, (int, float)):
-                    price = h.get(last_day) if days else None
-                if price is None:
+                try:  # one malformed item never aborts the import of the others
+                    row = _item_rows(realm, iid, v)
+                except (TypeError, ValueError, OverflowError, AttributeError):
+                    row = None
+                if row is None:
                     continue
-                price = int(price)
-                avail = a.get(last_day)
+                drows, price, avail, last_day = row
+                daily.extend(drows)
                 p = prev.get(iid)
-                if p is not None and (p[2] or 0, p[3] or 0) > (last_day, mtime):
-                    continue  # a newer observation from the web version (another player's scan) is kept
+                # A newer observation pulled from the web version (another player's scan) is kept, but a
+                # future-dated one (last_day > today or updated_at ahead of now: never genuine) never blocks the
+                # user's own import.
+                if p is not None and (p[2] or 0) <= today and (p[3] or 0) <= now_slack and (p[2] or 0, p[3] or 0) > (last_day, mtime):
+                    continue
                 if p is None or p[0] != price or p[1] != avail or p[2] != last_day:
                     current.append((realm, iid, price, avail, last_day, mtime))
                 if p is None or p[0] != price or p[1] != avail:
@@ -144,7 +191,7 @@ def _ingest(conn, cfg, force=False):
                 "INSERT INTO price_current(realm,item_id,price,available,last_day,updated_at) VALUES(?,?,?,?,?,?) "
                 "ON CONFLICT(realm,item_id) DO UPDATE SET price=excluded.price, available=excluded.available, "
                 "last_day=excluded.last_day, updated_at=excluded.updated_at", current)
-            cur.executemany("INSERT INTO snapshots VALUES(?,?,?,?,?)", snaps)
+            cur.executemany("INSERT INTO snapshots(realm,item_id,ts,price,available) VALUES(?,?,?,?,?)", snaps)
             cur.execute("INSERT INTO ingests(ts,file_mtime,realm,items,changed) VALUES(?,?,?,?,?)",
                         (now, mtime, realm, len(items), len(snaps)))
             realm_summaries.append({"realm": realm, "items": len(items), "changed": len(snaps)})
@@ -162,7 +209,10 @@ def _ingest(conn, cfg, force=False):
                     continue
                 for e in entries:
                     if isinstance(e, dict) and "price" in e and "time" in e:
-                        prow.append((iid, int(e["time"]), int(e["price"]), int(e.get("quantity") or 0)))
+                        t, pr = _int_in(e["time"], 0, TS_MAX), _int_in(e["price"], 1, PRICE_MAX)
+                        q = _int_in(e.get("quantity") or 0, 0, AVAIL_MAX)
+                        if t is not None and pr is not None and q is not None:
+                            prow.append((iid, t, pr, q))
         cur.executemany("INSERT OR IGNORE INTO postings VALUES(?,?,?,?)", prow)
 
         # vendor prices seen by Auctionator

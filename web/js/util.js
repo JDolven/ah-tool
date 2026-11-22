@@ -99,6 +99,11 @@ export function ttAttr(id) {
   return id === null || id === undefined || id === '' ? '' : `data-item-id="${esc(id)}"`;
 }
 
+/** Icon URL from the server, or '' unless it is a plain https URL (no quotes/parens/spaces). */
+export function safeIconUrl(url) {
+  return typeof url === 'string' && /^https:\/\/[A-Za-z0-9.-]+\/[A-Za-z0-9_\-./%]+$/.test(url) ? url : '';
+}
+
 export function itemLink(id, name, quality, extra = '') {
   return `<a class="item ${qClass(quality)}" href="#/item/${encodeURIComponent(id)}" ${ttAttr(id)} ${extra}>${esc(itemName(name, id))}</a>`;
 }

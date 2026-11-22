@@ -5,3 +5,9 @@ config.json
 *.db-*
 __pycache__
 addon
+.env
+.env.*
+*.log
+.github
+.vscode
+.idea

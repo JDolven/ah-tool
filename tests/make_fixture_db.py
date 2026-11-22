@@ -104,7 +104,7 @@ def add_extras(conn):
     conn.execute("INSERT OR REPLACE INTO items VALUES(7001,'Odd \"Quote\" Herb',1,5,7,9,1,10,0,20)")
     conn.execute("INSERT OR REPLACE INTO items VALUES(7002,'Caret^Dust',1,5,7,9,1,10,0,20)")
     for iid in (7001, 7002):
-        conn.execute("INSERT OR REPLACE INTO price_current VALUES('PvP',?,?,?,?,?)", (iid, 200, 10, D, 1800000000))
+        conn.execute("INSERT OR REPLACE INTO price_current VALUES('PvP',?,?,?,?,?)", (iid, 200, 10, D, 1790000000))
         for k in range(30):
             conn.execute("INSERT OR REPLACE INTO price_daily VALUES('PvP',?,?,?,?,?)", (iid, D - 29 + k, 200, 210, 10))
     conn.execute("INSERT OR REPLACE INTO spells VALUES(9001,'Odd Brew')")
@@ -143,7 +143,7 @@ def add_v4(conn):
             conn.execute("INSERT OR REPLACE INTO price_daily VALUES('PvP',?,?,?,?,?)", (iid, day, v, v + 5, avail))
 
     def cur(iid, price, avail, last_day=D):
-        conn.execute("INSERT OR REPLACE INTO price_current VALUES('PvP',?,?,?,?,?)", (iid, price, avail, last_day, 1800000000))
+        conn.execute("INSERT OR REPLACE INTO price_current VALUES('PvP',?,?,?,?,?)", (iid, price, avail, last_day, 1790000000))
 
     daily(8001, lambda d, k: 5000 if d == D - 5 else 100, 50); cur(8001, 100, 50)
     daily(8002, lambda d, k: 1000, 10); cur(8002, 5000, 1)
@@ -192,9 +192,9 @@ def build(path):
                 low = fn(day, day)
                 high = low + 10
             c.execute("INSERT INTO price_daily VALUES('PvP',?,?,?,?,?)", (it, day, low, high, avail))
-        c.execute("INSERT INTO price_current VALUES('PvP',?,?,?,?,?)", (it, price, avail, last_day, 1800000000))
+        c.execute("INSERT INTO price_current VALUES('PvP',?,?,?,?,?)", (it, price, avail, last_day, 1790000000))
     for k, p in enumerate([1100, 1000, 800, 600]):
-        c.execute("INSERT INTO snapshots VALUES('PvP',2453,?,?,?)", (1799000000 + k * 1000, p, 100 + k))
+        c.execute("INSERT INTO snapshots VALUES('PvP',2453,?,?,?)", (1789000000 + k * 1000, p, 100 + k))
     c.execute("INSERT INTO ingests(ts,file_mtime,realm,items,changed) VALUES(1800000000,1799999000,'PvP',10,10)")
     c.execute("INSERT INTO postings VALUES(2453,1799990000,900,5)")
     c.execute("INSERT INTO postings VALUES(118,1799990100,1800,2)")

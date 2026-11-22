@@ -14,6 +14,7 @@ earlier. The 24 hours before that are "the day before". Everything comes from da
 * group moves: median price change of the busy items per trade-goods group
 """
 import datetime
+import re
 import statistics
 import time
 from collections import defaultdict
@@ -26,6 +27,7 @@ MOVERS_N = 3
 BUSY_QTY = 10        # average listed quantity (scans) / max available (Auctionator) for an item to count as "busy"
 FLAT = 0.005         # +-0.5 % counts as unchanged
 ICON_URL = "https://wow.zamimg.com/images/wow/icons/medium/%s.jpg"
+_ICON_RE = re.compile(r"[A-Za-z0-9_\-]+")  # icon names that are safe to put into the URL
 
 # (key, label, class_id, subclass_id or None)
 GROUPS = [
@@ -55,12 +57,19 @@ def _r(v, n=4):
 
 
 def _scans(conn, realm):
-    q = "SELECT id, ts, n, faction, realm FROM ah_scans WHERE partial=0"
+    """Full scans, oldest first. Only your own (web version: the owner's) when the newest of those is recent
+    (market.PREFER_OWN_S before the newest scan of anyone), so other players' scans never pick the faction or the
+    window, and never mix their sales into yours."""
+    q = "SELECT id, ts, n, faction, realm, %s AS pref FROM ah_scans WHERE partial=0" % market.preferred_scans_sql(conn)
     args = ()
     if realm:
         q += " AND realm=?"
         args = (realm,)
-    return [dict(r) for r in conn.execute(q + " ORDER BY ts", args)]
+    scans = [dict(r) for r in conn.execute(q + " ORDER BY ts", args)]
+    own = [s for s in scans if s["pref"]]
+    if own and own[-1]["ts"] >= scans[-1]["ts"] - market.PREFER_OWN_S:
+        return own
+    return scans
 
 
 def _covered(scans, window):
@@ -82,10 +91,11 @@ def _sales(conn, scan_ids):
     per = defaultdict(lambda: {"sold": 0, "value": 0})
     auctions = 0
     for iid, cnt, val, n in conn.execute(
-            "SELECT item_id, SUM(count), SUM(count*unit_price), COUNT(*) FROM ah_sales "
+            # TOTAL (float sum), not SUM: SUM raises "integer overflow" past 2^63 (sales may come from other players)
+            "SELECT item_id, TOTAL(count), TOTAL(count*unit_price), COUNT(*) FROM ah_sales "
             "WHERE scan_id IN (%s) AND kind='sold' GROUP BY item_id" % marks, scan_ids):
-        per[iid]["sold"] = cnt or 0
-        per[iid]["value"] = val or 0
+        per[iid]["sold"] = int(cnt or 0)
+        per[iid]["value"] = int(round(val or 0))
         auctions += n
     return per, auctions
 
@@ -285,7 +295,7 @@ def daily(conn, cfg, date=None, realm=None):
             info[iid] = {"name": name, "quality": q if q is not None else 1, "icon_url": None}
         try:
             for iid, icon in conn.execute("SELECT id, icon FROM item_tooltip WHERE id IN (%s)" % marks, ids):
-                if icon:
+                if isinstance(icon, str) and _ICON_RE.fullmatch(icon):
                     info.setdefault(iid, {"name": None, "quality": 1})["icon_url"] = ICON_URL % icon
         except Exception:  # item_tooltip may not exist yet
             pass

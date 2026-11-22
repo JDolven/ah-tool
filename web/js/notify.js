@@ -71,7 +71,7 @@ export function show(alerts) {
     const n = new Notification(title, { body: lines.join('\n'), tag: `ahtool-alert-${first.id}`, icon: document.querySelector('link[rel=icon]')?.href });
     n.onclick = () => {
       window.focus();
-      location.hash = alerts.length === 1 && first.item_id ? `#/item/${first.item_id}` : '#/watchlist';
+      location.hash = alerts.length === 1 && first.item_id ? `#/item/${encodeURIComponent(first.item_id)}` : '#/watchlist';
       n.close();
     };
     return true;
