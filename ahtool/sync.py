@@ -88,6 +88,8 @@ CREATE INDEX IF NOT EXISTS ix_ah_scans_seq ON ah_scans(seq);
 CREATE TABLE IF NOT EXISTS sync_keys(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
     hash TEXT NOT NULL UNIQUE, role TEXT NOT NULL DEFAULT 'contributor', created_at INTEGER NOT NULL,
     revoked_at INTEGER, last_push_ts INTEGER, pushes INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS sync_scan_deletes(id INTEGER PRIMARY KEY AUTOINCREMENT, seq INTEGER NOT NULL,
+    origin INTEGER NOT NULL, realm TEXT, faction TEXT, ts INTEGER);
 """
 
 
@@ -365,6 +367,9 @@ def build_batches(conn, cfg, remote, full=False, mine=None):
     scans = [s for s in conn.execute("SELECT id, %s FROM ah_scans WHERE COALESCE(source,'')<>'web' ORDER BY ts"
                                      % ",".join(SCAN)).fetchall() if _bad_row(list(s[1:]), SPEC["scan"], lim) is None]
     key_of = {s[0]: (s[2], s[3], s[1]) for s in scans}  # id -> (realm, faction, ts)
+    # the server takes a scan at most SCAN_TS_SLACK in the future: a newer one (this PC's clock is ahead) is sent
+    # with a later push, as the server does not list it as pushed yet
+    scans = [s for s in scans if s[1] <= lim["now"] + SCAN_TS_SLACK]
 
     def sales_for(sid):
         out = []
@@ -435,6 +440,11 @@ CREATE TABLE IF NOT EXISTS sync_pulled_snap(realm TEXT, item_id INTEGER, ts INTE
 
 
 def _ensure_client_schema(conn):
+    # ah_scans.sync_origin: the web version's id of a pulled scan (NULL: your own, or pulled before this existed)
+    cols = [r[1] for r in conn.execute("PRAGMA main.table_info(ah_scans)")]
+    if cols and "sync_origin" not in cols:
+        with conn:
+            conn.execute("ALTER TABLE main.ah_scans ADD COLUMN sync_origin INTEGER")
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_pulled_snap'").fetchone():
         return
     conn.executescript(CLIENT_SCHEMA)
@@ -655,7 +665,9 @@ def _summary(res):
 
 # ================================================================ server (web version)
 
-SCHEMA_VERSION = 3  # meta sync_schema: 3 = per-key price tables, scans unique per key, invalid rows swept
+# meta sync_schema: 3 = per-key price tables, scans unique per key, invalid rows swept; 4 = deleted scans are recorded
+# (sync_scan_deletes) and scans that share their realm/faction/time with another key's are sent once more
+SCHEMA_VERSION = 4
 LEGACY_SRC = -1     # src_key in the per-key tables for rows pushed before src_key existed
 
 SERVER_SCHEMA_V3 = """
@@ -707,7 +719,9 @@ def ensure_schema(conn):
     try:
         r = cur.execute("SELECT value FROM main.meta WHERE key='sync_schema'").fetchone()
         if not (r and r[0] == str(SCHEMA_VERSION)):
-            _migrate_v3(cur)
+            if not (r and str(r[0]).isdigit() and int(r[0]) >= 3):
+                _migrate_v3(cur)
+            _migrate_v4(cur)
             cur.execute("INSERT OR IGNORE INTO main.meta(key,value) VALUES('sync_epoch',?)", (os.urandom(8).hex(),))
             cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES('sync_schema',?)", (str(SCHEMA_VERSION),))
         conn.commit()
@@ -731,14 +745,30 @@ def _migrate_v3(cur):
     for stmt in SERVER_SCHEMA_V3.strip().split(";"):
         if stmt.strip():
             cur.execute(stmt)
-    # every merged row becomes the row of the key that last changed it (rows from before src_key: LEGACY_SRC)
+    # Every merged row becomes a LEGACY_SRC row. Its src_key only named the key that last changed it: the values are
+    # the merge of everyone (the owner included), so filing them under that key would let `ahkey purge` of it delete
+    # the owner's values too. (Versions before this fix did file them under that key; see README, "Purging a key".)
     cur.execute("INSERT OR IGNORE INTO main.price_daily_src(realm,item_id,day,src_key,low,high,available) "
-                "SELECT realm,item_id,day,COALESCE(src_key,?),low,high,available FROM main.price_daily", (LEGACY_SRC,))
+                "SELECT realm,item_id,day,?,low,high,available FROM main.price_daily", (LEGACY_SRC,))
     cur.execute("INSERT OR IGNORE INTO main.price_current_src(realm,item_id,src_key,price,available,last_day,"
-                "updated_at) SELECT realm,item_id,COALESCE(src_key,?),price,available,last_day,updated_at "
+                "updated_at) SELECT realm,item_id,?,price,available,last_day,updated_at "
                 "FROM main.price_current", (LEGACY_SRC,))
     _sweep(cur)
     _set_owner_realms(cur, _owner_realms_from_data(cur))
+
+
+def _migrate_v4(cur):
+    """Scans that share (realm, faction, ts) with another key's scan get a new seq: PCs fetch them again and then
+    hold the one the server now sends for that key (the owner's), repairing copies a clashing scan overwrote.
+
+    The v3 migration filed legacy merged price rows under the key that last changed them; they cannot be told apart
+    from that key's own pushes any more, so they stay (documented in README: re-push from the owner after a purge)."""
+    clash = cur.execute("SELECT realm, faction, ts FROM main.ah_scans GROUP BY realm, faction, ts "
+                        "HAVING COUNT(*) > 1").fetchall()
+    if clash:
+        seq = _next_seq(cur)
+        cur.executemany("UPDATE main.ah_scans SET seq=? WHERE realm IS ? AND faction IS ? AND ts IS ?",
+                        [(seq,) + tuple(k) for k in clash])
 
 
 # ---------------------------------------------------------------- rows stored before validation existed
@@ -823,14 +853,29 @@ def _sweep(cur):
 
 
 def _drop_scans(cur, sids, out):
+    """Delete scans with everything that belongs to them. Each deletion is recorded (sync_scan_deletes) so PCs that
+    pulled the scan delete their copy, and the remaining scans with the same realm/faction/time get a new seq: one of
+    them may now be the one the server sends for that key (pull_page), and PCs must fetch it."""
+    sids = list(sids)
+    if not sids:
+        return 0
+    gone = []
     for i in range(0, len(sids), 500):
         part = sids[i:i + 500]
         sq = ",".join("?" * len(part))
+        gone += cur.execute("SELECT id, realm, faction, ts FROM main.ah_scans WHERE id IN (%s)" % sq, part).fetchall()
         for t in ("ah_auctions", "ah_scan_items", "ah_sales"):
             out[t] = out.get(t, 0) + cur.execute("DELETE FROM main.%s WHERE scan_id IN (%s)" % (t, sq),
                                                  part).rowcount
         cur.execute("UPDATE main.ah_sales SET prev_scan_id=NULL WHERE prev_scan_id IN (%s)" % sq, part)
-    return _delete_ids(cur, "ah_scans", list(sids), key="id")
+    n = _delete_ids(cur, "ah_scans", sids, key="id")
+    if gone:
+        seq = _next_seq(cur)
+        cur.executemany("INSERT INTO main.sync_scan_deletes(seq, origin, realm, faction, ts) VALUES(?,?,?,?,?)",
+                        [(seq,) + tuple(g) for g in gone])
+        cur.executemany("UPDATE main.ah_scans SET seq=? WHERE realm IS ? AND faction IS ? AND ts IS ?",
+                        [(seq,) + tuple(k) for k in {tuple(g[1:]) for g in gone}])
+    return n
 
 
 # ---------------------------------------------------------------- per-key prices -> merged prices
@@ -1006,6 +1051,22 @@ def _count_rows(payload):
 
 
 SCAN_KEY = (_S(), _S(32), _I(TS_MIN, "ts"))
+# json.loads builds one object per value: a few kB of gzip can unpack to millions of "[]," (~700 MB of RAM for 24 MB).
+# Every pushed row is a list of at most 9 values, so a contributor's batch (no static data) has at most ~10 commas
+# and brackets per row. Owner batches carry the static item/recipe/tooltip data (free text) and are not bounded.
+VALUES_PER_ROW = 10
+CONTRIBUTOR_MAX_VALUES = SERVER_MAX_ROWS * VALUES_PER_ROW + 10000
+
+
+def too_many_values(raw, owner):
+    """Server, before json.loads: -> an error text if a contributor's batch holds more values than any valid batch
+    can, else None. Cheap (three bytes.count over the unpacked body)."""
+    if owner:
+        return None
+    n = raw.count(b",") + raw.count(b"[") + raw.count(b"{")
+    if n > CONTRIBUTOR_MAX_VALUES:
+        return "sync batch has too many values (%d, at most %d)" % (n, CONTRIBUTOR_MAX_VALUES)
+    return None
 # price_current: a row replaces another if it is newer by (last_day, updated_at), or if the stored one is "from the
 # future" (dated after today UTC / updated after now) - such a row must never block real observations.
 _CURRENT_NEWER = ("(COALESCE(excluded.last_day,0), COALESCE(excluded.updated_at,0)) >= "
@@ -1140,7 +1201,10 @@ def apply(conn, cfg, payload, source):
         for s in _list(payload.get("scans"), "scans"):
             row = _checked([s.get("scan")], "scan", lim)[0]
             if row[0] > lim["now"] + SCAN_TS_SLACK:
-                raise BadPayload("scan: ts is in the future (%d)" % row[0])
+                # the PC's clock is a little ahead: store it once its time has come (the PC sends it again, as the
+                # server does not list it as this key's yet); the rest of the batch is applied
+                applied["scans_deferred"] = applied.get("scans_deferred", 0) + 1
+                continue
             scans.append((row, _checked(_list(s.get("items"), "scan items"), "scan items", lim),
                           _checked(_list(s.get("auctions"), "auctions"), "auctions", lim),
                           _checked(_list(s.get("sales"), "sales"), "sales", lim)))
@@ -1234,7 +1298,8 @@ def purge_key(conn, key_ids):
     Prices: the keys' own rows are deleted and the merged rows are rebuilt from what the other keys sent (a merged
     row only goes when no other key has a value for it). Rows pushed before src_key existed are not tracked and stay.
     PCs that already pulled the rows keep them, but take the rebuilt rows on their next pull wherever they still hold
-    exactly what they pulled."""
+    exactly what they pulled. Deleted scans are recorded (sync_scan_deletes): PCs delete their pulled copy, or take
+    another key's scan for the same time that is now the one sent (see _drop_scans)."""
     ensure_schema(conn)
     ids = sorted({int(k) for k in key_ids})
     out = {}
@@ -1272,7 +1337,15 @@ def purge_key(conn, key_ids):
 
 
 PULL_LIMIT = 50000
-CURSOR_KEYS = ("pd", "pc", "sn", "sc")
+PULL_VERSION = 3   # pull pages: 3 = scans carry their server id ("origin"), large scans are split across pages, deletes
+CURSOR_KEYS = ("pd", "pc", "sn", "sc", "sp", "sd")
+SCAN_DELETE = (ID, _S(), _S(32), _I(TS_MIN, "ts"))  # [origin, realm, faction, ts]
+# Two keys can each have a scan at the same (realm, faction, ts) on the server, but a PC holds one per key. Pulls send
+# only one of them: an owner's before a contributor's, else the oldest (lowest id). A contributor can therefore never
+# replace the owner's scan on other PCs, nor one another contributor pushed first.
+_SCAN_WINNER = ("NOT EXISTS (SELECT 1 FROM main.ah_scans o WHERE o.realm=s.realm AND o.faction=s.faction AND "
+                "o.ts=s.ts AND o.id<>s.id AND (%s > %s OR (%s = %s AND o.id < s.id)))"
+                % ((_owner_keys_sql("o.src_key"), _owner_keys_sql("s.src_key")) * 2))
 
 
 def _cursor_int(v, what):
@@ -1281,8 +1354,12 @@ def _cursor_int(v, what):
     return v
 
 
-def pull_page(conn, cursor, limit=PULL_LIMIT):
+def pull_page(conn, cursor, limit=PULL_LIMIT, version=None):
     """Server: rows changed after `cursor`, oldest change first, at most ~limit rows per table.
+
+    version (the client's ?v=): PULL_VERSION or later gets pages whose scans part holds at most ~limit rows, a large
+    scan split over several pages ({"origin", "cont": true, ...} continues it), plus "scan_deletes". Older clients
+    get whole scans (their format), still only one scan per realm/faction/time.
 
     A stored row that fails validation (left from before it existed) is skipped and logged, never sent: one such row
     would make every PC refuse the page forever."""
@@ -1291,6 +1368,12 @@ def pull_page(conn, cursor, limit=PULL_LIMIT):
         cursor = {}
     if not isinstance(cursor, dict):
         raise BadPayload("cursor must be an object")
+    try:
+        version = int(version) if isinstance(version, int) or (isinstance(version, str) and version.isdigit()
+                                                              and len(version) <= 4) else 0
+    except (TypeError, ValueError):
+        version = 0
+    split = version >= PULL_VERSION
     c = {k: cursor[k] for k in CURSOR_KEYS if k in cursor}
 
     def pair(k):
@@ -1303,6 +1386,12 @@ def pull_page(conn, cursor, limit=PULL_LIMIT):
 
     pairs = {k: pair(k) for k in ("pd", "pc", "sc")}
     sn = -1 if c.get("sn") is None else _cursor_int(c["sn"], "sn")
+    sd = -1 if c.get("sd") is None else _cursor_int(c["sd"], "sd")
+    sp = c.get("sp")
+    if sp is not None:
+        if not isinstance(sp, list) or len(sp) != 5:
+            raise BadPayload("cursor sp must be [id, seq, items, auctions, sales]")
+        sp = [_cursor_int(v, "sp") for v in sp]
     try:
         limit = int(limit) if isinstance(limit, int) or (isinstance(limit, str) and limit.isdigit()
                                                         and len(limit) <= 9) else PULL_LIMIT
@@ -1312,6 +1401,9 @@ def pull_page(conn, cursor, limit=PULL_LIMIT):
     lim = _limits()
     epoch = conn.execute("SELECT value FROM main.meta WHERE key='sync_epoch'").fetchone()[0]
     out = {"protocol": PROTOCOL, "epoch": epoch, "cursor": dict(c), "more": False}
+    out["cursor"].pop("sp", None)
+    if split:
+        out["pull_version"] = PULL_VERSION
     skipped = {}
 
     def ok(rows, what):
@@ -1337,27 +1429,70 @@ def pull_page(conn, cursor, limit=PULL_LIMIT):
     out["more"] = out["more"] or len(rows) >= limit
     out["snapshots"] = ok([list(r[1:]) for r in rows], "snapshots")
 
-    scans, budget = [], limit
-    for r in conn.execute("SELECT seq, id, %s FROM main.ah_scans WHERE (seq, id) > (?, ?) ORDER BY seq, id"
-                          % ",".join(SCAN), pairs["sc"]).fetchall():
-        if scans and budget <= 0:
+    if split:
+        rows = conn.execute("SELECT id, origin, realm, faction, ts FROM main.sync_scan_deletes WHERE id>? ORDER BY id "
+                            "LIMIT ?", (sd, limit)).fetchall()
+        if rows:
+            out["cursor"]["sd"] = rows[-1][0]
+        out["more"] = out["more"] or len(rows) >= limit
+        good = [list(r[1:]) for r in rows if _bad_row(list(r[1:]), SCAN_DELETE, lim) is None]
+        if len(good) != len(rows):
+            skipped["scan deletes"] = len(rows) - len(good)
+        out["scan_deletes"] = good
+
+    parts = (("items", "SELECT %s FROM main.ah_scan_items WHERE scan_id=? ORDER BY rowid LIMIT ? OFFSET ?"
+              % ",".join(SCAN_ITEMS), "scan items"),
+             ("auctions", "SELECT %s FROM main.ah_auctions WHERE scan_id=? ORDER BY rowid LIMIT ? OFFSET ?"
+              % ",".join(AUCTIONS), "auctions"),
+             ("sales", "SELECT p.ts, s.item_id, s.suffix, s.count, s.unit_price, s.owner, s.kind FROM main.ah_sales s "
+                       "LEFT JOIN main.ah_scans p ON p.id=s.prev_scan_id WHERE s.scan_id=? ORDER BY s.rowid "
+                       "LIMIT ? OFFSET ?", "sales"))
+    scans, budget, first = [], limit, True
+    for r in conn.execute("SELECT s.seq, s.id, %s FROM main.ah_scans s WHERE (s.seq, s.id) > (?, ?) AND %s "
+                          "ORDER BY s.seq, s.id LIMIT ?" % (",".join("s." + x for x in SCAN), _SCAN_WINNER),
+                          pairs["sc"] + (limit + 1,)).fetchall():
+        if budget <= 0:
             out["more"] = True
             break
-        out["cursor"]["sc"] = [r[0], r[1]]
-        sid, row = r[1], list(r[2:])
+        seq, sid, row = r[0], r[1], list(r[2:])
+        resume = first and split and sp is not None and sp[:2] == [sid, seq]
+        first = False
         if _bad_row(row, SPEC["scan"], lim):
             skipped["scan"] = skipped.get("scan", 0) + 1
+            out["cursor"]["sc"] = [seq, sid]
+            budget -= 1
             continue
-        item = {"scan": row,
-                "items": ok(_rows(conn, "SELECT %s FROM main.ah_scan_items WHERE scan_id=?" % ",".join(SCAN_ITEMS),
-                                  (sid,)), "scan items"),
-                "auctions": ok(_rows(conn, "SELECT %s FROM main.ah_auctions WHERE scan_id=?" % ",".join(AUCTIONS),
-                                     (sid,)), "auctions") if row[7] else None,
-                "sales": ok(_rows(conn, "SELECT p.ts, s.item_id, s.suffix, s.count, s.unit_price, s.owner, s.kind "
-                                        "FROM main.ah_sales s LEFT JOIN main.ah_scans p ON p.id=s.prev_scan_id "
-                                        "WHERE s.scan_id=?", (sid,)), "sales")}
-        budget -= len(item["items"]) + len(item["auctions"] or []) + len(item["sales"]) + 1
+        item = {"origin": sid}
+        if resume:
+            item["cont"] = True
+        else:
+            item["scan"] = row
+        offs = list(sp[2:]) if resume else [0, 0, 0]
+        done = True
+        for i, (name, sql, what) in enumerate(parts):
+            if name == "auctions" and not row[7]:
+                if not resume:
+                    item["auctions"] = None
+                continue
+            if not split:  # older clients: the whole scan
+                item[name] = ok(_rows(conn, sql, (sid, -1, 0)), what)
+                budget -= len(item[name])
+                continue
+            take = max(budget, 0) if done else 0
+            got = _rows(conn, sql, (sid, take + 1, offs[i])) if done else []
+            if len(got) > take:
+                got, done = got[:take], False
+            offs[i] += len(got)
+            budget -= len(got)
+            item[name] = ok(got, what)
+        budget -= 1
         scans.append(item)
+        if not done:
+            item["more"] = True
+            out["cursor"]["sp"] = [sid, seq] + offs
+            out["more"] = True
+            break
+        out["cursor"]["sc"] = [seq, sid]
     out["scans"] = scans
     if skipped:
         _log("pull: left out stored rows that fail validation (run sync.sweep_invalid): %s"
@@ -1424,10 +1559,17 @@ def apply_pull(conn, page, keep_raw=6):
         if not isinstance(s, dict):
             raise BadPayload("scans must be objects")
         auctions = s.get("auctions")
-        scans.append((_checked([s.get("scan")], "scan", lim)[0],
+        origin = s.get("origin")  # the server's id of the scan (servers before PULL_VERSION 3 send none)
+        if origin is not None and _bad_value(origin, ID, lim):
+            raise BadPayload("scans: origin must be a positive integer")
+        cont = s.get("cont") is True  # more rows of a scan an earlier entry started
+        if cont and origin is None:
+            raise BadPayload("scans: a continued scan needs its origin")
+        scans.append((None if cont else _checked([s.get("scan")], "scan", lim)[0],
                       _checked(_list(s.get("items"), "scan items"), "scan items", lim),
                       None if auctions is None else _checked(_list(auctions, "auctions"), "auctions", lim),
-                      _checked(_list(s.get("sales"), "sales"), "sales", lim)))
+                      _checked(_list(s.get("sales"), "sales"), "sales", lim), origin, cont))
+    deletes = _checked(_list(page.get("scan_deletes"), "scan_deletes"), "scan deletes", lim, SCAN_DELETE)
     _ensure_client_schema(conn)
     cur = conn.cursor()
     cur.execute("BEGIN IMMEDIATE")
@@ -1482,11 +1624,10 @@ def apply_pull(conn, page, keep_raw=6):
         cur.executemany("INSERT OR IGNORE INTO sync_pulled_snap VALUES(?,?,?)", [r[:3] for r in sn])
 
         def local_scan(realm, faction, ts):
-            return cur.execute("SELECT id, COALESCE(source,''), raw_kept FROM ah_scans WHERE realm=? AND faction=? "
-                               "AND ts=?", (realm, faction, ts)).fetchone()
+            return cur.execute("SELECT id, COALESCE(source,''), raw_kept, sync_origin FROM ah_scans WHERE realm=? AND "
+                               "faction=? AND ts=?", (realm, faction, ts)).fetchone()
 
-        def put_sales(sid, realm, faction, ts, sales):
-            cur.execute("DELETE FROM ah_sales WHERE scan_id=?", (sid,))
+        def sales_rows(sid, realm, faction, ts, sales):
             out = []
             for prev_ts, iid, suffix, count, unit, owner, kind in sales:
                 prev = local_scan(realm, faction, prev_ts) if prev_ts is not None else None
@@ -1494,13 +1635,58 @@ def apply_pull(conn, page, keep_raw=6):
             cur.executemany("INSERT INTO ah_sales(scan_id,prev_scan_id,ts,item_id,suffix,count,unit_price,owner,kind) "
                             "VALUES(?,?,?,?,?,?,?,?,?)", out)
 
+        def put_sales(sid, realm, faction, ts, sales):
+            cur.execute("DELETE FROM ah_sales WHERE scan_id=?", (sid,))
+            sales_rows(sid, realm, faction, ts, sales)
+
+        def add_rows(sid, items, auctions):
+            cur.executemany("INSERT OR REPLACE INTO ah_scan_items(scan_id,%s) VALUES(?,%s)"
+                            % (",".join(SCAN_ITEMS), ",".join("?" * len(SCAN_ITEMS))), [[sid] + r for r in items])
+            cur.executemany("INSERT INTO ah_auctions(scan_id,%s) VALUES(?,%s)"
+                            % (",".join(AUCTIONS), ",".join("?" * len(AUCTIONS))), [[sid] + r for r in auctions or []])
+
+        # scans the web version deleted (ahkey purge, invalid rows): only the pulled copy of exactly that scan goes
+        n_deleted = 0
+        for origin, realm, faction, ts in deletes:
+            have = local_scan(realm, faction, ts)
+            if have and have[1] == "web" and have[3] in (None, origin):
+                for t in ("ah_auctions", "ah_scan_items", "ah_sales"):
+                    cur.execute("DELETE FROM %s WHERE scan_id=?" % t, (have[0],))
+                cur.execute("UPDATE ah_sales SET prev_scan_id=NULL WHERE prev_scan_id=?", (have[0],))
+                cur.execute("DELETE FROM ah_scans WHERE id=?", (have[0],))
+                n_deleted += 1
+
         n_scans = 0
-        for row, items, auctions, sales in scans:
+        for row, items, auctions, sales, origin, cont in scans:
+            if cont:
+                # the rest of a large scan: appended to the pulled copy of that same scan (if this PC took it)
+                have = cur.execute("SELECT id, raw_kept, realm, faction, ts FROM ah_scans WHERE source='web' AND "
+                                   "sync_origin=?", (origin,)).fetchone()
+                if have:
+                    add_rows(have[0], items, auctions if have[1] else None)
+                    sales_rows(have[0], have[2], have[3], have[4], sales)
+                continue
             ts, realm, faction = row[0], row[1], row[2]
             have = local_scan(realm, faction, ts)
             if have and have[1] != "web":
                 continue  # your own scan coming back: yours is the original
-            if have:
+            if origin is not None:
+                # The server sends one scan per realm/faction/time (the owner's first), so the pulled copy takes
+                # whatever it sends now - a scan another key pushed for the same time is never mixed into it.
+                if have:
+                    sid = have[0]
+                    cur.execute("DELETE FROM ah_auctions WHERE scan_id=?", (sid,))
+                    cur.execute("DELETE FROM ah_scan_items WHERE scan_id=?", (sid,))
+                    cur.execute("UPDATE ah_scans SET char='', total=?, n=?, partial=?, raw_kept=?, diffed=1, "
+                                "sync_origin=? WHERE id=?", (row[4], row[5], row[6], 1 if auctions is not None else 0,
+                                                            origin, sid))
+                else:
+                    cur.execute("INSERT INTO ah_scans(ts,realm,faction,char,source,total,n,partial,raw_kept,diffed,"
+                                "sync_origin) VALUES(?,?,?,'','web',?,?,?,?,1,?)",
+                                (ts, realm, faction, row[4], row[5], row[6], 1 if auctions is not None else 0, origin))
+                    sid = cur.lastrowid
+                add_rows(sid, items, auctions)
+            elif have:  # a server from before PULL_VERSION 3
                 sid = have[0]
                 if auctions is None and have[2]:
                     cur.execute("DELETE FROM ah_auctions WHERE scan_id=?", (sid,))
@@ -1510,11 +1696,7 @@ def apply_pull(conn, page, keep_raw=6):
                             "VALUES(?,?,?,'','web',?,?,?,?,1)", (ts, realm, faction, row[4], row[5], row[6],
                                                                 1 if auctions is not None else 0))
                 sid = cur.lastrowid
-                cur.executemany("INSERT INTO ah_scan_items(scan_id,%s) VALUES(?,%s)"
-                                % (",".join(SCAN_ITEMS), ",".join("?" * len(SCAN_ITEMS))), [[sid] + r for r in items])
-                cur.executemany("INSERT INTO ah_auctions(scan_id,%s) VALUES(?,%s)"
-                                % (",".join(AUCTIONS), ",".join("?" * len(AUCTIONS))),
-                                [[sid] + r for r in auctions or []])
+                add_rows(sid, items, auctions)
             put_sales(sid, realm, faction, ts, sales)
             n_scans += 1
         if n_scans:  # pulled raw auctions are kept like your own: the newest few per realm/faction
@@ -1540,7 +1722,7 @@ def apply_pull(conn, page, keep_raw=6):
     except Exception:
         conn.rollback()
         raise
-    return {"prices": prices, "scans": n_scans}
+    return {"prices": prices, "scans": n_scans, "scans_deleted": n_deleted}
 
 
 def pull(conn, cfg, full=False, max_pages=300):
@@ -1563,7 +1745,8 @@ def pull(conn, cfg, full=False, max_pages=300):
     except (TypeError, ValueError, OverflowError):
         keep = 6
     for _ in range(max_pages):
-        q = urllib.parse.urlencode({"cursor": json.dumps(st.get("cursor") or {}, separators=(",", ":"))})
+        q = urllib.parse.urlencode({"cursor": json.dumps(st.get("cursor") or {}, separators=(",", ":")),
+                                    "v": PULL_VERSION})
         page = _request(cfg, "GET", "/api/sync/pull?" + q)
         if page.get("protocol") != PROTOCOL:
             raise SyncError("the web version speaks sync protocol %s, this app %s" % (page.get("protocol"), PROTOCOL))

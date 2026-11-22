@@ -481,7 +481,10 @@ st_own = sync.remote_state(c, src(ids, "Own"))
 check([s[2] for s in st_cat["scans"]] == [T] and st_own["scans"] == [], "state lists only the caller's own scans")
 res = ap(c, ids, "Cat", scans=[scan(T)])
 check(not res["applied"].get("scans"), "re-pushing your own scan is a no-op")
-check(refused(lambda: ap(c, ids, "Mal", scans=[scan(NOW + 120)])), "scan 2 min in the future refused")
+res = ap(c, ids, "Mal", scans=[scan(NOW + 120)])
+check(res["applied"].get("scans_deferred") == 1 and not res["applied"].get("scans")
+      and q(c, "SELECT COUNT(*) FROM ah_scans WHERE ts=?", (NOW + 120,)) == [(0,)],
+      "scan 2 min in the future is deferred, not stored, the batch not refused (%s)" % res["applied"])
 check(not refused(lambda: ap(c, ids, "Mal", scans=[scan(NOW + 30)])), "scan within 60 s clock skew accepted")
 res = ap(c, ids, "Mal", scans=[scan(NOW - 5000 - i) for i in range(sync.MAX_SCANS_PER_BATCH + 10)])
 check(res["applied"].get("scans") == sync.MAX_SCANS_PER_BATCH and res["applied"].get("scans_deferred") == 10,
@@ -653,7 +656,8 @@ oc.execute("INSERT INTO ah_scans(ts,realm,faction,char,source,total,n,partial,ra
 oc.commit()
 sync.ensure_schema(oc)
 check(q(oc, "SELECT value FROM meta WHERE key='sync_schema'") == [(str(sync.SCHEMA_VERSION),)], "schema upgraded")
-check(q(oc, "SELECT COUNT(*) FROM price_daily") == [(1,)] and q(oc, "SELECT src_key FROM price_daily_src") == [(0,)]
+check(q(oc, "SELECT COUNT(*) FROM price_daily") == [(1,)]
+      and q(oc, "SELECT src_key FROM price_daily_src") == [(sync.LEGACY_SRC,)]
       and q(oc, "SELECT src_key FROM price_current_src") == [(sync.LEGACY_SRC,)], "bad row swept, per-key tables filled")
 check("UNIQUE" not in oc.execute("SELECT sql FROM sqlite_master WHERE name='ah_scans'").fetchone()[0].upper()
       and q(oc, "SELECT COUNT(*) FROM ah_scans") == [(1,)], "ah_scans rebuilt without the global UNIQUE")
@@ -695,6 +699,184 @@ for qq in ("²", "9" * 5000, "٣", "2589"):
     except Exception as e:  # noqa
         check(False, "search %r answers (%s)" % (qq[:8], e))
 sconn.close()
+
+# ================================================================ round 3
+
+def pull_all(web_conn, pc_conn, cur=None, version=sync.PULL_VERSION, limit=sync.PULL_LIMIT, max_pages=100):
+    """-> (cursor, pages). Pulls like sync.pull, straight from the web DB."""
+    st, pages = dict(cur or {}), []
+    for _ in range(max_pages):
+        pg = sync.pull_page(web_conn, st, limit, version=version)
+        sync.apply_pull(pc_conn, pg)
+        pages.append(pg)
+        st = pg["cursor"]
+        if not pg["more"]:
+            break
+    return st, pages
+
+
+def scan3(ts, raw=0, items=None, auctions=None, sales=None, faction="Alliance"):
+    return {"scan": [ts, "Home", faction, "addon", 3, 3, 0, raw, 1],
+            "items": items if items is not None else [[2589, 3, 15, 100, 110, 2]],
+            "auctions": auctions or [], "sales": sales or []}
+
+
+# ---------------------------------------------------------------- R3.3 scans with the same key from two keys
+T0, T1 = NOW - 7200, NOW - 3600
+AU3 = [[2589, 0, 5, 500, 400, 0, 4, "Seller"]] * 3
+for ver in (sync.PULL_VERSION, None):
+    c, ids = fresh_web("r33_%s.db" % ver)
+    ap(c, ids, "Own", scans=[scan3(T0), scan3(T1, raw=1, auctions=AU3, sales=[[T0, 2589, 0, 5, 100, "Real", "sold"]])])
+    lp = db.connect(os.path.join(tmp, "r33_pc_%s.db" % ver))
+    cur, _ = pull_all(c, lp, version=ver)
+    ap(c, ids, "Mal", scans=[scan3(T1, items=[[2589, 1, 1, 1, 1, 1]],
+                                   sales=[[T0, 2589, 0, 10000, 2 ** 31 - 1, "Fake", "sold"]])])
+    cur, pages = pull_all(c, lp, cur, version=ver)
+    check(q(lp, "SELECT owner, count FROM ah_sales") == [("Real", 5)] and q(lp, "SELECT COUNT(*) FROM ah_auctions")
+          == [(3,)] and q(lp, "SELECT qty FROM ah_scan_items i JOIN ah_scans s ON s.id=i.scan_id WHERE s.ts=?", (T1,))
+          == [(15,)], "pull v%s: a contributor's scan at the owner's realm/faction/ts never reaches PCs" % ver)
+    check(all(s.get("origin") != q(c, "SELECT id FROM ah_scans WHERE src_key=?", (ids["Mal"],))[0][0]
+              for pg in pages for s in pg["scans"]), "pull v%s: the clashing scan is not even sent" % ver)
+    lp.close()
+    c.close()
+
+# contributor first, owner later at the same time: PCs end with the owner's scan, nothing of the contributor's kept
+c, ids = fresh_web("r33b.db")
+ap(c, ids, "Mal", scans=[scan3(T1, raw=1, items=[[2589, 1, 1, 1, 1, 1]], auctions=[[2589, 0, 1, 1, 1, 0, 4, "Fake"]],
+                               sales=[[None, 2589, 0, 9, 9, "Fake", "sold"]])])
+lp = db.connect(os.path.join(tmp, "r33b_pc.db"))
+cur, _ = pull_all(c, lp)
+check(q(lp, "SELECT owner FROM ah_auctions") == [("Fake",)], "PC took the contributor's scan while it was the only one")
+ap(c, ids, "Own", scans=[scan3(T1, raw=1, auctions=AU3, sales=[[None, 2589, 0, 5, 100, "Real", "sold"]])])
+cur, _ = pull_all(c, lp, cur)
+own_id = q(c, "SELECT id FROM ah_scans WHERE src_key=?", (ids["Own"],))[0][0]
+check(q(lp, "SELECT owner FROM ah_auctions") == [("Seller",)] * 3 and q(lp, "SELECT owner FROM ah_sales") == [("Real",)]
+      and q(lp, "SELECT qty FROM ah_scan_items") == [(15,)] and q(lp, "SELECT sync_origin FROM ah_scans") == [(own_id,)],
+      "the owner's scan pushed later replaces the contributor's copy on the PC, all of it")
+# purge of the owner's rival: nothing changes for PCs; purge of a scan nobody else has: PCs delete their copy
+ap(c, ids, "Mal", scans=[scan3(T0, sales=[[None, 2589, 0, 1, 1, "Fake", "sold"]])])
+cur, _ = pull_all(c, lp, cur)
+check(q(lp, "SELECT COUNT(*) FROM ah_scans WHERE ts=?", (T0,)) == [(1,)], "PC pulled the contributor's own-time scan")
+lp.execute("INSERT INTO ah_scans(ts,realm,faction,char,source,total,n,partial,raw_kept,diffed) "
+           "VALUES(?,'Home','Horde','me','addon',1,1,0,0,1)", (T0,))
+lp.commit()
+out = sync.purge_key(c, [ids["Mal"]])
+check(q(c, "SELECT COUNT(*) FROM sync_scan_deletes") == [(2,)], "purge records the deleted scans (%s)" % out)
+cur, pages = pull_all(c, lp, cur)
+check(q(lp, "SELECT ts, faction, source FROM ah_scans ORDER BY ts") == [(T0, "Horde", "addon"), (T1, "Alliance", "web")]
+      and q(lp, "SELECT owner FROM ah_auctions") == [("Seller",)] * 3,
+      "after the purge the PC deleted the purged scan's copy, kept the owner's and its own")
+check(any(pg.get("scan_deletes") for pg in pages), "the deletes travel in the pull page")
+
+# two contributors: the first one's copy is on PCs; purging it makes PCs fetch the other one's scan
+c, ids = fresh_web("r33c.db")
+ap(c, ids, "Mal", scans=[scan3(T1, items=[[2589, 1, 1, 1, 1, 1]])])
+ap(c, ids, "Cat", scans=[scan3(T1, items=[[2589, 7, 7, 7, 7, 7]])])
+lp = db.connect(os.path.join(tmp, "r33c_pc.db"))
+cur, _ = pull_all(c, lp)
+check(q(lp, "SELECT qty FROM ah_scan_items") == [(1,)], "of two contributors' scans the first pushed is sent")
+sync.purge_key(c, [ids["Mal"]])
+cur, _ = pull_all(c, lp, cur)
+check(q(lp, "SELECT qty FROM ah_scan_items") == [(7,)] and q(lp, "SELECT COUNT(*) FROM ah_scans") == [(1,)],
+      "purge: the other contributor's scan at that time replaces it on the PC")
+lp.close()
+c.close()
+
+# an older web DB (schema 3): upgrade adds the deletes table and resends scans that share their key
+c, ids = fresh_web("r33d.db")
+ap(c, ids, "Own", scans=[scan3(T1)])
+ap(c, ids, "Mal", scans=[scan3(T1, items=[[2589, 1, 1, 1, 1, 1]]), scan3(T0)])
+c.execute("DROP TABLE sync_scan_deletes")
+c.execute("UPDATE meta SET value='3' WHERE key='sync_schema'")
+c.commit()
+seq0 = q(c, "SELECT seq FROM ah_scans ORDER BY id")
+sync.ensure_schema(c)
+seq1 = q(c, "SELECT seq FROM ah_scans ORDER BY id")
+check(q(c, "SELECT value FROM meta WHERE key='sync_schema'") == [(str(sync.SCHEMA_VERSION),)]
+      and q(c, "SELECT COUNT(*) FROM sqlite_master WHERE name='sync_scan_deletes'") == [(1,)]
+      and seq1[0] > seq0[0] and seq1[1] > seq0[1] and seq1[2] == seq0[2],
+      "schema 3 -> 4: deletes table, clashing scans get a new seq (%s -> %s)" % (seq0, seq1))
+c.close()
+
+# client validation of the new fields
+lp = db.connect(os.path.join(tmp, "r33e_pc.db"))
+for what, pg in (("origin not an int", page(scans=[dict(scan3(T1), origin="1")])),
+                 ("origin 0", page(scans=[dict(scan3(T1), origin=0)])),
+                 ("continued scan without origin", page(scans=[{"cont": True, "items": [], "sales": []}])),
+                 ("bad scan delete", page(scan_deletes=[[1, "Home", "Alliance", "x"]])),
+                 ("bad continued auctions", page(scans=[{"origin": 5, "cont": True, "auctions": [["<b>"]]}]))):
+    check(refused(lambda: sync.apply_pull(lp, pg)), "apply_pull refuses %s" % what)
+lp.close()
+
+# ---------------------------------------------------------------- R3.2 pull pages respect their budget
+c, ids = fresh_web("r32.db")
+NA = 450
+AUB = [[2589 + i % 7, 0, 1, 100 + i, 90, 0, 4, "S%d" % i] for i in range(NA)]
+ITB = [[3000 + i, 1, 1, 1, 1, 1] for i in range(150)]
+SAB = [[None, 2589, 0, 1, 10 + i, "B%d" % i, "sold"] for i in range(120)]
+ap(c, ids, "Own", scans=[scan3(T0, raw=1, auctions=AUB, items=ITB, sales=SAB), scan3(T1)])
+lp = db.connect(os.path.join(tmp, "r32_pc.db"))
+cur, pages = pull_all(c, lp, limit=100)
+sizes = [sum(len(s.get(k) or []) for s in pg["scans"] for k in ("items", "auctions", "sales")) for pg in pages]
+check(len(pages) >= 7 and max(sizes) <= 100, "a large scan is split over pages of at most `limit` rows (%s)" % sizes)
+check(q(lp, "SELECT COUNT(*) FROM ah_auctions") == [(NA,)] and q(lp, "SELECT COUNT(*) FROM ah_scan_items")
+      == [(151,)] and q(lp, "SELECT COUNT(*) FROM ah_sales") == [(120,)] and q(lp, "SELECT COUNT(*) FROM ah_scans")
+      == [(2,)], "the PC puts the parts together: every auction, item and sale once")
+check(sorted(r[0] for r in lp.execute("SELECT buyout FROM ah_auctions")) == sorted(a[3] for a in AUB),
+      "the split scan's auctions are the server's")
+# an older client gets the whole scan in its own format (no cont entries)
+pg = sync.pull_page(c, {}, 100)
+check(all("cont" not in s for s in pg["scans"]) and len(pg["scans"][0]["auctions"]) == NA
+      and "scan_deletes" not in pg, "older clients (no v=) get whole scans, their format")
+# a scan that changes while it is half sent is sent again from the start
+lp2 = db.connect(os.path.join(tmp, "r32b_pc.db"))
+st = {}
+for _ in range(2):
+    pg = sync.pull_page(c, st, 100, version=sync.PULL_VERSION)
+    sync.apply_pull(lp2, pg)
+    st = pg["cursor"]
+check("sp" in st, "cursor holds the half-sent scan (%s)" % st)
+ap(c, ids, "Own", scan_updates=[{"key": ["Home", "Alliance", T0], "sales": SAB[:3]}])
+pull_all(c, lp2, st, limit=100)
+check(q(lp2, "SELECT COUNT(*) FROM ah_auctions") == [(NA,)] and q(lp2, "SELECT COUNT(*) FROM ah_sales") == [(3,)]
+      and q(lp2, "SELECT COUNT(*) FROM ah_scan_items") == [(151,)],
+      "changed mid-transfer: sent again from the start, no duplicates")
+lp.close()
+lp2.close()
+c.close()
+
+# ---------------------------------------------------------------- R3.4 PC clock ahead: future scans wait
+c, ids = fresh_web("r34.db")
+lp = db.connect(os.path.join(tmp, "r34_pc.db"))
+for i, ts in enumerate((NOW - 7200, NOW - 3600, NOW + 120)):
+    lp.execute("INSERT INTO ah_scans(ts,realm,faction,char,source,total,n,partial,raw_kept,diffed) "
+               "VALUES(?,'Home','Alliance','Me','addon',1,1,0,0,1)", (ts,))
+    lp.execute("INSERT INTO ah_scan_items VALUES(?,2589,1,1,1,1,1)", (i + 1,))
+lp.commit()
+bs, _ = sync.build_batches(lp, {}, sync.remote_state(c, src(ids, "Own")))
+sent = [s["scan"][0] for b in bs for s in b.get("scans") or []]
+check(sent == [NOW - 7200, NOW - 3600], "client leaves out a scan more than SCAN_TS_SLACK ahead (%s)"
+      % [t - NOW for t in sent])
+for b in bs:
+    ap(c, ids, "Own", **{k: v for k, v in b.items() if k != "protocol"})
+check(q(c, "SELECT COUNT(*) FROM ah_scans") == [(2,)], "the other scans are stored")
+lp.close()
+c.close()
+
+# ---------------------------------------------------------------- R3.5 migration files merged rows as legacy
+# (covered in R2.8: price_daily_src / price_current_src of a migrated row is LEGACY_SRC, so purging the key that
+# last wrote it does not delete the owner's values)
+
+# ---------------------------------------------------------------- R3.7 value bombs
+bomb_json = b"[" + b"[]," * (sync.CONTRIBUTOR_MAX_VALUES // 2) + b"[]]"
+check(sync.too_many_values(bomb_json, False) and sync.too_many_values(bomb_json, True) is None,
+      "too_many_values: a contributor's '[],' bomb refused, owners not bounded")
+big = json.dumps({"protocol": sync.PROTOCOL, "scans": [
+    {"scan": [NOW - 60, "Home", "Alliance", "addon", 3, 3, 0, 1, 0], "items": [],
+     "auctions": [[100000 + i, -12345, 200, 2 ** 31 - 1, 2 ** 31 - 1, 2 ** 31 - 1, 4, "Somebody"]
+                  for i in range(sync.SERVER_MAX_ROWS - 1)], "sales": []}]}).encode()
+check(sync.too_many_values(big, False) is None, "a valid contributor batch of SERVER_MAX_ROWS rows passes")
+del big, bomb_json
 
 # ---------------------------------------------------------------- busy web version: 503 is retried
 busy = {"left": 2, "hits": 0, "ra": "1"}
