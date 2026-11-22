@@ -158,6 +158,26 @@ open, when new prices arrive, and show as browser notifications. My Sales and My
 `docker run -v /path/to/data:/data -e AHTOOL_SYNC_TOKEN=<random, 32+ chars> -e AHTOOL_PUBLIC_URL=https://ah.example.net -p 8642:8642 ahtool-web`.
 Generate a token with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. That token is the owner's.
 
+**Behind a reverse proxy** (recommended: it terminates HTTPS). The site refuses cross-site POSTs, so it must be able
+to tell that a request comes from its own page. It accepts a POST when the browser says `Sec-Fetch-Site:
+same-origin`, when the `Origin` matches `Host` or `X-Forwarded-Host` (default ports 80/443 are normalised, so
+`Host: ah.example.net:443` matches `https://ah.example.net`), or when it equals `AHTOOL_PUBLIC_URL`. So: set
+`AHTOOL_PUBLIC_URL` to the address people open, and have the proxy pass the original host. If it also appends the
+client address to `X-Forwarded-For`, set `AHTOOL_TRUST_PROXY=1` (the number of proxies in front, e.g. `2` for
+Cloudflare Tunnel → nginx) so the per-address limit (`AHTOOL_MAX_PER_IP`, default 16 concurrent requests) counts
+visitors instead of the proxy. Never set it when the port is reachable directly, or anyone could pick an address.
+
+- nginx: `proxy_set_header Host $host; proxy_set_header X-Forwarded-Host $host;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto $scheme;`
+  and `client_max_body_size 32m;` (sync batches), `proxy_read_timeout 180s;` (a large push takes a while).
+- Caddy: `reverse_proxy 127.0.0.1:8642` passes Host and sets X-Forwarded-For/-Host/-Proto by default.
+- Cloudflare Tunnel: point the public hostname at `http://ahtool:8642` and leave *HTTP Host Header* empty (the
+  public host is passed on); Cloudflare sets X-Forwarded-For. Allow `/api/sync/*` past any Access login.
+
+The server itself drops connections that do not deliver their headers within 10 s or their body at a reasonable
+rate, caps one sync batch at 24 MB unpacked (`AHTOOL_MAX_SYNC_MB`) and parses one push at a time (a second one
+waits up to 15 s, then gets 503 and is sent again at the next sync). Give the container at least 1 GB of memory.
+
 **Push from your PC**: add to config.json
 
 ```json

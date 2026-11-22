@@ -5,13 +5,16 @@ import json
 import mimetypes
 import os
 import re
+import http.client
+import io
 import socket
 import sys
 import threading
+import time
 import traceback
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse, urlsplit
 
 from . import alerts as alerts_mod
 from . import analytics, market, notify, shopping, tooltip, userstate, webstate
@@ -22,16 +25,40 @@ WEB_BLOCKED = {
     ("GET", "/api/postings"), ("GET", "/api/market/my"),
     ("HEAD", "/api/postings"), ("HEAD", "/api/market/my"),
 }
-MAX_BODY = 1 << 20          # normal API calls (local app and web version)
-# One sync batch unpacked. sync.py cuts row data into batches of MAX_BATCH_ROWS (150k rows, ~15-20 MB of JSON);
-# 64 MB leaves room for the static tables in the first batch. Override with AHTOOL_MAX_SYNC_MB if ever needed.
-MAX_SYNC_JSON = int(os.environ.get("AHTOOL_MAX_SYNC_MB") or 64) << 20
+MAX_BODY = 64 << 10          # a normal API call: settings, a watchlist entry, ... (all a few hundred bytes)
+# POST /api/x carries the visitor's whole browser state. Measured: a typical one is ~10-20 kB, one filled to every
+# webstate.LIMITS (5000 known recipes, 500 watched items with 500-char notes, 200 alerts, 2000 alert states) ~630 kB.
+MAX_TUNNEL_BODY = 1 << 20
+MAX_TUNNEL_PARSE = 8         # /api/x bodies parsed at once (json.loads can need ~25x the body size in RAM)
+TUNNEL_WAIT = 10             # seconds to wait for a parse slot before answering 503
+# One sync batch unpacked. sync.py cuts row data into batches of MAX_BATCH_ROWS = 150k rows: measured 6.6-7.3 MB of
+# JSON for prices/snapshots, ~10.5 MB for raw auctions; the static item/recipe/tooltip batch of a Classic client is
+# ~10-15 MB. The server accepts at most 2x150k rows per batch (one huge scan), ~21 MB. 24 MB covers all of that;
+# json.loads of a hostile batch can take ~25x its size in RAM, so pushes are also parsed one at a time (_PUSH_LOCK).
+# Override with AHTOOL_MAX_SYNC_MB if ever needed.
+MAX_SYNC_JSON = int(os.environ.get("AHTOOL_MAX_SYNC_MB") or 24) << 20
 MAX_SYNC_BODY = MAX_SYNC_JSON  # the gzip body can never legitimately be larger than what it unpacks to
 SYNC_CONTENT_TYPE = "application/gzip"  # what sync._request sends; plain application/json is accepted as well
-SOCKET_TIMEOUT = 30          # seconds of silence before a connection is dropped (slowloris)
+PUSH_WAIT = 15               # seconds a push waits for the one running before it is told 503 "busy, retry"
+SOCKET_TIMEOUT = 30          # seconds of silence before a connection is dropped (idle keep-alive, every recv)
+HEADER_TIMEOUT = 10          # request line + headers must arrive within this many seconds of the first byte
+BODY_TIMEOUT_MIN = 10        # a body must arrive within max(MIN, size / BODY_MIN_RATE) seconds, at most MAX
+BODY_TIMEOUT_MAX = 120
+BODY_MIN_RATE = 64 << 10     # bytes/s
+MAX_REQUEST_LINE = 8 << 10   # longer -> 414
+MAX_HEADER_BYTES = 32 << 10  # all header lines together; more -> 431
+DRAIN_MAX = 4 << 20          # an oversized body up to this size is read away before the 413, so the client sees it
+LINGER_SECONDS = 2           # larger: answer, half-close and keep reading this long before closing (no RST)
 MAX_WEB_CONNECTIONS = 128    # concurrent connections served at once in the web version
+MAX_CONN_PER_IP = int(os.environ.get("AHTOOL_MAX_PER_IP") or 16)  # web version, per client address
 UNSAFE_METHODS = ("POST", "PUT", "DELETE")
+DEFAULT_PORTS = {"http": 80, "https": 443}
 _CL_RE = re.compile(r"[0-9]{1,15}")
+
+# At most one sync push is read, unpacked, parsed and applied at a time (memory), and a bounded number of /api/x
+# bodies are parsed at once.
+_PUSH_LOCK = threading.Semaphore(1)
+_TUNNEL_SLOTS = threading.BoundedSemaphore(MAX_TUNNEL_PARSE)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(ROOT, "web")
@@ -147,6 +174,90 @@ def _leveling():
     return leveling
 
 
+def split_hostport(value, scheme=None):
+    """'Host'-style 'name[:port]' -> (lowercase name, port) with the scheme's default port; None if malformed."""
+    value = (value or "").strip().lower()
+    if not value or any(c in value for c in "/?#@\\ \t"):
+        return None
+    try:
+        u = urlsplit("//" + value)
+        port = u.port
+    except ValueError:
+        return None
+    if not u.hostname:
+        return None
+    if port is None:
+        port = DEFAULT_PORTS.get(scheme)
+    return u.hostname.rstrip("."), port
+
+
+def parse_origin(value):
+    """'https://name[:port]' -> (scheme, name, port) with the default port filled in; None for null/garbage."""
+    value = (value or "").strip()
+    try:
+        u = urlsplit(value)
+        port = u.port
+    except ValueError:
+        return None
+    scheme = u.scheme.lower()
+    if scheme not in DEFAULT_PORTS or not u.hostname or u.username or u.password:
+        return None
+    return scheme, u.hostname.lower().rstrip("."), port or DEFAULT_PORTS[scheme]
+
+
+def _trusted_hops(v):
+    """AHTOOL_TRUST_PROXY: 1/true/yes = one reverse proxy in front, a number = that many; else 0 (XFF ignored)."""
+    v = str(v if v is not None else "").strip().lower()
+    if v in ("true", "yes", "on"):
+        return 1
+    return int(v) if v.isdigit() else 0
+
+
+class _DeadlineSocketIO(socket.SocketIO):
+    """Raw socket reader that enforces the handler's absolute deadline (`_rdeadline`), not just a per-recv timeout:
+    trickling one byte every few seconds no longer keeps a request open forever. With no deadline set (between
+    requests) the idle SOCKET_TIMEOUT applies, and the first byte of a request starts the HEADER_TIMEOUT clock."""
+
+    def __init__(self, sock, handler):
+        super().__init__(sock, "rb")
+        self._h = handler
+
+    def readinto(self, b):
+        h = self._h
+        dl = h._rdeadline
+        t = SOCKET_TIMEOUT
+        if dl is not None:
+            t = dl - time.monotonic()
+            if t <= 0:
+                raise TimeoutError("request not received in time")
+        self._sock.settimeout(min(t, SOCKET_TIMEOUT))
+        try:
+            n = super().readinto(b)
+        finally:
+            self._sock.settimeout(SOCKET_TIMEOUT)  # writes keep the normal timeout
+        if dl is None and n:
+            h._rdeadline = time.monotonic() + HEADER_TIMEOUT
+        return n
+
+
+class _HeaderCappedReader(io.BufferedReader):
+    """Counts header bytes while the request headers are parsed; over MAX_HEADER_BYTES -> 431 (via LineTooLong,
+    which BaseHTTPRequestHandler.parse_request answers itself)."""
+
+    def __init__(self, raw, handler):
+        super().__init__(raw)
+        self._h = handler
+
+    def readline(self, size=-1):
+        line = super().readline(size)
+        h = self._h
+        if h._in_headers:
+            h._header_bytes += len(line)
+            if h._header_bytes > MAX_HEADER_BYTES:
+                raise http.client.LineTooLong("request headers")
+        return line
+
+
 def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR, web=False):
     """web=True: the shared web version (see webstate.py and sync.py) instead of the local app."""
     connect = connect or default_connect
@@ -154,16 +265,107 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
     web_root = os.path.normpath(web_dir)
 
     extra_hosts = {h.lower() for h in (cfg.get("allowed_hosts") or []) if isinstance(h, str)}
+    # Web version behind a reverse proxy: the browser's Origin is the public address, which the proxy may not pass on
+    # in Host/X-Forwarded-Host. AHTOOL_PUBLIC_URL (run_web.py puts it in cfg) names it.
+    public_origin = parse_origin(cfg.get("public_url")) if web and cfg.get("public_url") else None
+    trust_hops = _trusted_hops(cfg.get("trust_proxy")) if web else 0
+    per_ip_cap = MAX_CONN_PER_IP
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "AHTool"
         timeout = SOCKET_TIMEOUT  # applied to the socket by StreamRequestHandler.setup()
+        _rdeadline = None         # absolute read deadline (time.monotonic()) of the current request part
+        _in_headers = False
+        _header_bytes = 0
+        _linger = False           # unread request data may be in flight: half-close and drain before closing
+        _body_pending = 0
+
+        def version_string(self):
+            return self.server_version  # no Python version in the Server header
+
+        def setup(self):
+            super().setup()
+            self.rfile.close()  # replace the plain makefile() reader with the deadline-aware one
+            self.connection._io_refs += 1  # what makefile() does; released by rfile.close() in finish()
+            self.rfile = _HeaderCappedReader(_DeadlineSocketIO(self.connection, self), self)
+
+        def handle_one_request(self):
+            self._rdeadline = None  # idle until the first byte of the next request arrives
+            self._in_headers = False
+            self._header_bytes = 0
+            try:
+                super().handle_one_request()
+            except ConnectionError:  # the client went away (reset, broken pipe): nothing to answer
+                self.close_connection = True
+
+        def parse_request(self):
+            if len(self.raw_requestline) > MAX_REQUEST_LINE:
+                self.requestline, self.request_version, self.command = "", "", ""
+                self.send_error(414)
+                return False
+            self._in_headers = True
+            try:
+                if not super().parse_request():
+                    return False
+            finally:
+                self._in_headers = False
+            # http.client.parse_headers stops at the first line that is not "Name: value" (e.g. "X-Foo : bar") and
+            # silently treats the rest - Content-Length, Transfer-Encoding, ... - as a message body. A proxy may read
+            # those headers; we would not, and parse the body as the next request. Refuse such requests, and folded
+            # (obs-fold) header values.
+            h = self.headers
+            if self.request_version == "HTTP/0.9" or not isinstance(h, http.client.HTTPMessage):
+                self.send_error(400, "HTTP/0.9 is not supported")
+                return False
+            if h.defects or h.get_payload() or any("\r" in v or "\n" in v for v in h.values()):
+                self.send_error(400, "malformed header line")
+                return False
+            return True
+
+        def finish(self):
+            try:
+                super().finish()
+            finally:
+                if self._linger:
+                    self._linger_close()
+
+        def _linger_close(self):
+            """We answered without reading the whole request. Closing now with unread data would make the kernel
+            send a RST, which can destroy the answer before the client read it. Half-close and read the rest away
+            for a moment instead."""
+            sock = self.connection
+            try:
+                sock.shutdown(socket.SHUT_WR)
+                end = time.monotonic() + LINGER_SECONDS
+                while True:
+                    t = end - time.monotonic()
+                    if t <= 0:
+                        break
+                    sock.settimeout(t)
+                    if not sock.recv(65536):
+                        break
+            except OSError:
+                pass
 
         def log_message(self, fmt, *args):
-            if web and self.path == "/healthz":
+            if web and getattr(self, "path", None) == "/healthz":
                 return
             sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+
+        def send_error(self, code, message=None, explain=None):
+            """Errors BaseHTTPRequestHandler answers itself (bad request line, unknown method, header too long, ...):
+            JSON with the same security headers as every other answer, and the connection closed."""
+            try:
+                short = self.responses[code][0]
+            except KeyError:
+                short = "error"
+            self.log_error("code %d, message %s", code, message or short)
+            self.close_connection = True
+            self._linger = True  # the rest of the request is unread: make sure the client still gets this answer
+            if not getattr(self, "request_version", None) or self.request_version == "HTTP/0.9":
+                self.request_version = "HTTP/1.1"  # answer with a status line and headers, never a bare body
+            self._json({"error": short.lower()}, code)
 
         def _send(self, code, body, ctype, extra=None, csp=CSP_API):
             self.send_response(code)
@@ -177,17 +379,20 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
             if self.close_connection:
                 self.send_header("Connection", "close")
             self.end_headers()
-            if self.command != "HEAD":
+            if getattr(self, "command", None) != "HEAD":
                 self.wfile.write(body)
 
-        def _json(self, obj, code=200):
+        def _json(self, obj, code=200, extra=None):
             body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-            self._send(code, body, "application/json; charset=utf-8", {"Cache-Control": "no-store"})
+            self._send(code, body, "application/json; charset=utf-8", dict({"Cache-Control": "no-store"}, **(extra or {})))
 
-        def _fail(self, code, msg):
+        def _fail(self, code, msg, extra=None):
             """Error answer that also ends the connection (the request may not have been read completely)."""
             self.close_connection = True
-            return self._json({"error": msg}, code)
+            return self._json({"error": msg}, code, extra)
+
+        def _busy(self, msg="busy, retry"):
+            return self._fail(503, msg, {"Retry-After": "5"})
 
         def _static(self, path):
             rel = unquote(path).lstrip("/") or "index.html"
@@ -229,13 +434,37 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
         def _read_body(self, limit):
             n = self._content_length()
             if n > limit:
+                self._discard_body(n)
                 raise TooLarge("request body too large")
             self._body_pending = 0
-            data = self.rfile.read(n) if n else b""
+            self._rdeadline = time.monotonic() + min(BODY_TIMEOUT_MAX, max(BODY_TIMEOUT_MIN, n / BODY_MIN_RATE))
+            try:
+                data = self.rfile.read(n) if n else b""
+            except TimeoutError:
+                self.close_connection = True
+                raise
             if len(data) != n:
                 self.close_connection = True
                 raise BadRequest("incomplete request body")
             return data
+
+        def _discard_body(self, n):
+            """An oversized body we will refuse: read it away first (up to DRAIN_MAX) so the client, still sending,
+            gets to read the 413 instead of a broken pipe; larger ones are left to _linger_close."""
+            self.close_connection = True
+            if n > DRAIN_MAX:
+                self._linger = True
+                return
+            self._rdeadline = time.monotonic() + min(BODY_TIMEOUT_MAX, max(BODY_TIMEOUT_MIN, n / BODY_MIN_RATE))
+            try:
+                while n > 0:
+                    chunk = self.rfile.read(min(n, 1 << 16))
+                    if not chunk:
+                        break
+                    n -= len(chunk)
+            except OSError:
+                return
+            self._body_pending = 0
 
         def _host_ok(self):
             if web:
@@ -253,14 +482,34 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
             site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
             if site in ("cross-site", "same-site"):
                 return False
+            if web and site == "same-origin":
+                # Set by the browser itself (scripts cannot), so it holds even when a reverse proxy rewrote Host.
+                return True
             origin = self.headers.get("Origin")
             if origin is None:
                 return True
-            netloc = urlparse(origin.strip()).netloc.lower() if origin.strip().lower() != "null" else ""
-            hosts = {(self.headers.get("Host") or "").strip().lower()}
+            o = parse_origin(origin)
+            if o is None:  # "null" (sandboxed frame, file://, redirects) or garbage
+                return False
+            scheme, name, oport = o
+            if public_origin is not None and o == public_origin:
+                return True
+            hosts = [self.headers.get("Host") or ""]
             if web and self.headers.get("X-Forwarded-Host"):  # behind a reverse proxy that rewrites Host
-                hosts.add(self.headers["X-Forwarded-Host"].split(",")[0].strip().lower())
-            return bool(netloc) and netloc in hosts
+                hosts.append(self.headers["X-Forwarded-Host"].split(",")[0])
+            # ports compared with defaults filled in: "Host: ah.example.net:443" is https://ah.example.net
+            return any(split_hostport(h, scheme) == (name, oport) for h in hosts)
+
+        def _client_ip(self):
+            """The visitor's address: the TCP peer, or behind trust_hops reverse proxies the address the outermost
+            trusted proxy saw (the entry it appended to X-Forwarded-For; earlier entries are client-supplied)."""
+            peer = self.client_address[0]
+            if not trust_hops:
+                return peer
+            xff = [e.strip() for e in ",".join(self.headers.get_all("X-Forwarded-For") or []).split(",") if e.strip()]
+            if not xff:
+                return peer
+            return xff[-trust_hops] if len(xff) >= trust_hops else xff[0]
 
         def _ctype_ok(self, allowed, body_len):
             ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
@@ -274,15 +523,24 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                 self._body_pending = self._content_length()
             except BadRequest as e:
                 return self._fail(400, str(e))
+            ip = None
             try:
+                if trust_hops:  # behind a proxy the per-address cap can only be applied once the headers are in
+                    ip = self._client_ip()
+                    if not self.server.ip_enter(ip):
+                        ip = None
+                        return self._busy("too many connections from your address")
                 if not self._host_ok():
                     return self._fail(403, "forbidden host")
                 if method in UNSAFE_METHODS and not self._same_origin():
                     return self._fail(403, "cross-origin request refused")
                 return self._dispatch(method)
             finally:
+                if ip is not None:
+                    self.server.ip_leave(ip)
                 if self._body_pending:  # body left unread: the next "request" on this connection would be the body
                     self.close_connection = True
+                    self._linger = True
 
         def _dispatch(self, method):
             u = urlparse(self.path)
@@ -302,7 +560,7 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                 if not self._ctype_ok(("application/json",), self._body_pending):
                     return self._fail(415, "Content-Type must be application/json")
                 try:
-                    raw = self._read_body(MAX_BODY)
+                    raw = self._read_body(MAX_TUNNEL_BODY if web and path == "/api/x" else MAX_BODY)
                 except TooLarge as e:
                     return self._fail(413, str(e))
                 except BadRequest as e:
@@ -350,32 +608,46 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
             larger than a header may be."""
             if method != "POST":
                 return self._json({"error": "method not allowed"}, 405)
-            try:
-                req = loads_strict(raw)
-                m, target = req["m"], req["p"]
-                if m not in ("GET", "POST", "PUT", "DELETE") or not isinstance(target, str):
-                    raise ValueError
-            except (ValueError, KeyError, TypeError, UnicodeDecodeError):
-                return self._json({"error": "bad request"}, 400)
-            u = urlparse(target)
-            path = u.path.rstrip("/")
-            if not path.startswith("/api/") or path.startswith("/api/sync") or path == "/api/x":
-                return self._json({"error": "unknown endpoint"}, 404)
-            qs = {k: v[-1] for k, v in parse_qs(u.query).items()}
-            body = req.get("b")
-            braw = json.dumps(body).encode("utf-8") if body is not None else b""
+            # Parsing and installing the state is where a body costs the most memory: a bounded number at a time.
+            # Afterwards only the small parts of the request are kept.
+            if not _TUNNEL_SLOTS.acquire(timeout=TUNNEL_WAIT):
+                return self._busy()
             conn = None
             try:
+                try:
+                    req = loads_strict(raw)
+                    m, target = req["m"], req["p"]
+                    if m not in ("GET", "POST", "PUT", "DELETE") or not isinstance(target, str):
+                        raise ValueError
+                except (ValueError, KeyError, TypeError, UnicodeDecodeError, RecursionError):
+                    return self._json({"error": "bad request"}, 400)
+                u = urlparse(target)
+                path = u.path.rstrip("/")
+                if not path.startswith("/api/") or path.startswith("/api/sync") or path == "/api/x":
+                    return self._json({"error": "unknown endpoint"}, 404)
+                qs = {k: v[-1] for k, v in parse_qs(u.query).items()}
+                body = req.get("b")
+                braw = json.dumps(body).encode("utf-8") if body is not None else b""
+                st = req.get("s") if isinstance(req.get("s"), dict) else {}
+                last_eval = st.get("eval")
                 conn = connect()
-                webstate.install(conn, req.get("s"))
+                webstate.install(conn, st)
+                del req, st, body
+            except Exception:  # noqa
+                traceback.print_exc()
+                if conn is not None:
+                    conn.close()
+                return self._json({"error": "internal server error"}, 500)
+            finally:
+                _TUNNEL_SLOTS.release()
+            try:
                 changed = m != "GET"
                 result = self._route(m, path, qs, conn, braw)
                 if path == "/api/status":
                     # Alerts are evaluated per browser, once per new batch of prices.
-                    st = req.get("s") if isinstance(req.get("s"), dict) else {}
                     marker = webstate.data_marker(conn)
-                    if marker and st.get("eval") != marker:
-                        if st.get("eval") is not None:
+                    if marker and last_eval != marker:
+                        if last_eval is not None:
                             alerts_mod.evaluate(conn, cfg, notify_user=False)
                             result["unseen_alerts"] = userstate.unseen_alerts(conn)
                         changed = True
@@ -396,11 +668,10 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                 traceback.print_exc()
                 self._json({"error": "internal server error"}, 500)
             finally:
-                if conn is not None:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         def _sync(self, method, path):
             """Push endpoints for the local apps (sync.py). Bearer: AHTOOL_SYNC_TOKEN or a key from keys.py."""
@@ -427,21 +698,33 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                     gz = self._ctype_ok((SYNC_CONTENT_TYPE,), -1)
                     if not gz and not self._ctype_ok(("application/json",), -1):
                         return self._fail(415, "Content-Type must be " + SYNC_CONTENT_TYPE)
+                    if self._body_pending > MAX_SYNC_BODY:
+                        return self._fail(413, "request body too large")
+                    # One push at a time: reading, unpacking, parsing and applying a batch needs up to several
+                    # hundred MB; parallel pushes could exhaust the container's memory.
+                    if not _PUSH_LOCK.acquire(timeout=PUSH_WAIT):
+                        return self._busy("busy with another push, retry")
                     try:
-                        raw = self._read_body(MAX_SYNC_BODY)
-                        if gz:
-                            raw = gunzip_capped(raw, MAX_SYNC_JSON)
-                    except TooLarge as e:
-                        return self._fail(413, str(e))
-                    try:
-                        payload = sync.loads_strict(raw.decode("utf-8"))
-                    except (ValueError, UnicodeDecodeError):
-                        raise BadRequest("sync batch is not valid JSON")
-                    del raw
-                    res = sync.apply(conn, cfg, payload, source)
+                        try:
+                            raw = self._read_body(MAX_SYNC_BODY)
+                            if gz:
+                                raw = gunzip_capped(raw, MAX_SYNC_JSON)
+                        except TooLarge as e:
+                            return self._fail(413, str(e))
+                        try:
+                            payload = sync.loads_strict(raw.decode("utf-8"))
+                        except (ValueError, UnicodeDecodeError, RecursionError):
+                            raise BadRequest("sync batch is not valid JSON")
+                        del raw
+                        res = sync.apply(conn, cfg, payload, source)
+                        del payload
+                    finally:
+                        _PUSH_LOCK.release()
                     analytics.invalidate()
                     return self._json(res)
                 return self._json({"error": "unknown endpoint"}, 404)
+            except TimeoutError:
+                raise  # body not received in time: handle_one_request drops the connection
             except BadRequest as e:
                 return self._fail(400, str(e))
             except sync.BadPayload as e:  # our own validation text: names the table/field, no internals
@@ -467,7 +750,7 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
             if method in ("POST", "PUT", "DELETE") and raw.strip():
                 try:
                     body = loads_strict(raw)
-                except (ValueError, UnicodeDecodeError):
+                except (ValueError, UnicodeDecodeError, RecursionError):
                     raise BadRequest("request body is not valid JSON")
             if method == "POST":
                 if path == "/api/ingest":
@@ -669,27 +952,64 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                 self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             super().server_bind()
 
-        # The web version is public: bound the number of connection threads. Over the limit a connection gets a
-        # plain 503 and is closed instead of starting yet another thread.
+        # The web version is public: bound the number of connection threads, in total and per client address.
+        # Over a limit a connection gets a plain 503 and is closed instead of starting yet another thread. Behind a
+        # trusted reverse proxy every connection comes from the proxy, so the per-address cap is applied per request
+        # instead, to the X-Forwarded-For address (Handler._handle).
         slots = threading.BoundedSemaphore(MAX_WEB_CONNECTIONS) if web else None
+        per_ip = {}
+        per_ip_lock = threading.Lock()
+        cap_peer = web and not trust_hops
+
+        def ip_enter(self, ip):
+            with self.per_ip_lock:
+                n = self.per_ip.get(ip, 0)
+                if n >= per_ip_cap:
+                    return False
+                self.per_ip[ip] = n + 1
+                return True
+
+        def ip_leave(self, ip):
+            with self.per_ip_lock:
+                n = self.per_ip.get(ip, 0) - 1
+                if n > 0:
+                    self.per_ip[ip] = n
+                else:
+                    self.per_ip.pop(ip, None)
+
+        def _refuse(self, request):
+            try:
+                request.settimeout(2)
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+                                b"Content-Length: 24\r\nX-Content-Type-Options: nosniff\r\n"
+                                b"Content-Security-Policy: " + CSP_API.encode() + b"\r\n"
+                                b"Connection: close\r\nRetry-After: 5\r\n\r\n{\"error\": \"busy, retry\"}")
+            except OSError:
+                pass
+            self.shutdown_request(request)
 
         def process_request(self, request, client_address):
             if self.slots is not None and not self.slots.acquire(blocking=False):
-                try:
-                    request.settimeout(2)
-                    request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n"
-                                    b"Connection: close\r\nRetry-After: 5\r\n\r\n")
-                except OSError:
-                    pass
-                self.shutdown_request(request)
-                return
-            super().process_request(request, client_address)
+                return self._refuse(request)
+            if self.cap_peer and not self.ip_enter(client_address[0]):
+                self.slots.release()
+                return self._refuse(request)
+            try:
+                super().process_request(request, client_address)
+            except BaseException:
+                self._release(client_address)
+                raise
+
+        def _release(self, client_address):
+            if self.cap_peer:
+                self.ip_leave(client_address[0])
+            if self.slots is not None:
+                self.slots.release()
 
         def process_request_thread(self, request, client_address):
             try:
                 super().process_request_thread(request, client_address)
             finally:
-                if self.slots is not None:
-                    self.slots.release()
+                self._release(client_address)
 
     return Server((host, port), Handler)

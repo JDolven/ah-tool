@@ -143,8 +143,55 @@ code, _, _ = req(WPORT, "POST", "/api/x", b'{"m":"GET","p":"/api/settings"}', {"
 check(code == 415, "web: text/plain tunnel call refused (%s)" % code)
 
 # ---------------------------------------------------------------- body limits and JSON strictness
+
+
+def send_and_read(port, head, body, wait=10):
+    """Send `head` + `body` while reading the answer at the same time, so an early answer (413) is never lost to a
+    broken pipe on our side. -> (first status line, closed by server)."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=wait)
+    s.sendall(head)
+
+    def pump():
+        try:
+            s.sendall(body)
+        except OSError:
+            pass
+    t = threading.Thread(target=pump, daemon=True)
+    t.start()
+    out, closed = b"", False
+    try:
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                closed = True
+                break
+            out += chunk
+    except OSError:
+        pass
+    s.close()
+    t.join(5)
+    return out.split(b"\r\n")[0], closed
+
+
 code, _, _ = req(LPORT, "PUT", "/api/settings", b" " * (server.MAX_BODY + 1), J)
 check(code == 413, "local body over MAX_BODY refused (%s)" % code)
+# round 2: the 413 must reach a client that sends the whole body before reading (http.client), every time
+codes = []
+for _ in range(20):
+    try:
+        codes.append(req(LPORT, "PUT", "/api/settings", b" " * (server.MAX_BODY + 1), J)[0])
+    except OSError as e:
+        codes.append(type(e).__name__)
+check(codes == [413] * 20, "oversized PUT: 413 delivered 20/20 times (%s)" % sorted(set(map(str, codes))))
+big = server.DRAIN_MAX + (1 << 20)  # too big to read away: answered, half-closed, drained for LINGER_SECONDS
+try:
+    code = req(LPORT, "PUT", "/api/settings", b" " * big, J)[0]
+except OSError as e:
+    code = type(e).__name__
+check(code == 413, "very large PUT (%d MB): 413 still delivered (%s)" % (big >> 20, code))
+line, closed = send_and_read(LPORT, b"PUT /api/settings HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json"
+                             b"\r\nContent-Length: %d\r\n\r\n" % (LPORT, big), b" " * big)
+check(line.startswith(b"HTTP/1.1 413") and closed, "very large PUT, raw: 413 and closed (%r)" % line)
 code, _, d = req(LPORT, "PUT", "/api/settings", b'{"shopping_max_markup": NaN}', J)
 check(code == 400, "NaN in a JSON body refused (%s %s)" % (code, d))
 
@@ -259,7 +306,244 @@ time.sleep(0.3)
 out, closed = raw_exchange(CPORT, b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
 check(out.startswith(b"HTTP/1.1 200"), "slot freed after the connection ends (%r)" % out[:30])
 
-for s in (lsrv, wsrv, bsrv, csrv):
+# ================================================================ round 2
+
+# ---------------------------------------------------------------- 1. memory: sync batch cap, one push at a time, /api/x
+check(server.MAX_SYNC_JSON == 24 << 20 or os.environ.get("AHTOOL_MAX_SYNC_MB"),
+      "sync batch cap 24 MB (%d MB)" % (server.MAX_SYNC_JSON >> 20))
+GZ = dict(AUTH, **{"Content-Type": "application/gzip"})
+old_wait = server.PUSH_WAIT
+server.PUSH_WAIT = 0.3
+server._PUSH_LOCK.acquire()
+try:
+    t0 = time.time()
+    code, r, d = req(WPORT, "POST", "/api/sync/push", gzip.compress(b'{"protocol": 2}'), GZ)
+    check(code == 503 and r.getheader("Retry-After") and "retry" in d.get("error", ""),
+          "push while another is parsed: 503 busy, retry (%s %s, %.1fs)" % (code, d, time.time() - t0))
+finally:
+    server._PUSH_LOCK.release()
+    server.PUSH_WAIT = old_wait
+code, _, d = req(WPORT, "POST", "/api/sync/push", gzip.compress(b'{"protocol": 2}'), GZ)
+check(code != 503, "push lock released again (%s)" % code)
+results = []
+
+
+def bomb_push():
+    try:
+        results.append(req(WPORT, "POST", "/api/sync/push", bomb, GZ)[0])
+    except OSError as e:
+        results.append(type(e).__name__)
+
+
+ts = [threading.Thread(target=bomb_push) for _ in range(3)]
+[t.start() for t in ts]
+[t.join() for t in ts]
+check(results == [413] * 3, "parallel gzip bombs all refused (%s)" % results)
+check(server.MAX_BODY <= 64 << 10 and server.MAX_TUNNEL_BODY >= 1 << 20, "body caps: API %d kB, /api/x %d kB"
+      % (server.MAX_BODY >> 10, server.MAX_TUNNEL_BODY >> 10))
+XH = dict(J, Origin="https://ah.example.org", **{"Sec-Fetch-Site": "same-origin"})
+# a state filled to webstate.LIMITS is ~630 kB: over MAX_BODY, must still pass through the tunnel
+big_state = {"known": {str(20000 + i): 1 for i in range(5000)},
+             "watch": {str(10000 + i): {"max_price": 10 ** 9, "note": "n" * 500} for i in range(500)}}
+xbody = json.dumps({"m": "GET", "p": "/api/watchlist", "s": big_state}).encode()
+check(len(xbody) > server.MAX_BODY, "big state is over MAX_BODY (%d kB)" % (len(xbody) >> 10))
+code, _, d = req(WPORT, "POST", "/api/x", xbody, XH, host="ah.example.org")
+check(code == 200 and "r" in d, "web: a maxed-out browser state passes /api/x (%s)" % code)
+code, _, d = req(WPORT, "POST", "/api/x", b" " * (server.MAX_TUNNEL_BODY + 1), XH, host="ah.example.org")
+check(code == 413, "web: /api/x body over MAX_TUNNEL_BODY refused (%s)" % code)
+code, _, d = req(WPORT, "PUT", "/api/settings", b" " * (server.MAX_BODY + 1), XH, host="ah.example.org")
+check(code == 413, "web: direct API body over MAX_BODY refused (%s)" % code)
+code, _, d = req(WPORT, "POST", "/api/x", b"[" * 100000 + b"]" * 100000, XH, host="ah.example.org")
+check(code == 400, "web: deeply nested /api/x body -> 400, not 500 (%s)" % code)
+old_wait = server.TUNNEL_WAIT
+server.TUNNEL_WAIT = 0.3
+held = 0
+for _ in range(server.MAX_TUNNEL_PARSE):  # a handler may still be finishing the previous request: wait for its slot
+    held += server._TUNNEL_SLOTS.acquire(timeout=5)
+try:
+    code, r, d = req(WPORT, "POST", "/api/x", json.dumps({"m": "GET", "p": "/api/settings"}).encode(), XH,
+                     host="ah.example.org")
+    check(code == 503 and r.getheader("Retry-After"), "web: all %d /api/x parse slots busy -> 503 (%s)" % (held, code))
+finally:
+    for _ in range(held):
+        server._TUNNEL_SLOTS.release()
+    server.TUNNEL_WAIT = old_wait
+code, _, d = req(WPORT, "POST", "/api/x", json.dumps({"m": "GET", "p": "/api/settings"}).encode(), XH,
+                 host="ah.example.org")
+check(code == 200, "web: /api/x works again once slots are free (%s)" % code)
+
+# ---------------------------------------------------------------- 2. slowloris: absolute deadlines, per-address cap
+old_ht, old_bt = server.HEADER_TIMEOUT, server.BODY_TIMEOUT_MIN
+server.HEADER_TIMEOUT, server.BODY_TIMEOUT_MIN = 1.0, 1.0
+
+
+def trickle(port, first, step=b"a", every=0.25, limit=6.0):
+    """Send `first`, then one byte every `every` s (well inside the per-recv timeout). -> seconds until the server
+    dropped the connection (or `limit`)."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=limit)
+    t0 = time.time()
+    s.sendall(first)
+    try:
+        while time.time() - t0 < limit:
+            s.sendall(step)
+            time.sleep(every)
+            s.setblocking(False)
+            try:
+                if s.recv(65536) == b"":
+                    break
+            except BlockingIOError:
+                pass
+            finally:
+                s.setblocking(True)
+    except OSError:
+        pass
+    s.close()
+    return time.time() - t0
+
+
+try:
+    dt = trickle(WPORT, b"GET / HTTP/1.1\r\nX-a: ")
+    check(dt < 3, "trickled headers dropped after the header deadline (%.1fs, deadline %ss, per-recv timeout %ss)"
+          % (dt, server.HEADER_TIMEOUT, server.SOCKET_TIMEOUT))
+    dt = trickle(LPORT, b"PUT /api/settings HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json\r\n"
+                 b"Content-Length: 1000\r\n\r\n" % LPORT, b" ")
+    check(dt < 3, "trickled body dropped after the body deadline (%.1fs)" % dt)
+    # an idle keep-alive connection is not cut by the header deadline: the clock starts at the first byte
+    c = http.client.HTTPConnection("127.0.0.1", LPORT, timeout=5)
+    c.connect()
+    codes = []
+    for _ in range(2):
+        time.sleep(1.5)
+        c.request("GET", "/api/settings")
+        r = c.getresponse()
+        r.read()
+        codes.append(r.status)
+    c.close()
+    check(codes == [200, 200], "idle keep-alive longer than the header deadline still served, twice (%s)" % codes)
+finally:
+    server.HEADER_TIMEOUT, server.BODY_TIMEOUT_MIN = old_ht, old_bt
+
+old_cap = server.MAX_CONN_PER_IP
+server.MAX_CONN_PER_IP = 2
+psrv, PPORT = start({"web": True}, web=True, connect=lambda: db.connect(os.path.join(tmp, "w.db")))
+server.MAX_CONN_PER_IP = old_cap
+holds = [socket.create_connection(("127.0.0.1", PPORT)) for _ in range(2)]
+time.sleep(0.3)
+out, closed = raw_exchange(PPORT, b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+check(out.startswith(b"HTTP/1.1 503") and b"nosniff" in out, "per-address cap: 3rd connection from one IP -> 503 (%r)"
+      % out[:30])
+holds.pop().close()
+time.sleep(0.3)
+out, closed = raw_exchange(PPORT, b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+check(out.startswith(b"HTTP/1.1 200"), "per-address slot freed (%r)" % out[:30])
+for h in holds:
+    h.close()
+
+# behind a trusted proxy: the cap applies per X-Forwarded-For address (the entry the proxy appended), per request
+gate = threading.Event()
+
+
+def gated():
+    gate.wait(10)
+    return db.connect(os.path.join(tmp, "w.db"))
+
+
+server.MAX_CONN_PER_IP = 1
+tsrv, TPORT = start({"web": True, "trust_proxy": "1"}, web=True, connect=gated)
+server.MAX_CONN_PER_IP = old_cap
+inflight = threading.Thread(target=req, args=(TPORT, "GET", "/api/settings", None,
+                                              {"X-Forwarded-For": "9.9.9.9, 1.2.3.4"}), daemon=True)
+inflight.start()
+time.sleep(0.3)
+code, _, _ = req(TPORT, "GET", "/healthz", None, {"X-Forwarded-For": "1.2.3.4"})
+check(code == 503, "trusted proxy: 2nd request from the same forwarded address -> 503 (%s)" % code)
+code, _, _ = req(TPORT, "GET", "/healthz", None, {"X-Forwarded-For": "1.2.3.4, 5.6.7.8"})
+check(code == 200, "trusted proxy: other forwarded address served, spoofed left entries ignored (%s)" % code)
+code, _, _ = req(TPORT, "GET", "/healthz", None, {"X-Forwarded-For": "5.6.7.8, 1.2.3.4"})
+check(code == 503, "trusted proxy: a forged first X-Forwarded-For entry does not dodge the cap (%s)" % code)
+code, _, _ = req(TPORT, "GET", "/healthz")
+check(code == 200, "trusted proxy: several connections from the proxy itself are fine (%s)" % code)
+gate.set()
+inflight.join(5)
+for _ in range(20):  # the handler leaves the count right after its answer went out
+    code, _, _ = req(TPORT, "GET", "/healthz", None, {"X-Forwarded-For": "1.2.3.4"})
+    if code == 200:
+        break
+    time.sleep(0.1)
+check(code == 200, "trusted proxy: forwarded address freed after its request (%s)" % code)
+check(server._trusted_hops("1") == 1 and server._trusted_hops("2") == 2 and server._trusted_hops("") == 0
+      and server._trusted_hops("no") == 0 and server._trusted_hops("true") == 1, "AHTOOL_TRUST_PROXY parsing")
+
+# ---------------------------------------------------------------- 3. reverse proxy: Origin vs Host / public URL
+X = json.dumps({"m": "GET", "p": "/api/settings"}).encode()
+nginx_host = "127.0.0.1:%d" % WPORT
+code, _, _ = req(WPORT, "POST", "/api/x", X, dict(J, Origin="https://ah.example.net", **{"Sec-Fetch-Site": "same-origin"}),
+                 host=nginx_host)
+check(code == 200, "web: nginx default (Host rewritten, no X-Forwarded-Host) + Sec-Fetch-Site same-origin (%s)" % code)
+code, _, _ = req(WPORT, "POST", "/api/x", X, dict(J, Origin="https://ah.example.net"), host="ah.example.net:443")
+check(code == 200, "web: Host ah.example.net:443 matches Origin https://ah.example.net (%s)" % code)
+code, _, _ = req(WPORT, "POST", "/api/x", X, dict(J, Origin="http://ah.example.net"), host="ah.example.net:80")
+check(code == 200, "web: Host :80 matches an http Origin (%s)" % code)
+code, _, _ = req(WPORT, "POST", "/api/x", X, dict(J, Origin="https://ah.example.net"), host="ah.example.net:8443")
+check(code == 403, "web: different port is another origin (%s)" % code)
+code, _, _ = req(WPORT, "POST", "/api/x", X, dict(J, Origin="https://ah.example.net"), host=nginx_host)
+check(code == 403, "web: Host rewritten, no Sec-Fetch-Site, no public URL configured -> refused (%s)" % code)
+code, _, _ = req(WPORT, "POST", "/api/x", X, dict(J, Origin="https://evil.example", **{"Sec-Fetch-Site": "cross-site"}),
+                 host=nginx_host)
+check(code == 403, "web: cross-site still refused behind a proxy (%s)" % code)
+code, _, _ = req(WPORT, "POST", "/api/x", X, dict(J, Origin="https://ah.example.net", **{"Sec-Fetch-Site": "same-site"}),
+                 host=nginx_host)
+check(code == 403, "web: same-site (a sibling subdomain) refused (%s)" % code)
+code, _, _ = req(WPORT, "POST", "/api/x", X, dict(J, Origin="null"), host=nginx_host)
+check(code == 403, "web: Origin null refused (%s)" % code)
+usrv, UPORT = start({"web": True, "public_url": "https://ah.example.net/"}, web=True,
+                    connect=lambda: db.connect(os.path.join(tmp, "w.db")))
+code, _, _ = req(UPORT, "POST", "/api/x", X, dict(J, Origin="https://ah.example.net"), host="127.0.0.1:%d" % UPORT)
+check(code == 200, "web: Origin = AHTOOL_PUBLIC_URL accepted whatever Host the proxy sends (%s)" % code)
+code, _, _ = req(UPORT, "POST", "/api/x", X, dict(J, Origin="https://ah.example.net:443"), host="127.0.0.1")
+check(code == 200, "web: public URL compared with default ports (%s)" % code)
+for bad in ("http://ah.example.net", "https://ah.example.net:8443", "https://evil.example", "https://ah.example.net.evil"):
+    code, _, _ = req(UPORT, "POST", "/api/x", X, dict(J, Origin=bad), host="127.0.0.1:%d" % UPORT)
+    check(code == 403, "web: Origin %s is not the public URL (%s)" % (bad, code))
+code, _, _ = req(LPORT, "PUT", "/api/settings", b"{}", dict(J, Origin="http://evil.example", **{"Sec-Fetch-Site": "same-origin"}))
+check(code == 403, "local app: Origin still checked even with Sec-Fetch-Site same-origin (%s)" % code)
+check(server.split_hostport("Ah.Example.Net:443", "https") == ("ah.example.net", 443)
+      and server.split_hostport("[::1]:8642") == ("::1", 8642) and server.split_hostport("a:b") is None
+      and server.parse_origin("https://x.y") == ("https", "x.y", 443) and server.parse_origin("null") is None
+      and server.parse_origin("https://u@x.y") is None, "host/origin normalisation helpers")
+
+# ---------------------------------------------------------------- 4. malformed header lines
+for name, hdrs in (("space before colon", b"X-Foo : bar\r\nContent-Length: 2\r\n"),
+                   ("space before colon, TE hidden", b"X-Foo : bar\r\nTransfer-Encoding: chunked\r\n"),
+                   ("line without colon", b"garbage\r\nContent-Length: 2\r\n"),
+                   ("obs-fold", b"Content-Length: 2\r\nX-Long: a\r\n b\r\n"),
+                   ("empty name", b":x\r\nContent-Length: 2\r\n")):
+    out, closed = raw_exchange(LPORT, b"PUT /api/settings HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json"
+                                      b"\r\n%s\r\n{}GET /api/settings HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n"
+                               % (LPORT, hdrs, LPORT))
+    check(out.startswith(b"HTTP/1.1 400") and out.count(b"HTTP/1.1 ") == 1 and closed,
+          "malformed header (%s): 400, closed, nothing after it parsed (%r)" % (name, out[:30]))
+out, closed = raw_exchange(LPORT, b"GET /api/settings HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n%s\r\n"
+                           % (LPORT, b"".join(b"X-%d: %s\r\n" % (i, b"a" * 1000) for i in range(40))))
+check(out.startswith(b"HTTP/1.1 431") and closed, "headers over MAX_HEADER_BYTES: 431 (%r)" % out[:30])
+
+# ---------------------------------------------------------------- 5. base-class error pages carry the security headers
+for name, raw, want in (("bad request line", b"GARBAGE\r\n\r\n", b"400"),
+                        ("bad version", b"GET / HTTP/9.9\r\nHost: x\r\n\r\n", b"505"),
+                        ("unknown method", b"PATCH / HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n" % LPORT, b"501"),
+                        ("long URL", b"GET /" + b"a" * (server.MAX_REQUEST_LINE + 10) + b" HTTP/1.1\r\n\r\n", b"414"),
+                        ("long header", b"GET / HTTP/1.1\r\nX: " + b"a" * 70000 + b"\r\n\r\n", b"431"),
+                        ("HTTP/0.9", b"GET /\r\n\r\n", b"400")):
+    for port in (LPORT, WPORT):
+        out, closed = raw_exchange(port, raw)
+        head = out.split(b"\r\n\r\n")[0]
+        check(out.startswith(b"HTTP/1.1 " + want) and b"X-Content-Type-Options: nosniff" in head
+              and b"X-Frame-Options: DENY" in head and b"Content-Security-Policy: default-src 'none'" in head
+              and b"application/json" in head and b"<html" not in out.lower() and b"Python" not in head and closed,
+              "%s (%s): %s with security headers, JSON, closed (%r)"
+              % (name, "web" if port == WPORT else "local", want.decode(), out[:60]))
+
+for s in (lsrv, wsrv, bsrv, csrv, psrv, tsrv, usrv):
     s.shutdown()
 print("\n%d failure(s)" % len(fails))
 sys.exit(1 if fails else 0)
