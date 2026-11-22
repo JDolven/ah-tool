@@ -905,6 +905,8 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                 raise NotFound("not available in the web version")
             realm = qs.get("realm") or None
             A = analytics
+            if realm and web and realm not in A.list_realms(conn):
+                realm = None  # the web version shows only realms the owner has data for (contributors add none)
             body = None
             if method in ("POST", "PUT", "DELETE") and raw.strip():
                 try:

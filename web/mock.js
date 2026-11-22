@@ -559,11 +559,13 @@ function itemRow(id) {
 // ---------------------------------------------------------------- endpoints
 let ingestTs = Math.floor(Date.now() / 1000) - 1260;
 
-function status() {
+const REALMS = [REALM, `${REALM} Neutral`];
+
+function status(realm) {
   return {
     unseen_alerts: ALERTS.filter((a) => !a.seen).length,
-    realm: REALM,
-    realms: [REALM],
+    realm: REALMS.includes(realm) ? realm : REALM,
+    realms: REALMS,
     last_ingest_ts: ingestTs,
     file_mtime: ingestTs - 30,
     items_priced: CURRENT.size,
@@ -1330,7 +1332,7 @@ export function mockApi(method, fullPath, body) {
   if (method === 'POST' && p === '/api/alerts/evaluate') return { fired: evaluateAlerts() };
   if (method === 'POST' && p === '/api/notify/test') return { ok: true, sent: SETTINGS.notify_windows };
 
-  if (p === '/api/status') return status();
+  if (p === '/api/status') return status(q.get('realm'));
   if (p === '/api/items/search') return search(q.get('q') || '', Number(q.get('limit')) || 50);
   if ((m = p.match(/^\/api\/item\/(\d+)$/))) return item(Number(m[1]));
   if ((m = p.match(/^\/api\/tooltip\/(\d+)$/))) {
