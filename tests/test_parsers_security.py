@@ -80,6 +80,86 @@ n = staticdata.update_vendor_from_cache(conn, {"1": float("inf"), "2": float("na
 check(n == 2, "vendor cache keeps only finite in-range prices (%d)" % n)
 check(staticdata._int(float("inf")) == 0 and staticdata._int("1e999") == 0, "staticdata._int(inf) -> default")
 
+# ---- luaparse: comment skipping is linear (unterminated long comments used to rescan to EOF each time)
+for bad in (b"--[[\n" * 250000, b"X=1\n" + b"--[==[ ]] \n" * 100000):
+    t0 = time.time()
+    check(raises(lambda: luaparse.parse(bad), luaparse.LuaParseError), "unterminated long comment -> LuaParseError")
+    check(time.time() - t0 < 1, "1 MB of unterminated comments rejected in %.2fs" % (time.time() - t0))
+t0 = time.time()
+v = luaparse.parse(b"X={" + b"--[[c]] --[==[ ]] ]==] -- line\n1," * 40000 + b"}")["X"]
+check(len(v) == 40000 and time.time() - t0 < 2, "1.6 MB of comments parse linearly (%.2fs)" % (time.time() - t0))
+check(luaparse.parse(b"--[[a\n]]X=--[=[ ]] ]=]1 -- c\n--\nY=2--x") == {"X": 1, "Y": 2}, "comment forms unchanged")
+
+# ---- ingest: non-finite / huge numbers skip the bad values, never the whole import
+from ahtool import ingest  # noqa: E402
+import struct  # noqa: E402
+
+
+def _bs(t):
+    t = t.encode()
+    return bytes([0x40 + len(t)]) + t
+
+
+def _luastr(b):
+    return '"' + "".join("\\%d" % x for x in b) + '"'
+
+
+def _cb_item(m_bytes):
+    return bytes([0xa2]) + _bs("m") + m_bytes + _bs("h") + bytes([0xa1]) + _bs("2511") + bytes([0x18, 100])
+
+
+_blob = bytes([0xa4]) + _bs("1") + _cb_item(b"\xfb" + struct.pack(">d", float("inf"))) \
+    + _bs("2") + _cb_item(b"\xfb" + struct.pack(">d", float("nan"))) \
+    + _bs("3") + _cb_item(b"\x1b" + b"\xff" * 8) + _bs("4") + _cb_item(b"\x18\x07")
+_lua = ('AUCTIONATOR_PRICE_DATABASE = { ["__dbversion"]=8, ["Cb"] = %s, ["Lu"] = {\n'
+        ' ["10"] = { ["m"]=-inf, ["h"]={["2511"]=-inf} },\n'
+        ' ["11"] = { ["m"]=18446744073709551615, ["h"]={["2511"]=1e300, ["99999999"]=5}, ["a"]={["2511"]=1e300} },\n'
+        ' ["12"] = { ["m"]=0x7FFFFFFFFFFFFFFFFFFF, ["h"]={["2511"]=50} },\n'
+        ' ["13"] = { ["m"]=42, ["h"]={["2510"]=40, ["2511"]=42}, ["a"]={["2511"]=3} },\n'
+        ' [99999999999999999999] = { ["m"]=1, ["h"]={["2511"]=1} },\n'
+        '} }\n'
+        'AUCTIONATOR_POSTING_HISTORY = { ["13"] = { {["price"]=1e300, ["time"]=1}, {["price"]=-inf, ["time"]=1},'
+        ' {["price"]=5, ["time"]=18446744073709551615}, {["price"]=7, ["time"]=100, ["quantity"]=2} } }\n') % _luastr(_blob)
+_ap = os.path.join(tmp, "Auctionator.lua")
+with open(_ap, "w") as f:
+    f.write(_lua)
+iconn = db.connect(os.path.join(tmp, "ing.db"))
+try:
+    res = ingest.ingest(iconn, {"savedvariables": _ap}, force=True)
+except Exception as e:  # noqa: BLE001
+    res = None
+    check(False, "ingest with inf/huge numbers aborted: %r" % e)
+if res:
+    pc = {(r[0], r[1]): (r[2], r[3]) for r in iconn.execute("SELECT realm,item_id,price,available FROM price_current")}
+    check(pc.get(("Cb", 4)) == (7, None), "CBOR good item kept %s" % pc)
+    check(pc.get(("Cb", 1)) == (100, None) and pc.get(("Cb", 3)) == (100, None) and pc.get(("Cb", 2)) == (100, None),
+          "CBOR inf/NaN/2^64-1 'm' falls back to the daily high %s" % pc)
+    check(("Lu", 10) not in pc, "-inf price item skipped")
+    check(pc.get(("Lu", 11)) is None and pc.get(("Lu", 12)) == (50, None), "huge m / daily values dropped %s" % pc)
+    check(pc.get(("Lu", 13)) == (42, 3), "good Lua item kept %s" % pc)
+    check(all(0 < r[0] <= ingest.PRICE_MAX for r in iconn.execute("SELECT price FROM price_current")), "prices capped")
+    check([tuple(r) for r in iconn.execute("SELECT * FROM postings")] == [(13, 100, 7, 2)], "only the valid posting kept")
+    check(iconn.execute("SELECT COUNT(*) FROM price_daily WHERE day > ? OR high > ?",
+                        (ingest.DAY_MAX, ingest.PRICE_MAX)).fetchone()[0] == 0, "daily rows range-checked")
+
+# ---- ingest: the user's own import vs. rows pulled from the web version
+_now = int(time.time())
+_today = ingest._today(_now)
+with open(_ap, "w") as f:
+    f.write('AUCTIONATOR_PRICE_DATABASE = { ["R"] = { ["1"] = { ["m"]=10, ["h"]={["%d"]=10} },'
+            ' ["2"] = { ["m"]=20, ["h"]={["%d"]=20} }, ["3"] = { ["m"]=30, ["h"]={["%d"]=30} } } }\n'
+            % (_today, _today - 1, _today - 1))
+os.utime(_ap, (_now, _now))
+iconn.executemany("INSERT INTO price_current(realm,item_id,price,available,last_day,updated_at) VALUES('R',?,?,1,?,?)",
+                  [(1, 999, _today + 1, _now + 5000),  # future-dated pulled row: never blocks the own import
+                   (2, 888, _today, _now + 100),       # newer genuine observation from another player: kept
+                   (3, 777, _today - 2, _now + 100)])  # older day: own import wins
+iconn.commit()
+ingest.ingest(iconn, {"savedvariables": _ap}, force=True)
+got = {r[0]: r[1] for r in iconn.execute("SELECT item_id, price FROM price_current WHERE realm='R'")}
+check(got == {1: 10, 2: 888, 3: 30}, "own import vs pulled rows %s" % got)
+iconn.close()
+
 # ---- market: auctions with count=0 must not divide by zero
 market.ensure_schema(conn)
 now = int(time.time())
