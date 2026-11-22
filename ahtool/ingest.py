@@ -10,7 +10,7 @@ from . import cbor, config, luaparse, staticdata
 from . import db as dbmod
 
 EPOCH = datetime.date(2020, 1, 1)
-_INT_RE = re.compile(r"\d+")
+_INT_RE = re.compile(r"[0-9]+")  # ASCII only: \d also matches other scripts' digits
 
 
 def day_to_date(day):
@@ -27,6 +27,7 @@ def _decode_blob(v):
 # Range caps for numbers read from the SavedVariables file (Lua or CBOR may hold inf/NaN, 2^64-1, ...). PRICE_MAX
 # matches the unit-price cap of the sync SPEC (copper; 2^31-1 is ~214k gold, far above any real unit price).
 PRICE_MAX = 2 ** 31 - 1
+ITEM_MAX = 2 ** 31 - 1
 AVAIL_MAX = 2 ** 31 - 1
 DAY_MAX = 100000      # days since 2020-01-01 (year ~2293); keeps day_to_date() and SQLite INTEGER safe
 TS_MAX = 2 ** 40      # unix seconds
@@ -66,14 +67,19 @@ def _today(now):
 
 
 def _item_id(key):
+    """Item id from a table key, or None. Only ASCII digits, and only ids in 1..2^31-1."""
+    if isinstance(key, bool):
+        return None
     if isinstance(key, int):
-        return key
+        return _int_in(key, 1, ITEM_MAX)
     if not isinstance(key, str):
         return None
-    if key.isdigit():
-        return int(key)
+    if key.isascii() and key.isdigit():
+        return _int_in(int(key), 1, ITEM_MAX) if len(key) <= 10 else None
     m = _INT_RE.search(key)
-    return int(m.group()) if m and key != "version" else None
+    if not m or key == "version" or len(m.group()) > 10:
+        return None
+    return _int_in(int(m.group()), 1, ITEM_MAX)
 
 
 def _realm_items(realm_val):

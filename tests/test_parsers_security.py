@@ -205,5 +205,28 @@ check(sdb._eval("9**9**9**9", 1) is None and sdb._eval("$s1**$s1**$s1**$s1", 1) 
 check(time.time() - t0 < 1, "power tower rejected quickly")
 check(sdb._eval("$s1/0", 1) is None, "division by zero -> None")
 
+# ---- round 3: item keys, auction counts, truncated scans, pulled scan n
+from ahtool import sync  # noqa: E402
+check(ingest._item_id("2589") == 2589 and ingest._item_id(2589) == 2589, "normal item key")
+check(all(ingest._item_id(k) is None for k in ("\u00b2", "\u0663", "9" * 5000, "9" * 30, -5, 0, True, 2 ** 40)),
+      "odd/oversized item keys -> None, never an exception")
+check(market.parse_rows("2589,0,10001,2000,1000,0,4,A;2589,0,20,2000,1000,0,4,B") == [(2589, 0, 20, 2000, 1000, 0, 4, "B")],
+      "auction count over MAX_ROW_COUNT skipped")
+NOW = int(time.time())
+d3 = tempfile.mkdtemp()
+c3 = db.connect(os.path.join(d3, "l.db"))
+market.ensure_schema(c3)
+sync.apply_pull(c3, {"scans": [{"scan": [NOW - 3000, "Home", "Alliance", "addon", 1, sync.QTY_MAX, 0, 1, 1],
+                                "items": [[2589, 1, 1, 1, 1, 1]], "auctions": [[2589, 0, 1, 1, 1, 0, 4, "x"]], "sales": []}]})
+lua3 = os.path.join(d3, "AHToolLogger.lua")
+scan3 = '{ ["t"] = %d, ["realm"] = "Home", ["faction"] = "Alliance", ["char"] = "Me", ["src"] = "full", ["total"] = 2, ["n"] = 2, ["d"] = "%s" }'
+with open(lua3, "w") as f:
+    f.write('AHToolLoggerDB = { ["scans"] = { %s } }\n' % (scan3 % (NOW - 1000, "2589,0,20,2000,1500,0,4,Bob;2589,0,10,900,800,0,4,Ann")))
+market.ingest(c3, {"logger_savedvariables": lua3}, force=True)
+own = c3.execute("SELECT partial FROM ah_scans WHERE source<>'web'").fetchall()
+check(own and own[0][0] == 0, "a pulled scan with a huge n does not make own scans partial")
+check(market.latest_scan(c3, "Home")["source"] == "full", "latest_scan is the own scan")
+c3.close()
+
 print("\n%d failure(s)" % len(fails))
 sys.exit(1 if fails else 0)
