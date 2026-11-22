@@ -389,7 +389,7 @@ Auctionator only gives one min price per scan + daily max quantity, so outliers 
   `snapshots` (insert or ignore, unique realm/item/ts), `scans:[{scan,items,auctions,sales}]` (at most
   `MAX_SCANS_PER_BATCH` = 50 new scans stored per batch, the rest counts as `applied.scans_deferred` and is resent by
   the PC next time; a scan with ts over now+`SCAN_TS_SLACK` (60 s) is skipped and counted in `scans_deferred` too, the
-  client does not send such scans), `scan_updates:[{key,drop_raw?,sales?}]`. Unknown keys (top level, in a
+  client does not send such scans), `scan_updates:[{key,drop_raw?,sales?,auctions_from?,more_auctions?}]`. Unknown keys (top level, in a
   scan / scan update object, in meta) -> 400. **Per-key prices:** server tables `price_daily_src` /
   `price_current_src` hold each key's own rows (src_key, -1 = from before keys were tracked); `price_daily` /
   `price_current` are the merge, recomputed for every realm/item(/day) a push or purge touches: daily = min low, max
@@ -423,6 +423,11 @@ Auctionator only gives one min price per scan + daily max quantity, so outliers 
   replaced. The client leaves out local rows that would be refused and splits price_current/snapshots/scan_updates
   into MAX_BATCH_ROWS batches. **Ownership:** server-only nullable column `src_key` on price_daily, price_current,
   snapshots, ah_scans = the key id that pushed / last changed the row (0 = AHTOOL_SYNC_TOKEN, NULL = before this
+  column existed). A scan with more rows than one batch is pushed in parts: the scan with as many auctions as fit,
+  then `scan_updates` `{key, auctions_from, more_auctions}` with the rest in order. The server appends a part only to
+  the pusher's own raw-kept scan and only when `auctions_from` equals the auctions it already has (else
+  `applied.auction_parts_skipped`), so a resent part is never stored twice. `/api/sync/state` scans carry a 6th
+  value, the stored auction count, so the next push sends only the missing parts.
   column existed). `scan_updates` only apply to scans with the pusher's own src_key (owners: any); others count as
   `applied.scan_updates_refused`. `ahkey purge <name|id>` (`keys.purge` -> `sync.purge_key`) deletes the key's rows
   (scans with their items/auctions/sales, its per-key price rows - merged rows are recomputed from the other keys -,
