@@ -17,6 +17,7 @@ with a faction's prices.
 Scans pulled from the web version (source 'web') are someone else's: their prices arrive through the price sync.
 """
 from .ingest import MERGE_DAILY, _today
+from .schema import add_column
 
 FACTIONS = ("Alliance", "Horde", "Neutral")
 SCHEMA_COLUMN = "priced"
@@ -25,7 +26,7 @@ SCHEMA_COLUMN = "priced"
 def ensure_schema(conn):
     cols = [r[1] for r in conn.execute("PRAGMA table_info(ah_scans)")]
     if cols and SCHEMA_COLUMN not in cols:
-        conn.execute("ALTER TABLE ah_scans ADD COLUMN priced INTEGER NOT NULL DEFAULT 0")
+        add_column(conn, "ah_scans", "priced INTEGER NOT NULL DEFAULT 0")
 
 
 def known_realms(cur):

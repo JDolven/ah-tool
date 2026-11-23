@@ -19,8 +19,13 @@ general.
 Note: this is for **Auctionator**, not Auctioneer – Auctioneer data is not read.
 
 ## Setup
+The easiest way: download `ahtool-windows.zip` from the *Run it yourself* page of a site running the web version
+(below). It contains the app, the AH Tool Logger addon and Python, so nothing has to be installed: unzip it and
+double-click `start.bat`. From the source code:
+
 1. Install Python 3.12 or newer and the addons above in WoW, and log in once with Auctionator enabled.
-2. Copy `config.example.json` to `config.json` and set:
+2. Start the app once: it looks for your WoW folder and writes `config.json` itself. If it cannot find it, or to
+   change it, copy `config.example.json` to `config.json` and set:
    - `savedvariables` – your `...\WTF\Account\<ACCOUNT>\SavedVariables\Auctionator.lua`
    - `addons_dir` – your `...\Interface\AddOns` folder (recipes are read from AtlasLootClassic there).
 3. Optional: copy `addon/AHToolLogger` into `Interface/AddOns` for full scans and sales estimates (see below).
@@ -192,6 +197,15 @@ blocks nobody: at most 3 bodies (plus 1 for the owner) are held at once and each
 contributor's batch that would build more JSON values than any valid batch can is refused before it is parsed. At
 most 2 pull pages are built at once (the PC retries a 503), and a page holds about 50,000 scan rows at most - a large
 scan is split over several pages. Give the container at least 1 GB of memory.
+
+**Downloads (`#/download`, *Run it yourself*)**: the image also builds `ahtool-windows.zip` (the app, the addon and
+the official Windows embeddable Python, downloaded from python.org during `docker build`) and
+`ahtool-logger-addon.zip`, served at `/download/`. Choose the Python version with
+`--build-arg PYTHON_EMBED_VERSION=3.13.5` and pin it with `--build-arg PYTHON_EMBED_SHA256=<sha256 from python.org>`
+(recommended: the build then fails on any other file). Without access to python.org the package is built without
+Python and the page asks for an installed one. The zips are built from explicit file lists in `ahtool/downloads.py`,
+so config.json, keys and data never end up in them. By hand: `python -m ahtool.downloads build downloads
+--python-version 3.13.5`.
 
 **Push from your PC**: add to config.json
 

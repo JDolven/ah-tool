@@ -16,6 +16,7 @@ import * as leveling from './js/pages/leveling.js';
 import * as activity from './js/pages/activity.js';
 import * as sales from './js/pages/sales.js';
 import * as report from './js/pages/report.js';
+import * as download from './js/pages/download.js';
 import { toast, installGlobalActions, alertKindBadge, closePopover } from './js/ui.js';
 import * as browserNotify from './js/notify.js';
 
@@ -37,6 +38,7 @@ const ROUTES = [
   { re: /^\/sales\/?$/, nav: 'sales', title: 'My Sales', fn: sales.render },
   { re: /^\/stats\/?$/, nav: 'stats', title: 'Statistics', fn: stats.render },
   { re: /^\/postings\/?$/, nav: 'postings', title: 'My auctions', fn: postings.render },
+  { re: /^\/download\/?$/, nav: 'download', title: 'Run it yourself', fn: download.render },
 ];
 
 // Web version: pages built on your own trades do not exist there (that data never leaves your PC).
@@ -49,7 +51,12 @@ if (WEB) {
   const rb = document.getElementById('refresh-btn');
   if (rb) rb.title = 'Reload the latest prices from the server';
   const foot = document.querySelector('.foot');
-  if (foot) foot.insertAdjacentHTML('beforeend', ' · Your professions, lists and alerts are saved in this browser only');
+  if (foot) foot.insertAdjacentHTML('beforeend', ' · Your professions, lists and alerts are saved in this browser only · <a href="#/download">Run it yourself</a>');
+} else {
+  // Downloads exist only on the web version (the local app is what they contain).
+  document.querySelector('.nav [data-nav="download"]')?.remove();
+  const i = ROUTES.findIndex((r) => r.nav === 'download');
+  if (i >= 0) ROUTES.splice(i, 1);
 }
 
 let routeToken = 0;

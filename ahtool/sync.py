@@ -48,6 +48,7 @@ import urllib.parse
 import urllib.request
 
 from .ingest import MERGE_DAILY
+from .schema import add_column
 
 PROTOCOL = 2
 MAX_BATCH_ROWS = 150000
@@ -465,7 +466,7 @@ def _ensure_client_schema(conn):
     cols = [r[1] for r in conn.execute("PRAGMA main.table_info(ah_scans)")]
     if cols and "sync_origin" not in cols:
         with conn:
-            conn.execute("ALTER TABLE main.ah_scans ADD COLUMN sync_origin INTEGER")
+            add_column(conn, "main.ah_scans", "sync_origin INTEGER")
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_pulled_snap'").fetchone():
         return
     conn.executescript(CLIENT_SCHEMA)
@@ -733,7 +734,7 @@ def ensure_schema(conn):
                               ("src_key", SRC_TABLES + ("ingests",), "src_key INTEGER")):
         for t in tables:
             if cols not in [r[1] for r in conn.execute("PRAGMA main.table_info(%s)" % t)]:
-                conn.execute("ALTER TABLE main.%s ADD COLUMN %s" % (t, ddl))
+                add_column(conn, "main." + t, ddl)
     conn.executescript(SERVER_SCHEMA)
     cur = conn.cursor()
     cur.execute("BEGIN IMMEDIATE")

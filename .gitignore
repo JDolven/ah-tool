@@ -17,3 +17,6 @@ desktop.ini
 
 # web version
 .env
+
+# built downloads (python -m ahtool.downloads build downloads)
+downloads/

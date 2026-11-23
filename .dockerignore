@@ -4,10 +4,10 @@ config.json
 *.db
 *.db-*
 __pycache__
-addon
 .env
 .env.*
 *.log
 .github
 .vscode
 .idea
+downloads
