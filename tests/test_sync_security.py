@@ -281,6 +281,11 @@ code, res = push({"price_current": [pc(realm="Evil", iid=i) for i in range(1, 60
 check(code == 200 and count("SELECT realm FROM ingests ORDER BY id DESC LIMIT 1") == "Evil",
       "contributor push made the newest ingest row 'Evil'")
 check(analytics.get_realm(w) == "Home", "web default realm stays the owner's (%s)" % analytics.get_realm(w))
+code, res = x("GET", "/api/status?realm=Evil")
+check(code == 200 and res["r"]["realm"] == "Home" and "Evil" not in res["r"]["realms"],
+      "a visitor cannot pick a realm only a contributor pushed (%s)" % res["r"]["realm"])
+code, res = x("GET", "/api/status?realm=Home")
+check(code == 200 and res["r"]["realm"] == "Home", "an owner realm can be picked")
 code, res = x("GET", "/api/status")
 check(code == 200 and "Evil" not in json.dumps(res.get("r", {}).get("realm")), "status not on Evil (%s)" % (
     res.get("r", {}).get("realm")))

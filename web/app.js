@@ -1,5 +1,5 @@
 // AH Tool – single-page app entry (ES module).
-import { api, clearCache, MOCK, WEB } from './js/api.js';
+import { api, clearCache, MOCK, WEB, getRealm, setRealm } from './js/api.js';
 import { esc, money, pct, itemName, qClass, relTime, dateLong, debounce, isNum, ttAttr } from './js/util.js';
 import { installTooltips } from './js/tooltip.js';
 import { destroyAll, rerenderAll } from './js/charts.js';
@@ -300,11 +300,27 @@ function renderSideStatus(s) {
     el.innerHTML = '<span class="dot dot-err"></span> Cannot reach the server';
     return;
   }
+  const realms = Array.isArray(s.realms) ? s.realms.filter((r) => typeof r === 'string' && r) : [];
+  // a remembered realm the server no longer lists (renamed key, owner data gone): back to the default
+  if (getRealm() && !realms.includes(getRealm())) setRealm('');
+  const dot = `<span class="dot ${s.items_priced ? 'dot-ok' : 'dot-idle'}"></span>`;
+  const realmHtml = realms.length > 1
+    ? `<label class="ss-realm">${dot}<span class="sr-only">Realm</span><select id="realm-sel" class="ss-realm-sel" title="Show prices for this realm">${
+      (realms.includes(s.realm) ? realms : [s.realm, ...realms]).filter(Boolean).map((r) => `<option value="${esc(r)}" ${r === s.realm ? 'selected' : ''}>${esc(r)}</option>`).join('')}</select></label>`
+    : `<div class="ss-realm">${dot}${esc(s.realm || 'No realm')}</div>`;
   el.innerHTML = `
-    <div class="ss-realm"><span class="dot ${s.items_priced ? 'dot-ok' : 'dot-idle'}"></span>${esc(s.realm || 'No realm')}</div>
+    ${realmHtml}
     <div class="ss-line">Scanned ${dateLong(s.latest_date)}</div>
     <div class="ss-line muted">${WEB ? `Updated ${relTime(s.last_push_ts)}` : `Imported ${relTime(s.last_ingest_ts)}`}</div>`;
 }
+
+document.getElementById('side-status').addEventListener('change', (e) => {
+  if (e.target.id !== 'realm-sel') return;
+  setRealm(e.target.value);
+  lastIngestTs = null; // another realm has another last import: no "new data" toast
+  pollStatus(true);
+  rerender();
+});
 
 async function pollStatus(initial = false) {
   try {

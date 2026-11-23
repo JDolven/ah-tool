@@ -192,6 +192,7 @@ check("notify encode", base64.b64decode(notify.encode_command("aæ")) == "aæ".e
 # defaults
 check("myprofessions empty", ok("GET", "/api/myprofessions") == [])
 check("status unseen_alerts", j("/api/status")["unseen_alerts"] == 0)
+check("status follows ?realm=", j("/api/status?realm=Elsewhere")["realm"] == "Elsewhere")
 check("settings defaults", ok("GET", "/api/settings") == {"notify_windows": True, "notify_vendor_flip_min": 0,
                                                           "notify_my_reagents": False, "shopping_max_markup": 0.15})
 check("professions mine default", all(x["mine"] is False and x["my_skill"] is None for x in j("/api/professions")))

@@ -18,6 +18,38 @@ export function clearCache() {
   cache.clear();
 }
 
+// ---------------------------------------------------------------- chosen realm
+// The realm picked in the sidebar is remembered in this browser and sent with every call (?realm=...). Empty means
+// the server's default (the realm with the newest data; on the web version the owner's).
+const REALM_KEY = 'ahtool-realm';
+
+export function getRealm() {
+  try {
+    return localStorage.getItem(REALM_KEY) || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+export function setRealm(realm) {
+  try {
+    if (realm) localStorage.setItem(REALM_KEY, realm);
+    else localStorage.removeItem(REALM_KEY);
+  } catch (e) {
+    /* storage disabled: the choice lasts until the page is closed */
+    memRealm = realm || '';
+  }
+  clearCache();
+}
+
+let memRealm = '';
+
+function withRealm(path) {
+  const realm = getRealm() || memRealm;
+  if (!realm || !path.startsWith('/api/') || path.startsWith('/api/sync') || /[?&]realm=/.test(path)) return path;
+  return `${path}${path.includes('?') ? '&' : '?'}realm=${encodeURIComponent(realm)}`;
+}
+
 // ---------------------------------------------------------------- web version
 // The shared web version keeps nothing personal on the server: professions, known recipes, shopping list, watchlist,
 // settings and alerts live here in localStorage and are sent along with every call (POST /api/x). The server answers
@@ -102,6 +134,7 @@ async function tunnelOnce(method, path, body) {
 }
 
 async function request(method, path, body) {
+  path = withRealm(path);
   if (MOCK) return mockCall(method, path, body);
   if (WEB) return tunnel(method, path, body);
   const opts = { method, headers: { Accept: 'application/json' } };
