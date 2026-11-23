@@ -206,11 +206,6 @@ def main(argv=None):
     finally:
         if tmp and os.path.exists(tmp):
             os.remove(tmp)
-    try:
-        m = build(a.out_dir, embed, a.python_version)
-    except (BuildError, zipfile.BadZipFile) as e:
-        print("downloads: %s" % e)
-        return 1
     for f in m["files"]:
         print("%-26s %8d kB  sha256 %s" % (f["name"], f["size"] // 1024, f["sha256"]))
     print("Python included: %s" % (m["python"]["version"] if m["python"] else "no"))

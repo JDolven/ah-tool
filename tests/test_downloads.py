@@ -93,13 +93,18 @@ except downloads.BuildError:
 check(downloads.patch_pth("a.zip\n.\n..\n").count("..") == 1, "._pth patch is idempotent")
 
 # ---------------------------------------------------------------- the real tree builds too
-real = downloads.build(os.path.join(tmp, "real"))
-with zipfile.ZipFile(os.path.join(tmp, "real", downloads.WINDOWS_ZIP)) as z:
-    rn = set(z.namelist())
-check("AHTool/ahtool/downloads.py" in rn and "AHTool/web/js/pages/download.js" in rn
-      and "AHTool/addon/AHToolLogger/AHToolLogger.lua" in rn, "repository builds a complete package")
-check(not any(n.startswith("AHTool/tests/") or n.endswith("config.json") or "/data/" in n for n in rn),
-      "repository package has no tests, config.json or data")
+# Only from a full checkout: the web image's server stage has no addon/, run.py or start.bat (its downloads stage
+# builds the real zips from them, and fails the image build if that goes wrong).
+if os.path.isfile(os.path.join(downloads.ROOT, "addon", "AHToolLogger", "AHToolLogger.toc")):
+    real = downloads.build(os.path.join(tmp, "real"))
+    with zipfile.ZipFile(os.path.join(tmp, "real", downloads.WINDOWS_ZIP)) as z:
+        rn = set(z.namelist())
+    check("AHTool/ahtool/downloads.py" in rn and "AHTool/web/js/pages/download.js" in rn
+          and "AHTool/addon/AHToolLogger/AHToolLogger.lua" in rn, "repository builds a complete package")
+    check(not any(n.startswith("AHTool/tests/") or n.endswith("config.json") or "/data/" in n for n in rn),
+          "repository package has no tests, config.json or data")
+else:
+    print("SKIP the real tree: no addon/ here (web image server stage)")
 
 # ---------------------------------------------------------------- server: /download/ on the web version
 webdir = tempfile.mkdtemp()
