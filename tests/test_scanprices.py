@@ -174,5 +174,31 @@ check(analytics.get_realm(w) == "PvP Alliance", "a batch with only the old key's
 w.close()
 c.close()
 
+# ---------------------------------------------------------------- two connections upgrade the same old database
+# (the web server's first requests on a fresh volume): both see "priced" missing, the slower ALTER must not fail.
+import sqlite3 as _sq  # noqa: E402
+import tempfile as _tf  # noqa: E402
+from ahtool import schema, scanprices  # noqa: E402
+old_db = os.path.join(_tf.mkdtemp(), "old.db")
+c1, c2 = _sq.connect(old_db), _sq.connect(old_db)
+c1.execute("CREATE TABLE ah_scans(id INTEGER PRIMARY KEY, ts INTEGER)")
+c1.commit()
+check(schema.add_column(c1, "ah_scans", "priced INTEGER NOT NULL DEFAULT 0"), "first connection adds the column")
+c1.commit()
+try:
+    added = schema.add_column(c2, "ah_scans", "priced INTEGER NOT NULL DEFAULT 0")
+    check(added is False, "second connection: column already there is not an error")
+except _sq.OperationalError as e:
+    check(False, "second connection raised %s" % e)
+scanprices.ensure_schema(c2)
+check(sum(1 for r in c2.execute("PRAGMA table_info(ah_scans)") if r[1] == "priced") == 1, "exactly one priced column")
+try:
+    schema.add_column(c2, "no_such_table", "x INTEGER")
+    check(False, "other errors still raise")
+except _sq.OperationalError:
+    check(True, "other errors still raise")
+c1.close()
+c2.close()
+
 print("\n%d failure(s)" % len(fails))
 sys.exit(1 if fails else 0)
