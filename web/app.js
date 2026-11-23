@@ -1,7 +1,7 @@
 // AH Tool – single-page app entry (ES module).
 import { api, clearCache, MOCK, WEB, getRealm, setRealm } from './js/api.js';
 import { esc, money, pct, itemName, qClass, relTime, dateLong, debounce, isNum, ttAttr } from './js/util.js';
-import { installTooltips } from './js/tooltip.js';
+import { installTooltips, clearTooltipCache } from './js/tooltip.js';
 import { destroyAll, rerenderAll } from './js/charts.js';
 import * as overview from './js/pages/overview.js';
 import * as deals from './js/pages/deals.js';
@@ -317,6 +317,7 @@ function renderSideStatus(s) {
 document.getElementById('side-status').addEventListener('change', (e) => {
   if (e.target.id !== 'realm-sel') return;
   setRealm(e.target.value);
+  clearTooltipCache(); // tooltips show the AH price of the realm they were fetched for
   lastIngestTs = null; // another realm has another last import: no "new data" toast
   pollStatus(true);
   rerender();
