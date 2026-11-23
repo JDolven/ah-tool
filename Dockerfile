@@ -6,9 +6,15 @@
 # with the official Windows embeddable Python from python.org, so players need not install anything. Override the
 # version with --build-arg PYTHON_EMBED_VERSION=3.13.x and pin it with PYTHON_EMBED_SHA256 (the build then fails on
 # any other file). If python.org cannot be reached the package is built without Python and the page says so.
+#
+# The default is pinned: this is the file players download and run. 3.13.5's sha256 was checked on 23 Nov 2026
+# against python.org's own signature (sigstore: `python -m sigstore verify identity --bundle
+# python-3.13.5-embed-amd64.zip.sigstore --cert-identity thomas@python.org --cert-oidc-issuer https://accounts.google.com
+# python-3.13.5-embed-amd64.zip` -> OK) and the MD5 on the release page. A new version needs a new hash, checked the
+# same way - changing only the version fails the build on purpose.
 FROM python:3.12-alpine AS downloads
 ARG PYTHON_EMBED_VERSION=3.13.5
-ARG PYTHON_EMBED_SHA256=
+ARG PYTHON_EMBED_SHA256=7d2650fd9d1b9d002d4a315d5f354247fd6a44f30517c7ef577b08f57a0fb6d9
 WORKDIR /src
 COPY ahtool ahtool
 COPY web web
