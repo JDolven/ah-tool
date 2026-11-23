@@ -24,8 +24,10 @@ def load_cfg():
 
 
 def main():
-    from ahtool import alerts, analytics, db, ingest, server, staticdata, watcher
+    from ahtool import alerts, analytics, db, firstrun, ingest, server, staticdata, watcher
 
+    if not firstrun.ensure_config(ROOT):
+        return
     cfg = load_cfg()
     port = int(cfg.get("port", 8642))
     print("AH Tool starting ...")

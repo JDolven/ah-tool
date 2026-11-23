@@ -11,6 +11,8 @@ the environment:
   AHTOOL_MAX_PER_IP  concurrent connections/requests per client address (default 16)
   AHTOOL_MAX_SYNC_MB largest unpacked sync batch accepted (default 24)
   AHTOOL_HOST/PORT   listen address (default 0.0.0.0:8642)
+  AHTOOL_DOWNLOADS   folder with the downloads built by `python -m ahtool.downloads build` (default: downloads/
+                     next to this file; the Docker image builds them). Served at /download/, shown on #/download
   AHTOOL_ANALYTICS_SCRIPT / AHTOOL_ANALYTICS_ID   optional Umami tracker (script URL + website id); only counted
                      on the AHTOOL_PUBLIC_URL host
 """
@@ -30,7 +32,8 @@ def main():
                public_url=os.environ.get("AHTOOL_PUBLIC_URL", "").strip(),
                trust_proxy=os.environ.get("AHTOOL_TRUST_PROXY", "").strip(),
                analytics_script=os.environ.get("AHTOOL_ANALYTICS_SCRIPT", "").strip(),
-               analytics_id=os.environ.get("AHTOOL_ANALYTICS_ID", "").strip())
+               analytics_id=os.environ.get("AHTOOL_ANALYTICS_ID", "").strip(),
+               downloads_dir=os.environ.get("AHTOOL_DOWNLOADS", "").strip() or os.path.join(ROOT, "downloads"))
     if cfg["public_url"] and server.parse_origin(cfg["public_url"]) is None:
         print("AHTOOL_PUBLIC_URL must look like https://ah.example.net (got %r)." % cfg["public_url"])
         return 2

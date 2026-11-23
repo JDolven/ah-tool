@@ -539,6 +539,41 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                 csp = csp_for_html(data, analytics_origins if web else ())
             self._send(200, data, ctype, {"Cache-Control": "no-store"}, csp=csp)
 
+        def _download(self, name):
+            """Web version: GET /download/<name> - only manifest.json and the files it lists (ahtool/downloads.py),
+            streamed from downloads_dir, so a 15 MB package does not sit in memory once per visitor."""
+            from . import downloads
+            ddir = cfg.get("downloads_dir") or ""
+            m = downloads.load_manifest(ddir) if ddir else None
+            if m is None:
+                return self._json({"error": "no downloads on this site"}, 404)
+            if name == downloads.MANIFEST:
+                return self._json(m)
+            names = {f.get("name") for f in m["files"] if isinstance(f, dict)}
+            if name not in names or "/" in name or "\\" in name or name.startswith("."):
+                return self._json({"error": "not found"}, 404)
+            full = os.path.join(ddir, name)
+            try:
+                f = open(full, "rb")
+            except OSError:
+                return self._json({"error": "not found"}, 404)
+            with f:
+                size = os.fstat(f.fileno()).st_size
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", 'attachment; filename="%s"' % name)
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Content-Security-Policy", CSP_API)
+                for k, v in SECURITY_HEADERS.items():
+                    self.send_header(k, v)
+                if self.close_connection:
+                    self.send_header("Connection", "close")
+                self.end_headers()
+                if self.command != "HEAD":
+                    for chunk in iter(lambda: f.read(256 * 1024), b""):
+                        self.wfile.write(chunk)
+
         # ------------------------------------------------------------ request framing / origin checks
 
         def _content_length(self):
@@ -691,6 +726,10 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                 return self._json({"ok": True})
             if web and path == "/api/x":
                 return self._tunnel(method, raw)
+            if web and path.startswith("/download/"):
+                if method not in ("GET", "HEAD"):
+                    return self._json({"error": "method not allowed"}, 405)
+                return self._download(path[len("/download/"):])
             if not path.startswith("/api/"):
                 if method not in ("GET", "HEAD"):
                     return self._json({"error": "method not allowed"}, 405)
