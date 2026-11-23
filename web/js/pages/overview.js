@@ -165,7 +165,6 @@ async function renderMine(box, ctx) {
 function renderStatus(box, s) {
   if (!s) return;
   const fresh = isNum(s.last_ingest_ts) && Date.now() / 1000 - s.last_ingest_ts < 3600;
-  const realms = (s.realms || []).length > 1 ? ` <span class="muted">(${(s.realms || []).map(esc).join(', ')})</span>` : '';
   const warn = [];
   if (s.item_names_loaded === false) warn.push('Item names are not loaded yet');
   if (s.recipes_loaded === false) warn.push('Recipes are not loaded yet');
@@ -173,7 +172,7 @@ function renderStatus(box, s) {
     <div class="status-main">
       <div class="status-item">
         <span class="status-label">Realm</span>
-        <span class="status-value realm">${esc(s.realm || '–')}${realms}</span>
+        <span class="status-value realm">${esc(s.realm || '–')}</span>
       </div>
       <div class="status-item">
         <span class="status-label">Last scanned</span>
