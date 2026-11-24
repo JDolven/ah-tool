@@ -1,4 +1,5 @@
 """AH Tool Logger import + market analytics. Run: python tests/test_market.py"""
+import json
 import os
 import sys
 import tempfile
@@ -52,7 +53,8 @@ check(c["short"] == 5 and c["bought"] == 5, "buy_cost short %s" % c)
 tmp = tempfile.mkdtemp()
 dbp = os.path.join(tmp, "t.db")
 conn = db.connect(dbp)
-conn.execute("INSERT INTO items(id, name, quality) VALUES(2589, 'Linen Cloth', 1), (2592, 'Wool Cloth', 1)")
+conn.execute("INSERT INTO items(id, name, quality, vendor_sell) VALUES(2589, 'Linen Cloth', 1, 13), "
+             "(2592, 'Wool Cloth', 1, 33), (11287, 'Lesser Magic Wand', 2, 508)")
 conn.commit()
 now = int(time.time())
 
@@ -74,6 +76,7 @@ lua = """AHToolLoggerDB = {
      ["price"] = 2000, ["fee"] = 100, ["count"] = 20, ["char"] = "Me" },
   ["expired|Wool Cloth||0|10|1"] = { ["t"] = %d, ["type"] = "expired", ["item"] = "Wool Cloth", ["count"] = 10 },
 },
+["sell"] = { [11287] = 254, [2589] = 13, [2592] = 0, [-5] = 1, [7] = -1, [8] = "x", [999999] = 77 },
 }
 """ % (scan(now - 7200, s1), scan(now - 3600, s2, "253664:2:Forever Tunic;2589:1:Renamed Cloth;bad;7:x:"),
        now - 100, now - 5000, now - 4000)
@@ -94,6 +97,25 @@ check(named.get(253664) == ("Forever Tunic", 2), "custom item named from scan %s
 check(named.get(2589) == ("Linen Cloth", 1), "existing name kept %s" % named)
 conn.execute("DELETE FROM items WHERE id=253664")
 check(market.apply_names(conn) == 1, "names re-applied after an items rebuild")
+
+# vendor sell prices the game reported (logger 1.3, GetItemInfo) win over the static data
+vs = dict(conn.execute("SELECT id, vendor_sell FROM items WHERE id IN (11287, 2589, 2592)").fetchall())
+check(vs == {11287: 254, 2589: 13, 2592: 0}, "game sell prices applied %s" % vs)
+check(conn.execute("SELECT COUNT(*) FROM items WHERE id=999999").fetchone()[0] == 0,
+      "a sell price never creates an item")
+check(market.parse_sell({1: 5, "2": 6, -1: 3, 3: -1, 4: True, 5: float("nan"), 6: 2 ** 41}) == {1: 5, 2: 6},
+      "parse_sell keeps only sane rows")
+conn.execute("UPDATE items SET vendor_sell=508 WHERE id=11287")  # a static data rebuild puts the CSV price back
+check(market.apply_sell(conn) == 1 and conn.execute("SELECT vendor_sell FROM items WHERE id=11287").fetchone()[0] == 254,
+      "game sell price re-applied after a static rebuild")
+check(market.apply_sell(conn) == 0, "apply_sell changes nothing the second time")
+conn.execute("INSERT INTO item_tooltip(id, icon, data) VALUES(11287, 'x', '{\"id\":11287,\"sell_price\":508}'), "
+             "(2592, 'x', '{\"id\":2592,\"sell_price\":33}'), (2589, 'x', 'not json')")
+market.apply_sell(conn)
+tt = {i: d for i, d in conn.execute("SELECT id, data FROM item_tooltip")}
+check(json.loads(tt[11287]).get("sell_price") == 254, "tooltip shows the game's sell price %s" % tt[11287])
+check("sell_price" not in json.loads(tt[2592]), "sell price 0: no Sell Price line %s" % tt[2592])
+check(tt[2589] == "not json", "broken tooltip data left alone")
 
 m = market.item_market(conn, cfg, 2592, qty=12)
 check(m["summary"]["qty"] == 15 and m["summary"]["sellers"] == 2, "summary %s" % m["summary"])

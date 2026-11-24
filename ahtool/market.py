@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS my_auctions(char_key TEXT, ts INTEGER, char TEXT, rea
     suffix INTEGER, count INTEGER, buyout INTEGER, min_bid INTEGER, bid INTEGER, time_left INTEGER,
     sale_status INTEGER);
 CREATE TABLE IF NOT EXISTS ah_item_names(id INTEGER PRIMARY KEY, name TEXT, quality INTEGER, ts INTEGER);
+CREATE TABLE IF NOT EXISTS item_sell(id INTEGER PRIMARY KEY, price INTEGER NOT NULL, ts INTEGER);
 """
 
 _lock = threading.Lock()
@@ -330,6 +331,55 @@ def _store_names(cur, names):
     return apply_names(cur)
 
 
+MAX_SELL_ROWS = 200000
+
+
+def parse_sell(v):
+    """Logger `sell` table {itemId: copper} (GetItemInfo's vendor sell price in the game) -> {item_id: price}."""
+    out = {}
+    if not isinstance(v, dict):
+        return out
+    for k, p in v.items():
+        if len(out) >= MAX_SELL_ROWS:
+            break
+        if isinstance(p, bool) or isinstance(k, bool):
+            continue
+        iid, price = _i(k, -1), _i(p, -1)
+        if 0 < iid < 2 ** 31 and 0 <= price < 2 ** 40:
+            out[iid] = price
+    return out
+
+
+def _store_sell(cur, prices):
+    if prices:
+        now = int(time.time())
+        cur.executemany("INSERT INTO item_sell(id, price, ts) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE "
+                        "SET price=excluded.price, ts=excluded.ts", [(i, p, now) for i, p in prices.items()])
+    return apply_sell(cur)
+
+
+def apply_sell(conn):
+    """Vendor sell prices the game reported (AH Tool Logger, GetItemInfo) win over the Classic Era client tables and
+    the hotfix cache: Forever changed some (e.g. Lesser Magic Wand). Called after every logger import and after a
+    static data rebuild. Returns the number of items changed."""
+    try:
+        before = conn.execute("SELECT total_changes()").fetchone()[0]
+        conn.execute("UPDATE items SET vendor_sell=(SELECT s.price FROM item_sell s WHERE s.id=items.id) "
+                     "WHERE id IN (SELECT id FROM item_sell) AND vendor_sell IS NOT "
+                     "(SELECT s.price FROM item_sell s WHERE s.id=items.id)")
+        changed = conn.execute("SELECT total_changes()").fetchone()[0] - before
+        # The tooltip shows the same price ("Sell Price:"); item_tooltip is static data, so the web version gets it.
+        conn.execute("UPDATE item_tooltip SET data=(SELECT CASE WHEN s.price > 0 "
+                     "THEN json_set(item_tooltip.data, '$.sell_price', s.price) "
+                     "ELSE json_remove(item_tooltip.data, '$.sell_price') END FROM item_sell s WHERE s.id=item_tooltip.id) "
+                     "WHERE id IN (SELECT id FROM item_sell) AND json_valid(data) AND "
+                     "COALESCE(json_extract(data, '$.sell_price'), 0) IS NOT (SELECT s.price FROM item_sell s "
+                     "WHERE s.id=item_tooltip.id)")
+        return changed
+    except Exception:  # table missing (logger never ingested)
+        return 0
+
+
 def apply_names(conn):
     """Copy remembered AH names into items where the item is missing or unnamed. Existing names are never
     overwritten. Also called after a static data rebuild. Returns the number of items named."""
@@ -380,6 +430,7 @@ def ingest(conn, cfg, force=False):
                     for iid, v in parse_names(s.get("nm")).items():
                         names.setdefault(iid, v)
             new_names = _store_names(cur, names)
+            sell_changed = _store_sell(cur, parse_sell(data.get("sell")))
             fallback = _realm_fallback(cur, data)
             if fallback:
                 # scans stored with an empty realm before this fix take the realm too (never over an existing one)
@@ -471,7 +522,7 @@ def ingest(conn, cfg, force=False):
             conn.rollback()
             raise
     return {"skipped": False, "scans": new_scans, "sold": sold, "mail": new_mail, "owned": n_owned,
-            "names": new_names, "prices": priced}
+            "names": new_names, "sell": sell_changed, "prices": priced}
 
 
 # ---------------------------------------------------------------- queries

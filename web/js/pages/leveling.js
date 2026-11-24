@@ -8,7 +8,7 @@ import {
 import { DataTable } from '../table.js';
 import { toast, emit } from '../ui.js';
 import { PROF_ICONS, recipeName } from './professions.js';
-import { openGuide } from '../levelprint.js';
+import { openGuide, cdText } from '../levelprint.js';
 
 const SKILL_MAX = 375;
 const GATHERING = new Set([5, 11, 12]); // the planner returns 400 for these
@@ -22,7 +22,7 @@ const TRAINER = [
   { skill: 200, short: 'Artisan', text: 'Artisan – train at 200 (requires level 35)' },
   { skill: 225, short: 'Expert cap', text: 'Expert cap – Artisan needed to go past 225' },
 ];
-const DEFAULTS = { target: 300, mode: 'baseline', recover: 'sell', sources: 'trainer', known_only: false };
+const DEFAULTS = { target: 300, mode: 'baseline', recover: 'sell', sources: 'trainer', known_only: false, cooldowns: false };
 
 function clampInt(v, lo, hi, dflt) {
   const n = Math.round(Number(v));
@@ -85,6 +85,7 @@ export async function render(ctx) {
     recover: ['sell', 'vendor', 'none'].includes(query.recover) ? query.recover : DEFAULTS.recover,
     sources: query.sources === 'all' ? 'all' : 'trainer',
     known_only: query.known === '1' || query.known_only === '1',
+    cooldowns: query.cd === '1',
   };
   st.start = clampInt(query.start, 1, SKILL_MAX - 1, defaultStart(st.prof));
 
@@ -94,10 +95,11 @@ export async function render(ctx) {
     if (st.recover !== DEFAULTS.recover) q.set('recover', st.recover);
     if (st.sources !== DEFAULTS.sources) q.set('sources', st.sources);
     if (st.known_only) q.set('known', '1');
+    if (st.cooldowns) q.set('cd', '1');
     const h = `#/leveling?${q.toString()}`;
     if (location.hash !== h) history.replaceState(null, '', h);
   };
-  const apiOpts = () => ({ start: st.start, target: st.target, mode: st.mode, recover: st.recover, sources: st.sources, known_only: st.known_only });
+  const apiOpts = () => ({ start: st.start, target: st.target, mode: st.mode, recover: st.recover, sources: st.sources, known_only: st.known_only, cooldowns: st.cooldowns });
 
   // ---- form
   const seg = (group, opts) => `<div class="seg seg-sm" role="radiogroup" data-group="${group}">${opts
@@ -126,6 +128,7 @@ export async function render(ctx) {
       <div class="field field-auto"><span class="field-label">Recover cost by</span>${seg('recover', [['sell', 'Selling on AH', 'Sell crafted items on the AH (after the 5% cut). Vendor price when sale data is thin.'], ['vendor', 'Vendor', 'Sell crafted items to an NPC'], ['none', 'Nothing', 'Ignore the value of crafted items']])}</div>
       <div class="field field-auto"><span class="field-label">Recipes</span>${seg('sources', [['trainer', 'Trainer only'], ['all', 'Incl. recipe drops', 'Also use recipes taught by items; their AH price is added once']])}</div>
       <label class="toggle" title="Only recipes you know (set under My Professions) or that the trainer teaches at your skill"><input type="checkbox" id="lv-known" ${st.known_only ? 'checked' : ''}><span class="toggle-ui"></span> Known recipes only</label>
+      <label class="toggle" title="Also use recipes on a cooldown (Salt Shaker, transmutes, Mooncloth …). One craft per cooldown, so they can take days or weeks – the plan says how long."><input type="checkbox" id="lv-cd" ${st.cooldowns ? 'checked' : ''}><span class="toggle-ui"></span> Include cooldown crafts</label>
     </div>`;
 
   // ---- plan
@@ -186,6 +189,10 @@ export async function render(ctx) {
   });
   form.querySelector('#lv-known').addEventListener('change', (e) => {
     st.known_only = e.target.checked;
+    load();
+  });
+  form.querySelector('#lv-cd').addEventListener('change', (e) => {
+    st.cooldowns = e.target.checked;
     load();
   });
   const readNums = () => {
@@ -371,7 +378,7 @@ function stepColumns(colors) {
       key: 'name',
       label: 'Recipe',
       sortable: false,
-      render: (r) => `${recipeName(r)}${isNum(r.recipe_item) ? ` <span class="tag-mini warn" title="This recipe is taught by an item you need to buy – see Recipes to buy">recipe to buy</span>` : ''}<div class="cell-sub">${skillRange(r.skill)}${chanceText(r.chance)}</div><div class="cell-sub show-sm"><strong>${num(r.crafts)}</strong> crafts · ≈ ${num(r.crafts_expected, 1)} expected</div>`,
+      render: (r) => `${recipeName(r)}${isNum(r.recipe_item) ? ` <span class="tag-mini warn" title="This recipe is taught by an item you need to buy – see Recipes to buy">recipe to buy</span>` : ''}${cooldownTag(r.cooldown_h)}<div class="cell-sub">${skillRange(r.skill)}${chanceText(r.chance)}</div><div class="cell-sub show-sm"><strong>${num(r.crafts)}</strong> crafts · ≈ ${num(r.crafts_expected, 1)} expected</div>`,
     },
     {
       key: 'crafts',
@@ -500,6 +507,11 @@ function depthText(r) {
   return `<div class="cell-sub warn-text" title="The AH can only absorb so many – the rest is vendored">AH ${num(r.ah_units || 0)} / vendor ${num(r.vendor_units)}</div>`;
 }
 
+function cooldownTag(h) {
+  const t = cdText(h);
+  return t ? ` <span class="tag-mini warn" title="One craft per ${esc(t)} – see the warnings for how long this takes">⏱ ${esc(t)} cooldown</span>` : '';
+}
+
 function subcraftsCard(list) {
   if (!list.length) return '';
   return `<section class="card card-flush">
@@ -510,7 +522,7 @@ function subcraftsCard(list) {
         .map((x) => `<tr>
           <td>${x.item_id ? itemLink(x.item_id, x.name, x.quality) : `<span class="spell-name">${esc(x.name || '')}</span>`}${x.name && x.item_id ? '' : ''}</td>
           <td class="r">${num(x.need)}</td>
-          <td class="r">${num(x.crafts)}${isNum(x.num_created) && x.num_created > 1 ? ` <span class="muted">×${num(x.num_created)}</span>` : ''}</td>
+          <td class="r">${num(x.crafts)}${isNum(x.num_created) && x.num_created > 1 ? ` <span class="muted">×${num(x.num_created)}</span>` : ''}${cooldownTag(x.cooldown_h)}</td>
           <td class="r">${money(x.unit_cost)}</td>
         </tr>`)
         .join('')}</tbody>

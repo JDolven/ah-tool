@@ -229,7 +229,7 @@ export const api = {
   recipeTrend: (spellId, days = 30) => get(`/api/recipe/${enc(spellId)}/trend?days=${days}`),
   trendingCrafts: (limit = 8, mine = false, includeLow = false) =>
     get(`/api/trending-crafts?limit=${limit}&mine=${mine ? 1 : 0}${includeLow ? '&include_low=1' : ''}`),
-  /** opts: {start,target,mode,recover,sources,known_only} – serialised as the query string. */
+  /** opts: {start,target,mode,recover,sources,known_only,cooldowns} – serialised as the query string. */
   leveling: (profId, opts = {}) => get(`/api/leveling/${enc(profId)}?${levelQuery(opts)}`),
   // v5 – AH Tool Logger (full scans, sales, own auctions)
   itemMarket: (id, qty) => get(`/api/item/${enc(id)}/market${qty ? `?qty=${qty}` : ''}`),
@@ -243,5 +243,6 @@ export function levelQuery(o) {
   const q = new URLSearchParams();
   for (const k of ['start', 'target', 'mode', 'recover', 'sources']) if (o[k] !== undefined && o[k] !== null && o[k] !== '') q.set(k, String(o[k]));
   q.set('known_only', o.known_only ? '1' : '0');
+  if (o.cooldowns) q.set('cooldowns', '1');
   return q.toString();
 }
