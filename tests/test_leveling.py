@@ -146,6 +146,19 @@ def test_cooldown_recipe_never_used(conn):
         assert not pl["subcrafts"], pl["subcrafts"]
         bolts = [r for s in pl["steps"] for r in s["reagents"] if r["item_id"] == 1002]
         assert bolts and all(r["source"] == "ah" and r["unit_price"] == 50 for r in bolts), bolts
+        assert any("on a cooldown were not used" in w for w in pl["warnings"]), pl["warnings"]
+        assert pl["cooldowns"] is False
+        # "Include cooldown crafts": the bolt is crafted again, marked, and the plan says how long it takes
+        pl = P(conn, start=40, target=50, cooldowns=True)
+        bolt = [r for r in pl["steps"][0]["reagents"] if r["item_id"] == 1002][0]
+        assert bolt["source"] == "craft" and bolt["craft_spell_id"] == 100, bolt
+        sub = {x["spell_id"]: x for x in pl["subcrafts"]}
+        assert sub[100]["cooldown_h"] == 72 and pl["steps"][0]["cooldown_h"] is None, (sub, pl["steps"][0])
+        w = [w for w in pl["warnings"] if "cooldown take about" in w]
+        assert w and "33 crafts on a 3 days cooldown take about 96 days" in w[0], pl["warnings"]
+        assert not any("were not used" in x for x in pl["warnings"])
+        pl = P(conn, start=1, target=50, cooldowns="1")
+        assert any(s["spell_id"] == 100 and s["cooldown_h"] == 72 for s in pl["steps"]), pl["steps"]
     finally:
         del leveling.COOLDOWN_SPELLS[100]
     pl = P(conn, start=40, target=50)  # back to normal: the bolt is crafted again

@@ -23,6 +23,15 @@ export function gold(copper) {
 }
 
 const n = (v) => (isNum(v) ? nf.format(v) : '–');
+
+/** Cooldown in hours -> "10 min" / "2 h" / "3 days" ('' for none). Also used by the leveling page. */
+export function cdText(h) {
+  if (!isNum(h) || h <= 0) return '';
+  if (h < 1) return `${Math.round(h * 60)} min`;
+  if (h < 24) return `${nf.format(h)} h`;
+  const d = h / 24;
+  return `${Number.isInteger(d) ? d : d.toFixed(1)} day${d === 1 ? '' : 's'}`;
+}
 const itemName = (id, name) => name || (id ? `Item #${id}` : '?');
 const qStyle = (q) => `color:${Q_PRINT[isNum(q) ? q : 1] || Q_PRINT[1]}`;
 const srcText = (s) => ({ ah: 'AH', vendor: 'Vendor', craft: 'Craft' }[s] || 'No price');
@@ -68,7 +77,7 @@ export function guideText(plan, meta) {
   if (subs.length) {
     L.push('');
     L.push('__Craft along the way__ (materials are in the shopping list)');
-    for (const x of subs) L.push(`- ${n(x.need)}× ${x.name || ''}`);
+    for (const x of subs) L.push(`- ${n(x.need)}× ${x.name || ''}${cdText(x.cooldown_h) ? ` (${cdText(x.cooldown_h)} cooldown)` : ''}`);
   }
   L.push('');
   L.push('__Steps__');
@@ -139,8 +148,9 @@ export function guideHtml(plan, meta) {
     const regs = (s.reagents || []).map((g) => `${n(g.count)}× ${item(g.item_id, g.name, g.quality)}`).join(', ');
     const made = s.num_created > 1 ? ` <span class="muted">(makes ${n(s.num_created)})</span>` : '';
     const buyRecipe = isNum(s.recipe_item) ? ' <span class="warn">(recipe must be bought)</span>' : '';
+    const cd = cdText(s.cooldown_h) ? ` <span class="warn">(${esc(cdText(s.cooldown_h))} cooldown)</span>` : '';
     return `<tr><td class="ck"><i></i></td><td class="skill">${esc(s.from)}–${esc(s.to)}</td>
-      <td><b>${n(s.crafts)}×</b> ${s.created_item_id ? item(s.created_item_id, stepName(s), s.created_quality) : esc(stepName(s))}${made}${buyRecipe}${regs ? `<div class="regs">each: ${regs}</div>` : ''}</td>
+      <td><b>${n(s.crafts)}×</b> ${s.created_item_id ? item(s.created_item_id, stepName(s), s.created_quality) : esc(stepName(s))}${made}${buyRecipe}${cd}${regs ? `<div class="regs">each: ${regs}</div>` : ''}</td>
       <td class="r hide-sm">${gold(s.cost_total)}</td><td class="r">${isNum(s.net_total) ? (s.net_total < 0 ? `<span class="profit">+${gold(-s.net_total)}</span>` : gold(s.net_total)) : '–'}</td></tr>`;
   }).join('');
 

@@ -213,7 +213,8 @@ def _leveling_args(qs):
     if sources not in ("trainer", "all"):
         raise BadRequest("sources must be trainer or all")
     return dict(start=num("start", 1), target=num("target", 300), mode=mode, recover=recover, sources=sources,
-                known_only=qs.get("known_only", "0").lower() in ("1", "true", "yes"))
+                known_only=qs.get("known_only", "0").lower() in ("1", "true", "yes"),
+                cooldowns=qs.get("cooldowns", "0").lower() in ("1", "true", "yes"))
 
 
 def _leveling():

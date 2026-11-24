@@ -1,7 +1,7 @@
 """Profession leveling planner (v4, see CONTRACT.md "Leveling planner").
 
     plan(conn, cfg, prof_id, start=1, target=300, mode="baseline", recover="sell",
-         sources="trainer", known_only=False) -> dict
+         sources="trainer", known_only=False, cooldowns=False) -> dict
     plan_to_shopping(plan) -> [(spell_id, crafts)]
 
 Model
@@ -78,6 +78,18 @@ COOLDOWN_SPELLS = {
     22430: 2,                                                           # Refined Scale of Onyxia
 }
 COOLDOWN_PREFIXES = ("Transmute",)
+
+
+def _hours(h):
+    return "%g h" % h if h < 24 else "%g day%s" % (h / 24.0, "" if h == 24 else "s")
+
+
+def cooldown_hours(sid, name=None):
+    """Cooldown of a recipe in hours, or None. A transmute the client data lacks is assumed to be 24 h."""
+    h = COOLDOWN_SPELLS.get(sid)
+    if h:
+        return h
+    return 24 if (name or "").startswith(COOLDOWN_PREFIXES) else None
 
 
 # ---------------------------------------------------------------- analytics price functions (v4 contract)
@@ -273,7 +285,9 @@ def _backtrack(last, back):
 # ---------------------------------------------------------------- plan
 
 def plan(conn, cfg, prof_id, start=1, target=300, mode="baseline", recover="sell", sources="trainer",
-         known_only=False):
+         known_only=False, cooldowns=False):
+    """cooldowns=True also uses recipes on a cooldown (Salt Shaker, transmutes, Mooncloth...) as steps and as
+    make-vs-buy sources; their steps and sub-crafts carry cooldown_h and a warning says how many days they take."""
     try:
         prof_id = int(prof_id)
         start = int(start if start not in (None, "") else 1)
@@ -284,6 +298,7 @@ def plan(conn, cfg, prof_id, start=1, target=300, mode="baseline", recover="sell
     recover = recover or "sell"
     sources = sources or "trainer"
     known_only = _bool(known_only)
+    cooldowns = _bool(cooldowns)
     if prof_id not in analytics.PROFESSIONS:
         raise ValueError("unknown profession %r" % prof_id)
     if prof_id in GATHERING:
@@ -312,7 +327,7 @@ def plan(conn, cfg, prof_id, start=1, target=300, mode="baseline", recover="sell
 
     out = {"profession_id": prof_id, "profession": analytics.PROFESSIONS[prof_id][0],
            "start": start, "target": target, "mode": mode, "recover": recover,
-           "sources": sources, "known_only": known_only,
+           "sources": sources, "known_only": known_only, "cooldowns": cooldowns,
            "steps": [], "shopping": [], "subcrafts": [], "recipes_to_buy": [], "tools": [], "milestones": [],
            "totals": {"cost": 0, "recover": 0, "net": 0, "crafts": 0, "crafts_expected": 0, "recipes": 0},
            "warnings": [], "unreachable_from": None}
@@ -346,6 +361,8 @@ def plan(conn, cfg, prof_id, start=1, target=300, mode="baseline", recover="sell
 
     recs = {}
     excluded_spec = 0
+    excluded_cd = 0
+    cd_h = {}
     no_colour_in_range = 0
     unpriced_items = 0
     for sid, created, num, mn, lo, hi, sname in rows:
@@ -363,8 +380,13 @@ def plan(conn, cfg, prof_id, start=1, target=300, mode="baseline", recover="sell
         if sid in SPECIALISATION and prof_id == 9:
             excluded_spec += 1
             continue
-        if sid in COOLDOWN_SPELLS or (sname or "").startswith(COOLDOWN_PREFIXES):
-            continue
+        h = cooldown_hours(sid, sname)
+        if h:
+            if not cooldowns:
+                if r.mn < target:
+                    excluded_cd += 1
+                continue
+            cd_h[sid] = h
         if r.known == 1:
             r.free = True
         elif known_only and r.known == 0:
@@ -732,6 +754,7 @@ def plan(conn, cfg, prof_id, start=1, target=300, mode="baseline", recover="sell
             "ah_units": _num(ah_units), "vendor_units": _num(vendor_units),
             "_saving": saving, "_lost": 0.0, "kept": 0,
             "confidence": conf, "recipe_item": None if r.free else r.fixed_item,
+            "cooldown_h": cd_h.get(sid),
             "reagents": rl,
         })
         i = j
@@ -758,7 +781,8 @@ def plan(conn, cfg, prof_id, start=1, target=300, mode="baseline", recover="sell
             crafts = int(math.ceil(qty / cr.num - 1e-9))
             ent = sub.setdefault(csid, {"spell_id": csid, "name": cr.name, "item_id": iid,
                                         "quality": iqual(iid), "num_created": cr.num,
-                                        "need": 0, "crafts": 0, "unit_cost": None, "_e": e})
+                                        "need": 0, "crafts": 0, "unit_cost": None, "_e": e,
+                                        "cooldown_h": cd_h.get(csid)})
             ent["need"] += qty
             ent["crafts"] += crafts
             ent["_e"] = min(ent["_e"], e)
@@ -843,6 +867,16 @@ def plan(conn, cfg, prof_id, start=1, target=300, mode="baseline", recover="sell
         warnings.append("Mining is levelled mainly by mining ore nodes; this plan only covers smelting.")
     if excluded_spec:
         warnings.append("Goblin/Gnomish specialisation recipes are not used (%d ignored)." % excluded_spec)
+    if excluded_cd:
+        warnings.append("%d recipe(s) on a cooldown were not used (turn on \"Include cooldown crafts\" to allow "
+                        "them)." % excluded_cd)
+    for kind, lst in (("step", steps), ("sub-craft", out["subcrafts"])):
+        for x in lst:
+            if x.get("cooldown_h") and x["crafts"] > 1:
+                days = (x["crafts"] - 1) * x["cooldown_h"] / 24.0
+                warnings.append("%s (%s): %d crafts on a %s cooldown take about %s."
+                                % (x["name"], kind, x["crafts"], _hours(x["cooldown_h"]),
+                                   "%.0f days" % days if days >= 2 else "%.0f hours" % (days * 24)))
     if prof_id == 10 and steps:
         # Runed rods are tools: list the ones whose skill is reached by the plan (cost of one craft each)
         top = max(st["skill"]["min"] for st in steps)
