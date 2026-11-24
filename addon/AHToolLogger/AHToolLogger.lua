@@ -10,6 +10,9 @@
 -- timeLeft is the band 1..4 (short, medium, long, very long).
 -- A scan also carries nm = "itemId:quality:name;..." - one name per item, so the app can name custom realm items
 -- that are missing from its static data.
+-- sell = { [itemId] = copper }: the vendor sell price the game reports (GetItemInfo) for every item seen in a full
+-- scan or in a profession window - no need to own the item. The app prefers it over the Classic Era client tables,
+-- which Forever has changed for some items.
 
 local VERSION = 1
 local KEEP_SCANS = 3          -- full scans kept in the file (the app imports them on /reload and keeps the history)
@@ -35,7 +38,66 @@ local function db()
   d.scans = d.scans or {}
   d.owned = d.owned or {}
   d.mail = d.mail or {}
+  d.sell = d.sell or {}
   return d
+end
+
+-- Vendor sell prices ------------------------------------------------------------------------------------------------
+
+local sellWait, sellWaiting = {}, 0   -- items the client is still loading (GET_ITEM_INFO_RECEIVED)
+
+local function sellOf(itemId)
+  return select(11, GetItemInfo(itemId))
+end
+
+local function noteSell(itemId)
+  itemId = tonumber(itemId)
+  if not itemId or itemId <= 0 then return end
+  local ok, price = pcall(sellOf, itemId)
+  if ok and type(price) == "number" and price >= 0 then
+    db().sell[itemId] = price
+    if sellWait[itemId] then sellWait[itemId] = nil; sellWaiting = sellWaiting - 1 end
+  elseif ok and not sellWait[itemId] and sellWaiting < 5000 then
+    sellWait[itemId] = true  -- GetItemInfo asked the server; the answer arrives as GET_ITEM_INFO_RECEIVED
+    sellWaiting = sellWaiting + 1
+    if sellWaiting == 1 then frame:RegisterEvent("GET_ITEM_INFO_RECEIVED") end
+  end
+end
+
+local function onItemInfo(itemId, success)
+  itemId = tonumber(itemId)
+  if not itemId or not sellWait[itemId] then return end
+  sellWait[itemId] = nil
+  sellWaiting = sellWaiting - 1
+  if success then noteSell(itemId) end
+  if sellWaiting <= 0 then
+    sellWaiting = 0
+    frame:UnregisterEvent("GET_ITEM_INFO_RECEIVED")
+  end
+end
+
+local function linkId(link)
+  return type(link) == "string" and tonumber(link:match("item:(%d+)")) or nil
+end
+
+-- Profession window: every product and reagent listed (TradeSkill API; Enchanting uses the Craft API in Classic).
+local function readProfession()
+  if GetNumTradeSkills and GetTradeSkillItemLink then
+    for i = 1, GetNumTradeSkills() or 0 do
+      noteSell(linkId(GetTradeSkillItemLink(i)))
+      for j = 1, (GetTradeSkillNumReagents and GetTradeSkillNumReagents(i)) or 0 do
+        noteSell(linkId(GetTradeSkillReagentItemLink(i, j)))
+      end
+    end
+  end
+  if GetNumCrafts and GetCraftItemLink then
+    for i = 1, GetNumCrafts() or 0 do
+      noteSell(linkId(GetCraftItemLink(i)))
+      for j = 1, (GetCraftNumReagents and GetCraftNumReagents(i)) or 0 do
+        noteSell(linkId(GetCraftReagentItemLink and GetCraftReagentItemLink(i, j)))
+      end
+    end
+  end
 end
 
 local function clean(s)
@@ -137,7 +199,7 @@ local function readFullScan()
   local source = state.ownScan and "ahtool" or "addon"
   state.ownScan = false
   local rows, seen, t = {}, {}, time()
-  local names, nameList = {}, {}
+  local names, nameList, priced = {}, {}, {}
   local i, last_i = api.first, api.first + total - 1
   local function step()
     if api.count() ~= total then
@@ -150,6 +212,10 @@ local function readFullScan()
     local stop = math.min(i + BATCH - 1, last_i)
     for idx = i, stop do
       local ok, row, itemId, name, quality, link = pcall(api.row, idx)
+      if ok and itemId and not priced[itemId] then
+        priced[itemId] = true
+        noteSell(itemId)
+      end
       if ok and itemId and not names[itemId] then
         if (not name or name == "") and type(link) == "string" then name = link:match("|h%[(.-)%]|h") end
         name = name and clean(name):gsub(":", "") or ""
@@ -429,8 +495,18 @@ end
 
 local mailTimer = false
 
-frame:SetScript("OnEvent", function(_, event)
-  if event == api.event then
+local profTimer = false
+
+frame:SetScript("OnEvent", function(_, event, ...)
+  if event == "GET_ITEM_INFO_RECEIVED" then
+    onItemInfo(...)
+  elseif event == "TRADE_SKILL_SHOW" or event == "TRADE_SKILL_UPDATE" or event == "CRAFT_SHOW"
+      or event == "CRAFT_UPDATE" then
+    if not profTimer then
+      profTimer = true
+      C_Timer.After(1, function() profTimer = false; pcall(readProfession) end)
+    end
+  elseif event == api.event then
     if state.pending then
       state.pending = false
       frame:UnregisterEvent(api.event)
@@ -461,7 +537,8 @@ frame:SetScript("OnEvent", function(_, event)
 end)
 
 for _, ev in ipairs({ "PLAYER_LOGIN", "MAIL_INBOX_UPDATE", "AUCTION_HOUSE_SHOW", "AUCTION_HOUSE_CLOSED",
-                      MODERN and "OWNED_AUCTIONS_UPDATED" or "AUCTION_OWNED_LIST_UPDATE" }) do
+                      MODERN and "OWNED_AUCTIONS_UPDATED" or "AUCTION_OWNED_LIST_UPDATE",
+                      "TRADE_SKILL_SHOW", "TRADE_SKILL_UPDATE", "CRAFT_SHOW", "CRAFT_UPDATE" }) do
   pcall(frame.RegisterEvent, frame, ev)
 end
 
@@ -473,11 +550,12 @@ SlashCmdList.AHTOOLLOGGER = function(arg)
   else
     local d = db()
     local last = d.scans[#d.scans]
-    local nm = 0
+    local nm, ns = 0, 0
     for _ in pairs(d.mail) do nm = nm + 1 end
-    msg(string.format("%d full scan(s) stored%s, %d mail record(s). Auction House API: %s.", #d.scans,
-      last and (", last " .. date("%Y-%m-%d %H:%M", last.t) .. " (" .. last.n .. " auctions)") or "", nm,
-      MODERN and "modern" or (LEGACY and "legacy" or "none")))
+    for _ in pairs(d.sell) do ns = ns + 1 end
+    msg(string.format("%d full scan(s) stored%s, %d mail record(s), %d vendor sell price(s). Auction House API: %s.",
+      #d.scans, last and (", last " .. date("%Y-%m-%d %H:%M", last.t) .. " (" .. last.n .. " auctions)") or "", nm,
+      ns, MODERN and "modern" or (LEGACY and "legacy" or "none")))
     msg("/ahtl scan - start a full scan (Auction House must be open). Auctionator's Full Scan is recorded too.")
   end
 end
