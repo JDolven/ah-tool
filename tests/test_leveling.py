@@ -136,6 +136,22 @@ def test_buy_when_cheaper(conn):
         set_price(conn, 1002, 50, 1000)
 
 
+def test_cooldown_recipe_never_used(conn):
+    # A cooldown craft must neither level nor make a reagent cheap (Salt Shaker -> Refined Deeprock Salt).
+    assert 19566 in leveling.COOLDOWN_SPELLS and 18560 in leveling.COOLDOWN_SPELLS
+    leveling.COOLDOWN_SPELLS[100] = 72  # pretend the bolt recipe is on a cooldown
+    try:
+        pl = P(conn, start=1, target=50)
+        assert all(s["spell_id"] != 100 for s in pl["steps"]), pl["steps"]
+        assert not pl["subcrafts"], pl["subcrafts"]
+        bolts = [r for s in pl["steps"] for r in s["reagents"] if r["item_id"] == 1002]
+        assert bolts and all(r["source"] == "ah" and r["unit_price"] == 50 for r in bolts), bolts
+    finally:
+        del leveling.COOLDOWN_SPELLS[100]
+    pl = P(conn, start=40, target=50)  # back to normal: the bolt is crafted again
+    assert [r for r in pl["steps"][0]["reagents"] if r["item_id"] == 1002][0]["source"] == "craft"
+
+
 def test_merging_reuse_and_determinism(conn):
     pl = P(conn, start=1, target=40)
     check_contiguous(pl, 1, 40)

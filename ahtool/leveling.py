@@ -64,8 +64,19 @@ SPECIALISATION = {
     23489: "Gnomish",
 }
 SPECIALISATION = {k: v for k, v in SPECIALISATION.items() if v}
-# Recipes on a long cooldown (one craft per day or more) are useless for leveling.
-COOLDOWN_SPELLS = {18560}          # Mooncloth
+# Recipes on a cooldown are useless for leveling, and as a make-vs-buy source they would price a reagent far below
+# what it really costs (Salt Shaker -> Refined Deeprock Salt made Cured Rugged Hide look hugely profitable).
+# Every AtlasLoot Classic recipe with a cooldown in SpellCooldowns (Classic Era 1.15.8 and 1.15.9, wago.tools),
+# spell id -> cooldown in hours. The name prefix also catches transmutes the client data does not have (Forever).
+COOLDOWN_SPELLS = {
+    11479: 24, 11480: 48, 17187: 48,                                    # Transmute: Iron to Gold, Mithril, Arcanite
+    17559: 24, 17560: 24, 17561: 24, 17562: 24, 17563: 24, 17564: 24,  # Transmute: elements
+    17565: 24, 17566: 24, 25146: 0.17,                                  # ..., Elemental Fire (10 min)
+    18560: 96,                                                          # Mooncloth
+    19566: 72,                                                          # Salt Shaker (Refined Deeprock Salt)
+    21935: 24,                                                          # SnowMaster 9000
+    22430: 2,                                                           # Refined Scale of Onyxia
+}
 COOLDOWN_PREFIXES = ("Transmute",)
 
 
