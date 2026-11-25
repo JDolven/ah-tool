@@ -222,13 +222,33 @@ def update_vendor_from_cache(conn, vendor_cache):
 def build_tooltips(conn, cfg):
     """Item tooltip data (stats, effects, icons; Forever overlays) -> item_tooltip. See ahtool/tooltipdata.py."""
     from . import tooltipdata
-    return tooltipdata.build(conn, cfg, lambda table: _download(cfg, table))
+    res = tooltipdata.build(conn, cfg, lambda table: _download(cfg, table))
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('dbcache_sig', ?)", (dbcache_sig(cfg),))
+    conn.commit()
+    return res
 
 
-def tooltips_current(conn):
+def dbcache_sig(cfg):
+    """Size and mtime of the client's hotfix cache. It grows whenever the game loads an item the Forever server
+    changed (e.g. a lower vendor sell price), so the tooltips - and items.vendor_sell - are rebuilt when it changes."""
+    p = (cfg or {}).get("dbcache_path") or ""
+    try:
+        st = os.stat(p)
+    except OSError:
+        return ""
+    return "%d:%d" % (st.st_size, int(st.st_mtime))
+
+
+def tooltips_current(conn, cfg=None):
+    """True when item_tooltip is built by this version and - given cfg - from the hotfix cache as it is now."""
     from . import tooltipdata
     r = conn.execute("SELECT value FROM meta WHERE key='tooltip_version'").fetchone()
-    return bool(r and r[0] == tooltipdata.VERSION and _count(conn, "item_tooltip"))
+    if not (r and r[0] == tooltipdata.VERSION and _count(conn, "item_tooltip")):
+        return False
+    if cfg is None:
+        return True
+    s = conn.execute("SELECT value FROM meta WHERE key='dbcache_sig'").fetchone()
+    return (s[0] if s else "") == dbcache_sig(cfg)
 
 
 def _count(conn, table):
@@ -253,7 +273,7 @@ def ensure(conn, cfg, force=False):
         market.apply_names(conn)
         conn.commit()
     # Tooltips also patch items.quality/item_level (Forever overrides), so rebuild them after an items rebuild.
-    if force or rebuilt_items or not tooltips_current(conn):
+    if force or rebuilt_items or not tooltips_current(conn, cfg):
         try:
             build_tooltips(conn, cfg)
         except Exception as ex:

@@ -117,6 +117,24 @@ check(json.loads(tt[11287]).get("sell_price") == 254, "tooltip shows the game's 
 check("sell_price" not in json.loads(tt[2592]), "sell price 0: no Sell Price line %s" % tt[2592])
 check(tt[2589] == "not json", "broken tooltip data left alone")
 
+# the client's hotfix cache grows while you play (new Forever prices): tooltips are rebuilt when it changes
+from ahtool import staticdata, tooltipdata  # noqa: E402
+conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('tooltip_version', ?)", (tooltipdata.VERSION,))
+dbc = os.path.join(tmp, "DBCache.bin")
+with open(dbc, "wb") as f:
+    f.write(b"x" * 10)
+tcfg = {"dbcache_path": dbc}
+check(staticdata.tooltips_current(conn) is True, "without cfg only the version counts")
+check(not staticdata.tooltips_current(conn, tcfg), "built before the cache was tracked -> rebuild once")
+conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('dbcache_sig', ?)", (staticdata.dbcache_sig(tcfg),))
+check(staticdata.tooltips_current(conn, tcfg), "same hotfix cache -> current")
+with open(dbc, "ab") as f:
+    f.write(b"more hotfixes")
+check(not staticdata.tooltips_current(conn, tcfg), "hotfix cache grew -> rebuild")
+check(staticdata.dbcache_sig({"dbcache_path": os.path.join(tmp, "missing")}) == "", "no cache file -> empty signature")
+conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('dbcache_sig', '')")
+check(staticdata.tooltips_current(conn, {"dbcache_path": ""}), "no cache configured and none recorded -> current")
+
 m = market.item_market(conn, cfg, 2592, qty=12)
 check(m["summary"]["qty"] == 15 and m["summary"]["sellers"] == 2, "summary %s" % m["summary"])
 check(m["cost"]["total"] == 4000 and m["cost"]["bought"] == 15, "cost %s" % m["cost"])

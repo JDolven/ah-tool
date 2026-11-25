@@ -124,8 +124,8 @@ records the raw data instead:
   bid, time left and seller. `/ahtl` shows what is stored.
 - **Your own auctions** – whenever the Auctions tab is opened.
 - **AH mail** – sold, bought, expired and cancelled auctions, when the mailbox is opened.
-- **Vendor sell prices** – the price the game itself reports (`GetItemInfo`) for every item in a full scan and every
-  product and reagent in an open profession window; you don't need to own the items. The app uses them instead of the
+- **Vendor sell prices** – the price the game itself reports (`GetItemInfo`) for every item in a full scan, every
+  product and reagent in an open profession window and everything in your bags; you don't need to own the items. The app uses them instead of the
   Classic Era client tables, which Forever has changed for some items (e.g. Lesser Magic Wand).
 
 Install: copy `addon/AHToolLogger` into `Interface/AddOns` and enable it on the
