@@ -576,6 +576,53 @@ def _scan_info(scan):
             "realm": scan["realm"], "faction": scan["faction"], "char": scan["char"]}
 
 
+def vendor_flips(conn, cfg=None, realm=None, limit=1000):
+    """Every listing in the latest full scan whose buyout is below what a vendor pays for its units: buy it all and
+    sell it to a vendor. Per item and in total: units, listings, cost, vendor revenue and profit. No AH cut applies
+    (you buy on the AH and sell to an NPC). `game_price` says the vendor price came from the game itself (AH Tool
+    Logger) rather than the Classic Era tables, which are wrong for some Forever items."""
+    ensure_schema(conn)
+    realm = _realm_filter(conn, realm)
+    scan = latest_scan(conn, realm)
+    out = {"scan": _scan_info(scan), "installed": addon_installed(cfg or {}), "items": [],
+           "totals": {"items": 0, "listings": 0, "qty": 0, "cost": 0, "revenue": 0, "profit": 0,
+                      "profit_game_price": 0}}
+    if not scan:
+        return out
+    items = {}
+    for iid, cnt, buyout, vs, name, quality, game in conn.execute(
+            "SELECT a.item_id, a.count, a.buyout, i.vendor_sell, i.name, i.quality, "
+            "EXISTS(SELECT 1 FROM item_sell s WHERE s.id=a.item_id) "
+            "FROM ah_auctions a JOIN items i ON i.id=a.item_id "
+            "WHERE a.scan_id=? AND a.buyout>0 AND a.count>0 AND i.vendor_sell>0 AND a.buyout < a.count*i.vendor_sell",
+            (scan["id"],)):
+        e = items.get(iid)
+        if e is None:
+            e = items[iid] = {"item_id": iid, "name": name, "quality": quality if quality is not None else 1,
+                              "vendor_sell": vs, "game_price": bool(game), "listings": 0, "qty": 0, "cost": 0,
+                              "revenue": 0, "profit": 0, "min_unit": None, "max_unit": None}
+        unit = buyout / cnt
+        e["listings"] += 1
+        e["qty"] += cnt
+        e["cost"] += buyout
+        e["revenue"] += cnt * vs
+        e["profit"] += cnt * vs - buyout
+        e["min_unit"] = unit if e["min_unit"] is None else min(e["min_unit"], unit)
+        e["max_unit"] = unit if e["max_unit"] is None else max(e["max_unit"], unit)
+    lst = sorted(items.values(), key=lambda e: (-e["profit"], e["item_id"]))
+    for e in lst:
+        e["min_unit"], e["max_unit"] = round(e["min_unit"], 2), round(e["max_unit"], 2)
+    t = out["totals"]
+    for e in lst:
+        t["items"] += 1
+        for k in ("listings", "qty", "cost", "revenue", "profit"):
+            t[k] += e[k]
+        if e["game_price"]:
+            t["profit_game_price"] += e["profit"]
+    out["items"] = lst[:max(1, int(limit))]
+    return out
+
+
 def buy_cost(stacks, qty):
     """stacks: [(unit, count)] with buyout. Buys whole stacks from the cheapest up until qty is covered."""
     need = max(0, int(qty))

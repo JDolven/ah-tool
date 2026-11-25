@@ -117,6 +117,18 @@ check(json.loads(tt[11287]).get("sell_price") == 254, "tooltip shows the game's 
 check("sell_price" not in json.loads(tt[2592]), "sell price 0: no Sell Price line %s" % tt[2592])
 check(tt[2589] == "not json", "broken tooltip data left alone")
 
+# vendor flips: every listing of the latest full scan under what a vendor pays (Wool Cloth: game price 0 -> none)
+conn.execute("UPDATE items SET vendor_sell=150 WHERE id=2589")  # Linen: listed at 100/unit in both scans
+vf = market.vendor_flips(conn, cfg)
+it = {e["item_id"]: e for e in vf["items"]}
+check(list(it) == [2589] and it[2589]["qty"] == 20 and it[2589]["listings"] == 1, "vendor flips: one listing %s" % vf)
+check(it[2589]["cost"] == 2000 and it[2589]["revenue"] == 3000 and it[2589]["profit"] == 1000 and it[2589]["game_price"],
+      "vendor flips: cost, revenue, profit %s" % it[2589])
+check(vf["totals"]["profit"] == 1000 and vf["totals"]["profit_game_price"] == 1000 and vf["totals"]["qty"] == 20,
+      "vendor flips totals %s" % vf["totals"])
+conn.execute("UPDATE items SET vendor_sell=13 WHERE id=2589")
+check(market.vendor_flips(conn, cfg)["totals"]["items"] == 0, "nothing under vendor price -> empty")
+
 # the client's hotfix cache grows while you play (new Forever prices): tooltips are rebuilt when it changes
 from ahtool import staticdata, tooltipdata  # noqa: E402
 conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('tooltip_version', ?)", (tooltipdata.VERSION,))

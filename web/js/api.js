@@ -233,6 +233,7 @@ export const api = {
   leveling: (profId, opts = {}) => get(`/api/leveling/${enc(profId)}?${levelQuery(opts)}`),
   // v5 – AH Tool Logger (full scans, sales, own auctions)
   itemMarket: (id, qty) => get(`/api/item/${enc(id)}/market${qty ? `?qty=${qty}` : ''}`),
+  vendorFlips: () => get('/api/market/vendor-flips'),
   activity: (days = 7) => get(`/api/market/activity?days=${days}`),
   mySales: (days = 30) => get(`/api/market/my?days=${days}`),
   report: (date = '') => get(`/api/market/report${date ? `?date=${enc(date)}` : ''}`),

@@ -1,7 +1,7 @@
 import { api } from '../api.js';
 import {
   esc, money, num, pct, itemLink, reasonBadge, discountBar, REASONS, debounce,
-  noData, errorState, skeletonRows, emptyState, isNum, confBadge, flagChip,
+  noData, errorState, skeletonRows, emptyState, isNum, confBadge, flagChip, tile, relTime,
 } from '../util.js';
 import { DataTable } from '../table.js';
 import { watchBtn } from '../ui.js';
@@ -25,6 +25,7 @@ export async function render(ctx) {
         <p class="lead">Items priced below <strong>market price</strong> – the median of the daily lowest price over the 14 days before the latest scan – or below what a vendor pays.</p>
       </div>
     </header>
+    <div id="vflip"></div>
     <section class="card filters">
       <div class="filter-row">
         <label class="field field-slider">
@@ -144,7 +145,51 @@ export async function render(ctx) {
     })
   );
 
-  await load();
+  await Promise.all([load(), loadFlips(el, ctx)]);
+}
+
+// ---- buy everything below vendor price (AH Tool Logger full scan: every listing, not just the cheapest)
+async function loadFlips(el, ctx) {
+  const box = el.querySelector('#vflip');
+  let r;
+  try {
+    r = await api.vendorFlips();
+  } catch (err) {
+    if (ctx.alive()) box.innerHTML = '';
+    return;
+  }
+  if (!ctx.alive()) return;
+  if (!r || !r.scan) {
+    box.innerHTML = '';
+    return;
+  }
+  const t = r.totals || {};
+  const unverified = (t.profit || 0) - (t.profit_game_price || 0);
+  box.innerHTML = `
+    <section class="card vflip-card">
+      <div class="card-head"><h2>Buy everything below vendor price</h2>
+        <span class="card-note">Every listing in the full scan of ${esc(relTime(r.scan.ts))} whose buyout is under what a vendor pays – bought and sold to a vendor (no AH cut)</span></div>
+      <div class="tiles tiles-compact">
+        ${tile('Profit', `<span class="${t.profit > 0 ? 'up' : ''}">${money(t.profit)}</span>`, unverified > 0 ? `${money(unverified)} of it uses Classic vendor prices` : 'all vendor prices from the game')}
+        ${tile('Cost', money(t.cost), `vendor pays ${money(t.revenue)}`)}
+        ${tile('Units', num(t.qty), `${num(t.listings)} listings`)}
+        ${tile('Items', num(t.items))}
+      </div>
+      <div id="vflip-table"></div>
+    </section>`;
+  if (!(r.items || []).length) {
+    box.querySelector('#vflip-table').innerHTML = emptyState('Nothing below vendor price', 'No listing in the latest full scan sells for less than a vendor pays.');
+    return;
+  }
+  new DataTable(box.querySelector('#vflip-table'), [
+    { key: 'name', label: 'Item', sort: (x) => String(x.name || '').toLowerCase(),
+      render: (x) => `${itemLink(x.item_id, x.name, x.quality)}${x.game_price ? '' : ' <span class="tag-mini warn" title="Vendor price from the Classic Era tables – Forever may pay less. A full scan with AH Tool Logger 1.5 or seeing the item in your bags fetches the real price.">Classic price</span>'}` },
+    { key: 'qty', label: 'Units', align: 'right', render: (x) => `${num(x.qty)}<div class="cell-sub">${num(x.listings)} listing${x.listings === 1 ? '' : 's'}</div>` },
+    { key: 'max_unit', label: 'Pay up to', align: 'right', hideSm: true, render: (x) => money(x.max_unit) },
+    { key: 'vendor_sell', label: 'Vendor pays', align: 'right', hideSm: true, render: (x) => money(x.vendor_sell) },
+    { key: 'cost', label: 'Cost', align: 'right', hideSm: true, render: (x) => money(x.cost) },
+    { key: 'profit', label: 'Profit', align: 'right', defaultDir: 'desc', render: (x) => `<span class="up">${money(x.profit, { signed: true })}</span>` },
+  ], { sortKey: 'profit', sortDir: 'desc', rowKey: (x) => x.item_id, limit: 25 }).setRows(r.items);
 }
 
 function columns(getWatched) {
