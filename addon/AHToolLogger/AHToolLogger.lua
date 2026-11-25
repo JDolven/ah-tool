@@ -60,7 +60,7 @@ local function noteSell(itemId)
   if ok and type(price) == "number" and price >= 0 then
     db().sell[itemId] = price
     if sellWait[itemId] then sellWait[itemId] = nil; sellWaiting = sellWaiting - 1 end
-  elseif ok and not sellWait[itemId] and sellWaiting < 5000 then
+  elseif ok and not sellWait[itemId] and sellWaiting < 50000 then
     sellWait[itemId] = true  -- GetItemInfo asked the server; the answer arrives as GET_ITEM_INFO_RECEIVED
     sellWaiting = sellWaiting + 1
     if sellWaiting == 1 then frame:RegisterEvent("GET_ITEM_INFO_RECEIVED") end
@@ -76,6 +76,33 @@ local function onItemInfo(itemId, success)
   if sellWaiting <= 0 then
     sellWaiting = 0
     frame:UnregisterEvent("GET_ITEM_INFO_RECEIVED")
+  end
+end
+
+-- Items of the last full scan, retried a few times after the scan: many custom Forever items are not loaded yet
+-- while the scan is read, and GET_ITEM_INFO_RECEIVED does not always arrive for every one of them.
+local lastScanItems = {}
+
+local function scanPriceCount()
+  local have, total = 0, 0
+  local sell = db().sell
+  for _, id in ipairs(lastScanItems) do
+    total = total + 1
+    if sell[id] then have = have + 1 end
+  end
+  return have, total
+end
+
+local function retryScanPrices()
+  local sell = db().sell
+  for _, id in ipairs(lastScanItems) do
+    if not sell[id] then
+      if sellWait[id] then  -- ask again even if an earlier request never answered
+        sellWait[id] = nil
+        sellWaiting = sellWaiting - 1
+      end
+      noteSell(id)
+    end
   end
 end
 
@@ -256,6 +283,11 @@ local function readFullScan()
     scans[#scans + 1] = { t = t, realm = realm, faction = faction, char = char, src = source, api = MODERN and "modern" or "legacy",
                           total = total, n = n, d = table.concat(out, ";"), nm = table.concat(nameList, ";") }
     while #scans > KEEP_SCANS do table.remove(scans, 1) end
+    lastScanItems = {}
+    for id in pairs(priced) do lastScanItems[#lastScanItems + 1] = id end
+    for _, delay in ipairs({ 10, 60, 180 }) do
+      C_Timer.After(delay, function() pcall(retryScanPrices) end)
+    end
     msg(string.format("saved full scan with %d auctions. /reload or log out to send it to AH Tool.", n))
   end
   step()
@@ -578,6 +610,11 @@ SlashCmdList.AHTOOLLOGGER = function(arg)
     local nm, ns = 0, 0
     for _ in pairs(d.mail) do nm = nm + 1 end
     for _ in pairs(d.sell) do ns = ns + 1 end
+    local have, total = scanPriceCount()
+    if total > 0 then
+      msg(string.format("vendor sell prices for %d of the %d items in this session's last scan%s.", have, total,
+        have < total and " - more arrive as the game loads them; wait a minute before /reload" or ""))
+    end
     msg(string.format("%d full scan(s) stored%s, %d mail record(s), %d vendor sell price(s). Auction House API: %s.",
       #d.scans, last and (", last " .. date("%Y-%m-%d %H:%M", last.t) .. " (" .. last.n .. " auctions)") or "", nm,
       ns, MODERN and "modern" or (LEGACY and "legacy" or "none")))
