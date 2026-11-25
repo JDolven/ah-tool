@@ -143,6 +143,12 @@ check(it[2589]["cost"] == 2000 and it[2589]["revenue"] == 3000 and it[2589]["pro
       "vendor flips: cost, revenue, profit %s" % it[2589])
 check(vf["totals"]["profit"] == 1000 and vf["totals"]["profit_game_price"] == 1000 and vf["totals"]["qty"] == 20,
       "vendor flips totals %s" % vf["totals"])
+from ahtool import analytics  # noqa: E402
+conn.execute("INSERT OR REPLACE INTO price_current VALUES('PvP', 2589, 100, 20, 2511, 1)")
+analytics.invalidate()
+dl = {d["item_id"]: d for d in analytics.deals(conn, cfg, realm="PvP")}
+check(dl.get(2589, {}).get("vendor_profit_total") == 1000 and dl[2589]["vendor_qty"] == 20,
+      "deals row carries the total vendor profit of the scan %s" % dl.get(2589))
 conn.execute("UPDATE items SET vendor_sell=13 WHERE id=2589")
 check(market.vendor_flips(conn, cfg)["totals"]["items"] == 0, "nothing under vendor price -> empty")
 

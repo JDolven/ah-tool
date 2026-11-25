@@ -730,6 +730,7 @@ function deals(threshold, minValue, reason, includeLow) {
     out.push({
       item_id: id, name: it.name, quality: it.quality, price: cur.price, baseline, discount,
       available: cur.available, days_of_data: (DAILY.get(id) || []).length, reasons, vendor_profit,
+      vendor_profit_total: vendor_profit ? vendor_profit * cur.available : null, vendor_qty: vendor_profit ? cur.available : null,
       professions: reasons.includes('cheap_reagent') ? profs : [], score: Math.round(score * 1000) / 1000,
       for_my_crafts: myReagentIds().has(id),
       confidence: conf, price_flag: priceFlag(id),

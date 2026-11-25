@@ -1086,8 +1086,6 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                 except ValueError:
                     raise BadRequest("days/limit must be numbers")
                 return market.activity(conn, cfg, days, limit, realm)
-            if path == "/api/market/vendor-flips":
-                return market.vendor_flips(conn, cfg, realm)
             if path == "/api/market/report":
                 from . import report
                 date = qs.get("date") or None
