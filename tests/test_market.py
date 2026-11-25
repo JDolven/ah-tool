@@ -117,6 +117,23 @@ check(json.loads(tt[11287]).get("sell_price") == 254, "tooltip shows the game's 
 check("sell_price" not in json.loads(tt[2592]), "sell price 0: no Sell Price line %s" % tt[2592])
 check(tt[2589] == "not json", "broken tooltip data left alone")
 
+# sold only when it could not have run out: a "long" (2-12 h) auction gone after 11 h most likely expired
+row = (7, 0, 1, 500, 400, 0, 3, "Ann")
+check(market.diff_scans([row], [], 11 * 3600)[0][5] == "expired", "long auction gone after 11 h -> expired")
+check(market.diff_scans([row], [], 3600)[0][5] == "sold", "long auction gone after 1 h -> sold")
+check(market.diff_scans([row[:6] + (4, "Ann")], [], 11 * 3600)[0][5] == "sold", "very long gone after 11 h -> sold")
+check(market.diff_scans([row[:6] + (1, "Ann")], [], 600)[0][5] == "expired", "short auction gone -> may have expired")
+
+# incomplete scans: judged by what the game reported and by the items on sale, not by the number of auctions
+cur = conn.cursor()
+rf = conn.execute("SELECT realm, faction FROM ah_scans LIMIT 1").fetchone()
+prev_items = conn.execute("SELECT COUNT(*) FROM ah_scan_items WHERE scan_id=(SELECT MAX(id) FROM ah_scans)").fetchone()[0]
+far = 2 ** 40
+check(not market._is_partial(cur, rf[0], rf[1], far, 10, 10, prev_items), "half the auctions, same items -> complete")
+check(market._is_partial(cur, rf[0], rf[1], far, 10, 20, prev_items), "read fewer auctions than reported -> partial")
+check(market._is_partial(cur, rf[0], rf[1], far, 0, 0, 0), "empty scan -> partial")
+check(market._is_partial(cur, rf[0], rf[1], far, 10, 10, 0) == (prev_items > 0), "far fewer items -> partial")
+
 # vendor flips: every listing of the latest full scan under what a vendor pays (Wool Cloth: game price 0 -> none)
 conn.execute("UPDATE items SET vendor_sell=150 WHERE id=2589")  # Linen: listed at 100/unit in both scans
 vf = market.vendor_flips(conn, cfg)

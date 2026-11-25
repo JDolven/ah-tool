@@ -144,9 +144,15 @@ What the app does with it:
   `logger_max_age_h` = 24 hours old) and warns when not enough is listed.
 
 **How sales are estimated:** two full scans less than 48 hours apart are compared. An auction that is gone in the
-newer scan while it still had time left is counted as *sold*. If it could have run out (its time-left category is
-shorter than the gap) it counts as *expired*, and if the same seller posted that item again it counts as *relisted*.
-Cancelled auctions look like sales, so the numbers are estimates – several scans a day give the best results.
+newer scan counts as *sold* only if it could not have run out: the least time left of its category (short 0, medium
+30 min, long 2 h, very long 12 h) is longer than the gap between the scans. Otherwise it counts as *expired*, and if the
+same seller posted that item again it counts as *relisted*. Most auctions run 8 hours, so an evening and a morning scan
+show mostly expired auctions; cancelled auctions look like sales. The numbers are estimates – several scans a day, a
+few hours apart, give the best results.
+
+A scan counts as incomplete (kept, but not used for prices, sales or listings) when the logger read fewer auctions
+than the game reported, or when it lists far fewer different items than the previous scan. The number of auctions
+alone is not used: it halves overnight as auctions run out.
 Raw auctions are kept for the newest `logger_keep_raw_scans` (6) scans; per-item summaries and sales are kept forever.
 
 ## Web version (share prices with other players)

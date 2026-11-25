@@ -23,6 +23,9 @@ from . import luaparse
 # the longest posting duration (24h on Forever).
 TIME_LEFT_MAX = {1: 30 * 60, 2: 2 * 3600, 3: 12 * 3600, 4: 24 * 3600}
 TIME_LEFT_TEXT = {1: "< 30m", 2: "30m - 2h", 3: "2h - 12h", 4: "12h - 24h"}
+# Least time an auction in each band still had. A gone auction counts as sold only when it could not have run out
+# (gap < this): most auctions run 8 h, so between an evening and a morning scan nearly all of them simply expire.
+TIME_LEFT_MIN = {1: 0, 2: 30 * 60, 3: 2 * 3600, 4: 12 * 3600}
 MAX_DIFF_GAP = 48 * 3600
 
 SCHEMA = """
@@ -228,7 +231,7 @@ def diff_scans(prev_rows, cur_rows, gap):
     out = []
     for r in really_gone:
         iid, suffix, count, buyout, min_bid, bid, tl, owner = r[:8]
-        could_expire = gap >= TIME_LEFT_MAX.get(tl, 24 * 3600)
+        could_expire = gap >= TIME_LEFT_MIN.get(tl, 0)
         if owner and new_by_owner.get((iid, owner), 0) > 0:
             new_by_owner[(iid, owner)] -= 1
             kind = "relisted"
@@ -299,6 +302,40 @@ def _diff_pending(conn):
                          [(sid, prev[0], ts) + s for s in sales])
         n_sales += sum(1 for s in sales if s[5] == "sold")
     return n_sales
+
+
+PARTIAL_RULE = "2"
+
+
+def _is_partial(cur, realm, faction, ts, n, total, items):
+    """A scan is incomplete when the logger read fewer auctions than the game reported, when it hit the memory cap, or
+    when it lists far fewer different items than the previous complete own scan. The number of auctions alone says
+    little: it halves overnight as auctions run out, while the items on sale stay much the same."""
+    if not n or n >= MAX_SCAN_ROWS or (total and n < 0.95 * total):
+        return True
+    # Compare with the previous own scan only: a pulled web scan is another player's claim.
+    prev = cur.execute("SELECT (SELECT COUNT(*) FROM ah_scan_items i WHERE i.scan_id=s.id) FROM ah_scans s "
+                       "WHERE realm=? AND faction=? AND partial=0 AND ts<? AND COALESCE(source,'')<>'web' "
+                       "ORDER BY ts DESC LIMIT 1", (realm, faction, ts)).fetchone()
+    return bool(prev and prev[0] and items < 0.6 * prev[0])
+
+
+def _recheck_partial(cur):
+    """Once after an upgrade: judge own scans that still have their raw auctions by the current rule (the old one
+    compared auction counts and marked complete morning scans as partial). Re-accepted scans get diffed and priced."""
+    r = cur.execute("SELECT value FROM meta WHERE key='partial_rule'").fetchone()
+    if r and r[0] == PARTIAL_RULE:
+        return 0
+    n = 0
+    for sid, realm, faction, ts, cnt, total in cur.execute(
+            "SELECT id, realm, faction, ts, n, total FROM ah_scans WHERE partial=1 AND raw_kept=1 "
+            "AND COALESCE(source,'')<>'web' ORDER BY ts").fetchall():
+        items = cur.execute("SELECT COUNT(*) FROM ah_scan_items WHERE scan_id=?", (sid,)).fetchone()[0]
+        if not _is_partial(cur, realm, faction, ts, cnt, total, items):
+            cur.execute("UPDATE ah_scans SET partial=0, diffed=0 WHERE id=?", (sid,))
+            n += 1
+    cur.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('partial_rule', ?)", (PARTIAL_RULE,))
+    return n
 
 
 def _drop_scan(cur, sid):
@@ -414,7 +451,8 @@ def ingest(conn, cfg, force=False):
         # an unchanged file is read again once when stored scans still need a realm or prices (after an upgrade)
         todo = conn.execute("SELECT 1 FROM ah_scans WHERE COALESCE(source,'')<>'web' AND (realm='' OR "
                             "(priced=0 AND partial=0)) LIMIT 1").fetchone()
-        if not force and r and r[0] == str(mtime) and not (todo and (cfg or {}).get("prices_from_logger") is not False):
+        rule = conn.execute("SELECT value FROM meta WHERE key='partial_rule'").fetchone()
+        if not force and r and r[0] == str(mtime) and (rule and rule[0] == PARTIAL_RULE)                 and not (todo and (cfg or {}).get("prices_from_logger") is not False):
             return {"skipped": True}
         data = luaparse.parse_file(path).get("AHToolLoggerDB") or {}
         if not isinstance(data, dict):
@@ -453,12 +491,8 @@ def ingest(conn, cfg, force=False):
                 # GetReplicateItemTimeLeft may return 0-based bands; normalise to 1..4
                 if rows and min(r[6] for r in rows) == 0 and max(r[6] for r in rows) <= 3:
                     rows = [r[:6] + (r[6] + 1,) + r[7:] for r in rows]
-                # Compare with the previous own scan only: a pulled web scan's n is another player's claim.
-                prev = cur.execute("SELECT n FROM ah_scans WHERE realm=? AND faction=? AND partial=0 AND ts<? "
-                                   "AND COALESCE(source,'')<>'web' ORDER BY ts DESC LIMIT 1",
-                                   (realm, faction, ts)).fetchone()
-                partial = 1 if ((prev and prev[0] and len(rows) < 0.6 * prev[0]) or not rows
-                                or len(rows) >= MAX_SCAN_ROWS) else 0  # a truncated scan must not be diffed
+                partial = 1 if _is_partial(cur, realm, faction, ts, len(rows), _i(s.get("total")),
+                                           len({r[0] for r in rows})) else 0  # a truncated scan must not be diffed
                 cur.execute("INSERT INTO ah_scans(ts,realm,faction,char,source,total,n,partial) VALUES(?,?,?,?,?,?,?,?)",
                             (ts, realm, faction, _s(s.get("char")), _s(s.get("src")), _i(s.get("total")),
                              len(rows), partial))
@@ -466,6 +500,7 @@ def ingest(conn, cfg, force=False):
                 cur.executemany("INSERT INTO ah_auctions VALUES(?,?,?,?,?,?,?,?,?)", [(sid,) + r for r in rows])
                 cur.executemany("INSERT INTO ah_scan_items VALUES(?,?,?,?,?,?,?)", _scan_item_rows(sid, rows))
                 new_scans += 1
+            _recheck_partial(cur)
             sold = _diff_pending(conn)
             # keep raw auctions only for the newest scans per realm/faction - your own and pulled ones (source
             # 'web') counted separately, so other players' scans never push out the one your next scan diffs against
