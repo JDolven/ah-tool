@@ -10,9 +10,9 @@
 -- timeLeft is the band 1..4 (short, medium, long, very long).
 -- A scan also carries nm = "itemId:quality:name;..." - one name per item, so the app can name custom realm items
 -- that are missing from its static data.
--- sell = { [itemId] = copper }: the vendor sell price the game reports (GetItemInfo) for every item seen in a full
--- scan, in a profession window or in your bags - no need to own the item. The app prefers it over the Classic Era client tables,
--- which Forever has changed for some items.
+-- sell = { [itemId] = copper }: the vendor sell price the game reports (C_Item.GetItemInfo) for every item seen in
+-- a full scan, in a profession window or in your bags - no need to own the item. The app prefers it over the Classic
+-- Era client tables, which Forever has changed for some items.
 
 local VERSION = 1
 local KEEP_SCANS = 3          -- full scans kept in the file (the app imports them on /reload and keeps the history)
@@ -46,8 +46,11 @@ end
 
 local sellWait, sellWaiting = {}, 0   -- items the client is still loading (GET_ITEM_INFO_RECEIVED)
 
+-- Newer clients (Forever) have only C_Item.GetItemInfo; the global GetItemInfo is gone there.
+local itemInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+
 local function sellOf(itemId)
-  return select(11, GetItemInfo(itemId))
+  return select(11, itemInfo(itemId))
 end
 
 local function noteSell(itemId)
