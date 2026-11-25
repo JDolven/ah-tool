@@ -11,7 +11,7 @@
 -- A scan also carries nm = "itemId:quality:name;..." - one name per item, so the app can name custom realm items
 -- that are missing from its static data.
 -- sell = { [itemId] = copper }: the vendor sell price the game reports (GetItemInfo) for every item seen in a full
--- scan or in a profession window - no need to own the item. The app prefers it over the Classic Era client tables,
+-- scan, in a profession window or in your bags - no need to own the item. The app prefers it over the Classic Era client tables,
 -- which Forever has changed for some items.
 
 local VERSION = 1
@@ -495,7 +495,26 @@ end
 
 local mailTimer = false
 
-local profTimer = false
+-- Bags: everything you carry (crafted items that never reach the AH, e.g. wands).
+local function readBags()
+  local numSlots = (C_Container and C_Container.GetContainerNumSlots) or GetContainerNumSlots
+  local itemId = (C_Container and C_Container.GetContainerItemID) or GetContainerItemID
+  if not numSlots or not itemId then return end
+  for bag = 0, (NUM_BAG_SLOTS or 4) do
+    for slot = 1, numSlots(bag) or 0 do
+      noteSell(itemId(bag, slot))
+    end
+  end
+end
+
+local profTimer, bagTimer = false, false
+
+local function bagsSoon(delay)
+  if not bagTimer then
+    bagTimer = true
+    C_Timer.After(delay, function() bagTimer = false; pcall(readBags) end)
+  end
+end
 
 frame:SetScript("OnEvent", function(_, event, ...)
   if event == "GET_ITEM_INFO_RECEIVED" then
@@ -531,14 +550,17 @@ frame:SetScript("OnEvent", function(_, event, ...)
       if api.event then frame:UnregisterEvent(api.event) end
     end
     restoreOthers()
+  elseif event == "BAG_UPDATE_DELAYED" then
+    bagsSoon(2)
   elseif event == "PLAYER_LOGIN" then
     db()
+    bagsSoon(5)
   end
 end)
 
 for _, ev in ipairs({ "PLAYER_LOGIN", "MAIL_INBOX_UPDATE", "AUCTION_HOUSE_SHOW", "AUCTION_HOUSE_CLOSED",
                       MODERN and "OWNED_AUCTIONS_UPDATED" or "AUCTION_OWNED_LIST_UPDATE",
-                      "TRADE_SKILL_SHOW", "TRADE_SKILL_UPDATE", "CRAFT_SHOW", "CRAFT_UPDATE" }) do
+                      "TRADE_SKILL_SHOW", "TRADE_SKILL_UPDATE", "CRAFT_SHOW", "CRAFT_UPDATE", "BAG_UPDATE_DELAYED" }) do
   pcall(frame.RegisterEvent, frame, ev)
 end
 
