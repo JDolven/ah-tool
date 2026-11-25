@@ -350,24 +350,6 @@ def parse_sell(v):
     return out
 
 
-def parse_vsold(v):
-    """Logger `vsold` table {itemId: {p = copper per unit, t = time}}: what a vendor actually paid -> {item_id: price}.
-    The Forever server pays less than the client's tooltip for some items, so these win over parse_sell."""
-    out = {}
-    if not isinstance(v, dict):
-        return out
-    for k, rec in v.items():
-        if len(out) >= MAX_SELL_ROWS:
-            break
-        p = rec.get("p") if isinstance(rec, dict) else None
-        if isinstance(p, bool) or isinstance(k, bool):
-            continue
-        iid, price = _i(k, -1), _i(p, -1)
-        if 0 < iid < 2 ** 31 and 0 <= price < 2 ** 40:
-            out[iid] = price
-    return out
-
-
 def _store_sell(cur, prices):
     if prices:
         now = int(time.time())
@@ -448,9 +430,7 @@ def ingest(conn, cfg, force=False):
                     for iid, v in parse_names(s.get("nm")).items():
                         names.setdefault(iid, v)
             new_names = _store_names(cur, names)
-            game_sell = parse_sell(data.get("sell"))
-            game_sell.update(parse_vsold(data.get("vsold")))  # paid at a vendor beats the tooltip
-            sell_changed = _store_sell(cur, game_sell)
+            sell_changed = _store_sell(cur, parse_sell(data.get("sell")))
             fallback = _realm_fallback(cur, data)
             if fallback:
                 # scans stored with an empty realm before this fix take the realm too (never over an existing one)

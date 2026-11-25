@@ -54,7 +54,7 @@ tmp = tempfile.mkdtemp()
 dbp = os.path.join(tmp, "t.db")
 conn = db.connect(dbp)
 conn.execute("INSERT INTO items(id, name, quality, vendor_sell) VALUES(2589, 'Linen Cloth', 1, 13), "
-             "(2592, 'Wool Cloth', 1, 33), (11287, 'Lesser Magic Wand', 2, 508), (11289, 'Lesser Mystic Wand', 2, 3581)")
+             "(2592, 'Wool Cloth', 1, 33), (11287, 'Lesser Magic Wand', 2, 508)")
 conn.commit()
 now = int(time.time())
 
@@ -76,8 +76,7 @@ lua = """AHToolLoggerDB = {
      ["price"] = 2000, ["fee"] = 100, ["count"] = 20, ["char"] = "Me" },
   ["expired|Wool Cloth||0|10|1"] = { ["t"] = %d, ["type"] = "expired", ["item"] = "Wool Cloth", ["count"] = 10 },
 },
-["sell"] = { [11287] = 254, [2589] = 13, [2592] = 0, [-5] = 1, [7] = -1, [8] = "x", [999999] = 77, [11289] = 3581 },
-["vsold"] = { [11289] = { ["p"] = 450, ["t"] = 1 }, [5] = { ["p"] = -3 }, [6] = 12 },
+["sell"] = { [11287] = 254, [2589] = 13, [2592] = 0, [-5] = 1, [7] = -1, [8] = "x", [999999] = 77 },
 }
 """ % (scan(now - 7200, s1), scan(now - 3600, s2, "253664:2:Forever Tunic;2589:1:Renamed Cloth;bad;7:x:"),
        now - 100, now - 5000, now - 4000)
@@ -102,9 +101,6 @@ check(market.apply_names(conn) == 1, "names re-applied after an items rebuild")
 # vendor sell prices the game reported (logger 1.3, GetItemInfo) win over the static data
 vs = dict(conn.execute("SELECT id, vendor_sell FROM items WHERE id IN (11287, 2589, 2592)").fetchall())
 check(vs == {11287: 254, 2589: 13, 2592: 0}, "game sell prices applied %s" % vs)
-check(conn.execute("SELECT vendor_sell FROM items WHERE id=11289").fetchone()[0] == 450,
-      "what a vendor paid (4s 50c) beats the tooltip's 35s 81c")
-check(market.parse_vsold({1: {"p": 7, "t": 1}, 2: 5, 3: {"p": -1}, 4: {"p": True}}) == {1: 7}, "parse_vsold")
 check(conn.execute("SELECT COUNT(*) FROM items WHERE id=999999").fetchone()[0] == 0,
       "a sell price never creates an item")
 check(market.parse_sell({1: 5, "2": 6, -1: 3, 3: -1, 4: True, 5: float("nan"), 6: 2 ** 41}) == {1: 5, 2: 6},

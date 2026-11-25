@@ -1,7 +1,7 @@
 ## Interface: 16001, 11508, 11509
 ## Title: AH Tool Logger
 ## Notes: Records full Auction House scans, your own auctions and AH mail for the AH Tool desktop app.
-## Version: 1.4
+## Version: 1.3
 ## Author: AH Tool
 ## SavedVariables: AHToolLoggerDB
 ## OptionalDeps: Auctionator
