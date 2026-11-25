@@ -127,6 +127,10 @@ records the raw data instead:
 - **Vendor sell prices** – the price the game itself reports (`GetItemInfo`) for every item in a full scan and every
   product and reagent in an open profession window; you don't need to own the items. The app uses them instead of the
   Classic Era client tables, which Forever has changed for some items (e.g. Lesser Magic Wand).
+- **What a vendor actually paid** – when you sell an item to a vendor, the money you got per unit. The Forever server
+  pays less than the game's own tooltip for some items (Lesser Mystic Wand: tooltip 35s 81c, vendor pays 4s 50c), and
+  nothing in the client knows that, so a price seen at a vendor wins over everything else. Sell one of an item once to
+  correct it. Damaged gear and unclear cases (several items sold at once, buyback) are skipped.
 
 Install: copy `addon/AHToolLogger` into `Interface/AddOns` and enable it on the
 character screen. Data reaches the app on `/reload` or logout, same as Auctionator (`SavedVariables/AHToolLogger.lua`).

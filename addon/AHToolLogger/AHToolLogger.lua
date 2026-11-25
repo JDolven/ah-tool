@@ -13,6 +13,9 @@
 -- sell = { [itemId] = copper }: the vendor sell price the game reports (GetItemInfo) for every item seen in a full
 -- scan or in a profession window - no need to own the item. The app prefers it over the Classic Era client tables,
 -- which Forever has changed for some items.
+-- vsold = { [itemId] = { p = copper per unit, t = time } }: what a vendor actually paid when you sold the item. The
+-- Forever server pays less than the client says for some items (Lesser Mystic Wand: tooltip 35s 81c, paid 4s 50c),
+-- so this wins over the tooltip price in the app.
 
 local VERSION = 1
 local KEEP_SCANS = 3          -- full scans kept in the file (the app imports them on /reload and keeps the history)
@@ -39,6 +42,7 @@ local function db()
   d.owned = d.owned or {}
   d.mail = d.mail or {}
   d.sell = d.sell or {}
+  d.vsold = d.vsold or {}
   return d
 end
 
@@ -495,11 +499,110 @@ end
 
 local mailTimer = false
 
+-- Vendor sales -----------------------------------------------------------------------------------------------------
+-- While a merchant is open, every money increase is matched against the bags: when exactly one kind of item went
+-- down (and none came in), the vendor paid <money gained> for <units gone>. Damaged gear is skipped (its price
+-- depends on durability), and so is anything ambiguous (several items sold between two checks, buyback, repairs).
+
+local merchantOpen, lastBags, lastMoney, saleTimer = false, nil, nil, false
+
+local function slotInfo(bag, slot)
+  if C_Container and C_Container.GetContainerItemInfo then
+    local info = C_Container.GetContainerItemInfo(bag, slot)
+    if info then return info.itemID, info.stackCount end
+    return nil
+  end
+  if GetContainerItemInfo then
+    local _, count, _, _, _, _, link, _, _, itemId = GetContainerItemInfo(bag, slot)
+    return itemId or linkId(link), count
+  end
+end
+
+local function slotDamaged(bag, slot)
+  local f = (C_Container and C_Container.GetContainerItemDurability) or GetContainerItemDurability
+  if not f then return false end
+  local cur, max = f(bag, slot)
+  return cur ~= nil and max ~= nil and max > 0 and cur < max
+end
+
+local function bagCounts()
+  local counts, damaged = {}, {}
+  local numSlots = (C_Container and C_Container.GetContainerNumSlots) or GetContainerNumSlots
+  if not numSlots then return nil end
+  for bag = 0, (NUM_BAG_SLOTS or 4) do
+    for slot = 1, numSlots(bag) or 0 do
+      local id, count = slotInfo(bag, slot)
+      if id then
+        counts[id] = (counts[id] or 0) + (count or 1)
+        if slotDamaged(bag, slot) then damaged[id] = true end
+      end
+    end
+  end
+  return counts, damaged
+end
+
+local function snapshotBags()
+  local ok, counts, damaged = pcall(bagCounts)
+  if ok and counts then
+    lastBags = { counts = counts, damaged = damaged, at = GetTime() }
+  else
+    lastBags = nil
+  end
+  lastMoney = GetMoney and GetMoney() or nil
+end
+
+local function checkSale()
+  if not merchantOpen or not lastBags or not lastMoney then return snapshotBags() end
+  local money = GetMoney()
+  local gained = money - lastMoney
+  local ok, counts = pcall(bagCounts)
+  if gained > 0 and ok and counts then
+    local soldId, soldN, ambiguous = nil, 0, false
+    for id, n in pairs(lastBags.counts) do
+      local d = n - (counts[id] or 0)
+      if d > 0 then
+        if soldId then ambiguous = true else soldId, soldN = id, d end
+      end
+    end
+    for id, n in pairs(counts) do
+      if n > (lastBags.counts[id] or 0) then ambiguous = true end  -- something came in: buyback or a purchase
+    end
+    if not soldId and not ambiguous and GetTime() - lastBags.at < 3 then
+      return  -- the money arrived before the bags changed: look again on BAG_UPDATE_DELAYED
+    end
+    if soldId and not ambiguous and not lastBags.damaged[soldId] then
+      db().vsold[soldId] = { p = math.floor(gained / soldN + 0.5), t = time() }
+    end
+  elseif ok and counts and gained == 0 and GetTime() - lastBags.at < 3 then
+    -- the bags changed but the money has not arrived yet (or the other way round): keep the old snapshot and
+    -- look again on the next PLAYER_MONEY / BAG_UPDATE_DELAYED
+    for id, n in pairs(lastBags.counts) do
+      if (counts[id] or 0) < n then return end
+    end
+  end
+  snapshotBags()
+end
+
+local function saleSoon()
+  if merchantOpen and not saleTimer then
+    saleTimer = true
+    C_Timer.After(0.3, function() saleTimer = false; pcall(checkSale) end)
+  end
+end
+
 local profTimer = false
 
 frame:SetScript("OnEvent", function(_, event, ...)
   if event == "GET_ITEM_INFO_RECEIVED" then
     onItemInfo(...)
+  elseif event == "MERCHANT_SHOW" then
+    merchantOpen = true
+    pcall(snapshotBags)
+  elseif event == "MERCHANT_CLOSED" then
+    merchantOpen = false
+    lastBags, lastMoney = nil, nil
+  elseif event == "PLAYER_MONEY" or event == "BAG_UPDATE_DELAYED" then
+    saleSoon()
   elseif event == "TRADE_SKILL_SHOW" or event == "TRADE_SKILL_UPDATE" or event == "CRAFT_SHOW"
       or event == "CRAFT_UPDATE" then
     if not profTimer then
@@ -538,7 +641,8 @@ end)
 
 for _, ev in ipairs({ "PLAYER_LOGIN", "MAIL_INBOX_UPDATE", "AUCTION_HOUSE_SHOW", "AUCTION_HOUSE_CLOSED",
                       MODERN and "OWNED_AUCTIONS_UPDATED" or "AUCTION_OWNED_LIST_UPDATE",
-                      "TRADE_SKILL_SHOW", "TRADE_SKILL_UPDATE", "CRAFT_SHOW", "CRAFT_UPDATE" }) do
+                      "TRADE_SKILL_SHOW", "TRADE_SKILL_UPDATE", "CRAFT_SHOW", "CRAFT_UPDATE",
+                      "MERCHANT_SHOW", "MERCHANT_CLOSED", "PLAYER_MONEY", "BAG_UPDATE_DELAYED" }) do
   pcall(frame.RegisterEvent, frame, ev)
 end
 
@@ -550,12 +654,14 @@ SlashCmdList.AHTOOLLOGGER = function(arg)
   else
     local d = db()
     local last = d.scans[#d.scans]
-    local nm, ns = 0, 0
+    local nm, ns, nv = 0, 0, 0
     for _ in pairs(d.mail) do nm = nm + 1 end
     for _ in pairs(d.sell) do ns = ns + 1 end
-    msg(string.format("%d full scan(s) stored%s, %d mail record(s), %d vendor sell price(s). Auction House API: %s.",
+    for _ in pairs(d.vsold) do nv = nv + 1 end
+    msg(string.format("%d full scan(s) stored%s, %d mail record(s), %d vendor sell price(s), %d seen at a vendor. "
+      .. "Auction House API: %s.",
       #d.scans, last and (", last " .. date("%Y-%m-%d %H:%M", last.t) .. " (" .. last.n .. " auctions)") or "", nm,
-      ns, MODERN and "modern" or (LEGACY and "legacy" or "none")))
+      ns, nv, MODERN and "modern" or (LEGACY and "legacy" or "none")))
     msg("/ahtl scan - start a full scan (Auction House must be open). Auctionator's Full Scan is recorded too.")
   end
 end
