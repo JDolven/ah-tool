@@ -1249,24 +1249,22 @@ button.sr-row { width: 100%; border: 0; background: transparent; text-align: lef
 .dl-steps li + li { margin-top: 6px; }
 .dl-pre { margin: 0 0 12px; padding: 10px 12px; background: var(--surface-2); border-radius: 6px; overflow-x: auto; font-size: 13px; }
 
-/* Browse (Auction House categories) */
-.br-layout { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 18px; align-items: start; }
-.br-tree { padding: 8px; position: sticky; top: 76px; max-height: calc(100vh - 96px); overflow-y: auto; }
-.br-node { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px;
-  border: 0; border-radius: 6px; background: transparent; color: var(--text-2); font: inherit; font-size: 13.5px;
-  text-align: left; cursor: pointer; }
-.br-node:hover { background: var(--surface-2); color: var(--text); }
-.br-node.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
-.br-node.d0 { font-weight: 600; color: var(--text); }
-.br-node.d0.on { color: var(--accent); }
-.br-node.d1 { padding-left: 22px; }
-.br-node.d2 { padding-left: 36px; font-size: 13px; }
-.br-count { font-size: 11.5px; color: var(--muted); font-weight: 400; }
+/* Browse (Auction House categories): the tree sits in the sidebar under "Browse" */
+.sidebar .nav { flex: 1 1 auto; min-height: 0; overflow-x: hidden; overflow-y: auto; margin: 0 -14px; padding: 0 14px; }
+.nav-sub { display: flex; flex-direction: column; gap: 1px; margin: 2px 0 6px 10px; padding-left: 8px; border-left: 1px solid var(--border); }
+.nav-sub[hidden] { display: none; }
+.nav .nav-sub a.br-node { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 8px;
+  border-radius: 6px; color: var(--text-2); font-size: 13px; font-weight: 500; }
+.nav .nav-sub a.br-node:hover { background: var(--surface-2); color: var(--text); text-decoration: none; }
+.nav .nav-sub a.br-node.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.nav .nav-sub a.br-node.on::before { content: none; }
+.nav .nav-sub a.br-node.d0 { color: var(--text); }
+.nav .nav-sub a.br-node.d0.on { color: var(--accent); }
+.nav .nav-sub a.br-node.d1 { padding-left: 20px; font-size: 12.5px; }
+.nav .nav-sub a.br-node.d2 { padding-left: 32px; font-size: 12px; }
+.br-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.br-count { flex: none; font-size: 11px; color: var(--muted); font-weight: 400; }
 .br-range { display: flex; align-items: center; gap: 6px; }
 .br-range input { width: 64px; }
 .br-lvl { min-width: 0; }
 .row-stale td { opacity: 0.6; }
-@media (max-width: 900px) {
-  .br-layout { grid-template-columns: minmax(0, 1fr); }
-  .br-tree { position: static; max-height: 240px; }
-}

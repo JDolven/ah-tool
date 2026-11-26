@@ -22,34 +22,40 @@ function readState(query) {
   };
 }
 
-function writeHash(st) {
+function hrefFor(st, over) {
+  const n = { ...st, ...over };
   const q = new URLSearchParams();
-  if (st.cls !== null) q.set('class', String(st.cls));
-  if (st.sub !== null) q.set('sub', String(st.sub));
-  if (st.slot) q.set('slot', st.slot);
-  if (st.q) q.set('q', st.q);
-  if (st.min !== null) q.set('min', String(st.min));
-  if (st.max !== null) q.set('max', String(st.max));
-  if (st.quality !== null) q.set('quality', String(st.quality));
-  if (st.all) q.set('all', '1');
-  const h = `#/browse${q.toString() ? `?${q}` : ''}`;
+  if (n.cls !== null) q.set('class', String(n.cls));
+  if (n.sub !== null) q.set('sub', String(n.sub));
+  if (n.slot) q.set('slot', n.slot);
+  if (n.q) q.set('q', n.q);
+  if (n.min !== null) q.set('min', String(n.min));
+  if (n.max !== null) q.set('max', String(n.max));
+  if (n.quality !== null) q.set('quality', String(n.quality));
+  if (n.all) q.set('all', '1');
+  return `#/browse${q.toString() ? `?${q}` : ''}`;
+}
+
+function writeHash(st) {
+  const h = hrefFor(st, {});
   if (location.hash !== h) history.replaceState(null, '', h);
 }
 
+// The category tree lives in the sidebar under "Browse" (#nav-browse): links, so a category can be bookmarked.
 function treeHtml(cats, st) {
   const on = (c, s, sl) => st.cls === c && st.sub === s && (st.slot || '') === (sl || '');
-  const btn = (label, count, c, s, sl, depth) => `<button type="button" class="br-node d${depth} ${on(c, s, sl) ? 'on' : ''}"
-      data-cls="${c ?? ''}" data-sub="${s ?? ''}" data-slot="${esc(sl || '')}" aria-pressed="${on(c, s, sl)}">
-      <span class="br-label">${esc(label)}</span><span class="br-count">${num(count)}</span></button>`;
+  const link = (label, count, c, s, sl, depth) => `<a class="br-node d${depth} ${on(c, s, sl) ? 'on' : ''}"
+      href="${esc(hrefFor(st, { cls: c, sub: s, slot: sl || '' }))}" ${on(c, s, sl) ? 'aria-current="page"' : ''}>
+      <span class="br-label">${esc(label)}</span><span class="br-count">${num(count)}</span></a>`;
   const total = cats.reduce((a, c) => a + c.count, 0);
-  let html = btn('All items', total, null, null, '', 0);
+  let html = link('All items', total, null, null, '', 0);
   for (const c of cats) {
-    html += btn(c.name, c.count, c.id, null, '', 0);
+    html += link(c.name, c.count, c.id, null, '', 0);
     if (st.cls !== c.id) continue;
     for (const s of c.subclasses) {
-      html += btn(s.name, s.count, c.id, s.id, '', 1);
+      html += link(s.name, s.count, c.id, s.id, '', 1);
       if (st.sub !== s.id || s.slots.length < 2) continue;
-      for (const sl of s.slots) html += btn(sl.name, sl.count, c.id, s.id, sl.name, 2);
+      for (const sl of s.slots) html += link(sl.name, sl.count, c.id, s.id, sl.name, 2);
     }
   }
   return html;
@@ -63,10 +69,8 @@ export async function render(ctx) {
     .join('');
   el.innerHTML = `
     <header class="page-head"><div><h1>Browse</h1>
-      <p class="lead">Every item with an AH price, sorted into the Auction House categories. Pick a category on the left.</p></div></header>
-    <div class="br-layout">
-      <nav class="card br-tree" id="br-tree" aria-label="Categories">${skeletonRows(10, 1)}</nav>
-      <div class="br-main">
+      <p class="lead">Every item with an AH price, sorted into the Auction House categories. Pick a category under Browse in the menu.</p></div></header>
+    <div class="br-main">
         <section class="card filters">
           <div class="filter-row">
             <label class="field field-grow"><span class="field-label">Search</span>
@@ -82,8 +86,9 @@ export async function render(ctx) {
         </section>
         <div class="result-bar" id="br-summary"></div>
         <section class="card card-flush" id="br-table">${skeletonRows(12, 6)}</section>
-      </div>
     </div>`;
+  const nav = document.getElementById('nav-browse');
+  if (nav) nav.hidden = false;
 
   const table = new DataTable(el.querySelector('#br-table'), [
     {
@@ -115,21 +120,12 @@ export async function render(ctx) {
       return;
     }
     if (!ctx.alive() || my !== token) return;
-    el.querySelector('#br-tree').innerHTML = treeHtml(r.categories || [], st);
+    if (nav) nav.innerHTML = treeHtml(r.categories || [], st);
     table.setRows(r.items || []);
     el.querySelector('#br-summary').innerHTML = `<span><strong>${num(r.total)}</strong> item${r.total === 1 ? '' : 's'}</span>${r.total > r.items.length ? `<span class="muted">showing the ${num(r.items.length)} with the most listed – narrow the search for the rest</span>` : ''}`;
   };
   const loadSoon = debounce(load, 250);
 
-  el.querySelector('#br-tree').addEventListener('click', (e) => {
-    const b = e.target.closest('.br-node');
-    if (!b) return;
-    const v = (x) => (x === '' ? null : Number(x));
-    st.cls = v(b.dataset.cls);
-    st.sub = v(b.dataset.sub);
-    st.slot = b.dataset.slot || '';
-    load();
-  });
   el.querySelector('#br-q').addEventListener('input', (e) => { st.q = e.target.value.trim(); loadSoon(); });
   const lvl = (id, key) => el.querySelector(id).addEventListener('input', (e) => {
     const n = e.target.value === '' ? null : Math.max(0, Math.min(60, Math.round(Number(e.target.value) || 0)));

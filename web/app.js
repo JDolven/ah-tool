@@ -103,6 +103,8 @@ async function route() {
 
   const r = ROUTES.find((x) => x.re.test(path));
   document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', !!r && a.dataset.nav === r.nav));
+  const browseNav = document.getElementById('nav-browse');
+  if (browseNav && !(r && r.nav === 'browse')) browseNav.hidden = true; // the category tree belongs to Browse
 
   if (!r) {
     document.title = 'Page not found – AH Tool';
