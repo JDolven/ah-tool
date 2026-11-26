@@ -280,7 +280,7 @@ def ensure(conn, cfg, force=False):
             log("tooltip build failed: %r" % (ex,))
     # Vendor sell prices the game reported (AH Tool Logger) win over the client tables and the hotfix cache.
     from . import market
-    if market.apply_sell(conn):
+    if market.apply_sell(conn) + market.apply_class(conn):
         conn.commit()
     n_builtin = conn.execute("SELECT COUNT(*) FROM vendor_items WHERE source='builtin'").fetchone()[0]
     if force or n_builtin == 0:

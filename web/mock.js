@@ -1344,6 +1344,7 @@ export function mockApi(method, fullPath, body) {
   if (p === '/api/professions') return professions();
   if ((m = p.match(/^\/api\/professions\/(\d+)\/gather$/))) return gatherRows(Number(m[1]));
   if ((m = p.match(/^\/api\/professions\/(\d+)$/))) return profession(Number(m[1]), q.get('mode') || 'current', q.get('mine') === '1');
+  if (p === '/api/browse') return { categories: [], items: [], total: 0, limit: 1000 };
   if (p === '/api/deals') return deals(Number(q.get('threshold') ?? 0.25), Number(q.get('min_value') || 0), q.get('reason') || '', q.get('include_low') === '1');
   if ((m = p.match(/^\/api\/recipe\/(\d+)\/trend$/))) return recipeTrend(Number(m[1]), Math.max(7, Math.min(90, Number(q.get('days')) || 30)));
   // ---- v5 AH Tool Logger

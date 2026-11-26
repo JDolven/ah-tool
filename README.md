@@ -54,6 +54,9 @@ In-game commands: `/ahtl` shows the logger status, `/ahtl scan` starts a full sc
 ## Pages
 - **Overview** – status, best deals now, most profitable crafts.
 - **Deals** – items below market price (median of the last 14 days), under vendor price, and cheap reagents.
+- **Browse** – every item with an AH price in the Auction House categories (Weapon, Armor → Cloth → Chest, Trade
+  Goods, Recipe …), with search, required level and quality filters, price, market price, quantity and vendor price.
+  Custom Forever items get their category from AH Tool Logger (1.6), which records it with the sell price.
 - **Professions** – all recipes per profession with cost, sell value, profit (after the 5% AH cut) and margin.
 - **Item** – price chart, history, recipes, your own auctions.
 - **Statistics** – the market broken down by quality/class, biggest movers.

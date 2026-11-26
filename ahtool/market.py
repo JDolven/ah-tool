@@ -50,6 +50,8 @@ CREATE TABLE IF NOT EXISTS my_auctions(char_key TEXT, ts INTEGER, char TEXT, rea
     sale_status INTEGER);
 CREATE TABLE IF NOT EXISTS ah_item_names(id INTEGER PRIMARY KEY, name TEXT, quality INTEGER, ts INTEGER);
 CREATE TABLE IF NOT EXISTS item_sell(id INTEGER PRIMARY KEY, price INTEGER NOT NULL, ts INTEGER);
+CREATE TABLE IF NOT EXISTS item_class(id INTEGER PRIMARY KEY, class_id INTEGER NOT NULL, subclass_id INTEGER,
+    equip_loc TEXT, ts INTEGER);
 """
 
 _lock = threading.Lock()
@@ -387,6 +389,51 @@ def parse_sell(v):
     return out
 
 
+def parse_info(v):
+    """Logger `info` table {itemId: "classID:subclassID:equipLoc"} -> {item_id: (class, subclass, equip_loc)}."""
+    out = {}
+    if not isinstance(v, dict):
+        return out
+    for k, val in v.items():
+        if len(out) >= MAX_SELL_ROWS:
+            break
+        if isinstance(k, bool):
+            continue
+        iid = _i(k, -1)
+        bits = _s(val).split(":", 2)
+        if not (0 < iid < 2 ** 31) or len(bits) != 3:
+            continue
+        c, sc = _i(bits[0], -1), _i(bits[1], -1)
+        loc = bits[2].strip()
+        if 0 <= c < 100 and 0 <= sc < 100 and len(loc) <= 40 and (not loc or loc.replace("_", "").isalnum()):
+            out[iid] = (c, sc, loc or None)
+    return out
+
+
+def _store_info(cur, info):
+    """Remember the game's item class (AH Tool Logger) and use it for items the static data has no class for."""
+    if not info:
+        return 0
+    now = int(time.time())
+    cur.executemany("INSERT INTO item_class(id, class_id, subclass_id, equip_loc, ts) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET class_id=excluded.class_id, subclass_id=excluded.subclass_id, "
+                    "equip_loc=excluded.equip_loc, ts=excluded.ts", [(i,) + v + (now,) for i, v in info.items()])
+    return apply_class(cur)
+
+
+def apply_class(conn):
+    """Fill items.class_id/subclass_id from item_class where the static data has none (custom Forever items).
+    Also called after a static data rebuild. Returns the number of items changed."""
+    try:
+        before = conn.execute("SELECT total_changes()").fetchone()[0]
+        conn.execute("UPDATE items SET class_id=(SELECT c.class_id FROM item_class c WHERE c.id=items.id), "
+                     "subclass_id=(SELECT c.subclass_id FROM item_class c WHERE c.id=items.id) "
+                     "WHERE class_id IS NULL AND id IN (SELECT id FROM item_class)")
+        return conn.execute("SELECT total_changes()").fetchone()[0] - before
+    except Exception:  # noqa - table missing (logger never ingested)
+        return 0
+
+
 def _store_sell(cur, prices):
     if prices:
         now = int(time.time())
@@ -469,6 +516,7 @@ def ingest(conn, cfg, force=False):
                         names.setdefault(iid, v)
             new_names = _store_names(cur, names)
             sell_changed = _store_sell(cur, parse_sell(data.get("sell")))
+            _store_info(cur, parse_info(data.get("info")))
             fallback = _realm_fallback(cur, data)
             if fallback:
                 # scans stored with an empty realm before this fix take the realm too (never over an existing one)

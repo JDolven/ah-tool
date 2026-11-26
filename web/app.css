@@ -1248,3 +1248,25 @@ button.sr-row { width: 100%; border: 0; background: transparent; text-align: lef
 .dl-steps { margin: 0; padding-left: 22px; line-height: 1.6; color: var(--text-2); }
 .dl-steps li + li { margin-top: 6px; }
 .dl-pre { margin: 0 0 12px; padding: 10px 12px; background: var(--surface-2); border-radius: 6px; overflow-x: auto; font-size: 13px; }
+
+/* Browse (Auction House categories) */
+.br-layout { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 18px; align-items: start; }
+.br-tree { padding: 8px; position: sticky; top: 76px; max-height: calc(100vh - 96px); overflow-y: auto; }
+.br-node { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px;
+  border: 0; border-radius: 6px; background: transparent; color: var(--text-2); font: inherit; font-size: 13.5px;
+  text-align: left; cursor: pointer; }
+.br-node:hover { background: var(--surface-2); color: var(--text); }
+.br-node.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.br-node.d0 { font-weight: 600; color: var(--text); }
+.br-node.d0.on { color: var(--accent); }
+.br-node.d1 { padding-left: 22px; }
+.br-node.d2 { padding-left: 36px; font-size: 13px; }
+.br-count { font-size: 11.5px; color: var(--muted); font-weight: 400; }
+.br-range { display: flex; align-items: center; gap: 6px; }
+.br-range input { width: 64px; }
+.br-lvl { min-width: 0; }
+.row-stale td { opacity: 0.6; }
+@media (max-width: 900px) {
+  .br-layout { grid-template-columns: minmax(0, 1fr); }
+  .br-tree { position: static; max-height: 240px; }
+}
