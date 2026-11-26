@@ -1086,6 +1086,11 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                 except ValueError:
                     raise BadRequest("days/limit must be numbers")
                 return market.activity(conn, cfg, days, limit, realm)
+            if path == "/api/browse":
+                from . import browse
+                return browse.browse(conn, cfg, realm, qs.get("class"), qs.get("sub"), qs.get("slot") or None,
+                                     qs.get("q", ""), qs.get("min_level"), qs.get("max_level"), qs.get("quality"),
+                                     qs.get("listed", "1") not in ("0", "false"), qs.get("limit") or 1000)
             if path == "/api/market/report":
                 from . import report
                 date = qs.get("date") or None

@@ -13,6 +13,8 @@
 -- sell = { [itemId] = copper }: the vendor sell price the game reports (C_Item.GetItemInfo) for every item seen in
 -- a full scan, in a profession window or in your bags - no need to own the item. The app prefers it over the Classic
 -- Era client tables, which Forever has changed for some items.
+-- info = { [itemId] = "classID:subclassID:equipLoc" }: the item's Auction House category from the same call, so the
+-- app can sort custom Forever items (missing from its static data) into the right category.
 
 local VERSION = 1
 local KEEP_SCANS = 3          -- full scans kept in the file (the app imports them on /reload and keeps the history)
@@ -39,6 +41,7 @@ local function db()
   d.owned = d.owned or {}
   d.mail = d.mail or {}
   d.sell = d.sell or {}
+  d.info = d.info or {}
   return d
 end
 
@@ -49,16 +52,20 @@ local sellWait, sellWaiting = {}, 0   -- items the client is still loading (GET_
 -- Newer clients (Forever) have only C_Item.GetItemInfo; the global GetItemInfo is gone there.
 local itemInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
 
-local function sellOf(itemId)
-  return select(11, itemInfo(itemId))
+local function infoOf(itemId)
+  local _, _, _, _, _, _, _, _, equipLoc, _, price, classID, subclassID = itemInfo(itemId)
+  return price, classID, subclassID, equipLoc
 end
 
 local function noteSell(itemId)
   itemId = tonumber(itemId)
   if not itemId or itemId <= 0 then return end
-  local ok, price = pcall(sellOf, itemId)
+  local ok, price, classID, subclassID, equipLoc = pcall(infoOf, itemId)
   if ok and type(price) == "number" and price >= 0 then
     db().sell[itemId] = price
+    if type(classID) == "number" then
+      db().info[itemId] = string.format("%d:%d:%s", classID, tonumber(subclassID) or 0, equipLoc or "")
+    end
     if sellWait[itemId] then sellWait[itemId] = nil; sellWaiting = sellWaiting - 1 end
   elseif ok and not sellWait[itemId] and sellWaiting < 50000 then
     sellWait[itemId] = true  -- GetItemInfo asked the server; the answer arrives as GET_ITEM_INFO_RECEIVED

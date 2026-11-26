@@ -121,6 +121,20 @@ ids = [x["item_id"] for x in dl]
 check("deals set", ids == [4306, 2453], ids)
 uv = dl[0]
 check("deal under_vendor", uv["reasons"] == ["under_vendor"] and uv["vendor_profit"] == 300, uv)
+# browse: AH categories with counts, filters, slot from the tooltip
+br = j("/api/browse?listed=0")
+cats = {c["name"]: c for c in br["categories"]}
+check("browse categories", {"Trade Goods", "Armor", "Weapon", "Consumable"} <= set(cats), list(cats))
+check("browse total", br["total"] == sum(c["count"] for c in br["categories"]), br["total"])
+tg = {s["name"]: s["count"] for s in cats["Trade Goods"]["subclasses"]}
+check("browse subclasses", tg.get("Cloth", 0) >= 2 and "Herb" in tg, tg)
+w = j("/api/browse?listed=0&class=2&sub=7")
+check("browse weapon class+sub", [x["item_id"] for x in w["items"]] == [19019] and w["items"][0]["slot"], w["items"])
+check("browse slot filter", [x["item_id"] for x in j("/api/browse?listed=0&class=2&sub=7&slot=Two-Hand")["items"]] == [], "")
+check("browse search", [x["item_id"] for x in j("/api/browse?listed=0&q=linen")["items"]] and
+      all("linen" in x["name"].lower() for x in j("/api/browse?listed=0&q=linen")["items"]), "")
+check("browse quality", all(x["quality"] >= 2 for x in j("/api/browse?listed=0&quality=2")["items"]), "")
+check("browse min level", j("/api/browse?listed=0&min_level=60")["total"] <= 1, "")
 check("deal under_vendor: no logger scan -> no total", uv.get("vendor_profit_total") is None and "vendor_qty" in uv, uv)
 bd = dl[1]
 check("deal below_baseline", bd["reasons"] == ["below_baseline", "cheap_reagent"] and bd["baseline"] == 1000

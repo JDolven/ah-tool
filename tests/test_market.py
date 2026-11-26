@@ -76,6 +76,7 @@ lua = """AHToolLoggerDB = {
      ["price"] = 2000, ["fee"] = 100, ["count"] = 20, ["char"] = "Me" },
   ["expired|Wool Cloth||0|10|1"] = { ["t"] = %d, ["type"] = "expired", ["item"] = "Wool Cloth", ["count"] = 10 },
 },
+["info"] = { [253664] = "4:1:INVTYPE_ROBE", [2589] = "15:0:", [9] = "x:1:", [10] = "4:1:INVTYPE_<b>" },
 ["sell"] = { [11287] = 254, [2589] = 13, [2592] = 0, [-5] = 1, [7] = -1, [8] = "x", [999999] = 77 },
 }
 """ % (scan(now - 7200, s1), scan(now - 3600, s2, "253664:2:Forever Tunic;2589:1:Renamed Cloth;bad;7:x:"),
@@ -101,6 +102,12 @@ check(market.apply_names(conn) == 1, "names re-applied after an items rebuild")
 # vendor sell prices the game reported (logger 1.3, GetItemInfo) win over the static data
 vs = dict(conn.execute("SELECT id, vendor_sell FROM items WHERE id IN (11287, 2589, 2592)").fetchall())
 check(vs == {11287: 254, 2589: 13, 2592: 0}, "game sell prices applied %s" % vs)
+check(market.parse_info({1: "4:1:INVTYPE_ROBE", 2: "7:5:", 3: "x:1:", 4: "4:1:a b", 5: 3}) ==
+      {1: (4, 1, "INVTYPE_ROBE"), 2: (7, 5, None)}, "parse_info keeps only sane rows")
+conn.execute("UPDATE items SET class_id=7, subclass_id=5 WHERE id=2589")  # the static data knows Linen Cloth
+check(market.apply_class(conn) == 1, "game class re-applied to the custom item after a rebuild")
+ic = dict(conn.execute("SELECT id, class_id FROM items WHERE id IN (253664, 2589)").fetchall())
+check(ic == {253664: 4, 2589: 7}, "game class fills only items without one %s" % ic)
 check(conn.execute("SELECT COUNT(*) FROM items WHERE id=999999").fetchone()[0] == 0,
       "a sell price never creates an item")
 check(market.parse_sell({1: 5, "2": 6, -1: 3, 3: -1, 4: True, 5: float("nan"), 6: 2 ** 41}) == {1: 5, 2: 6},

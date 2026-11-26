@@ -5,6 +5,7 @@ import { installTooltips, clearTooltipCache } from './js/tooltip.js';
 import { destroyAll, rerenderAll } from './js/charts.js';
 import * as overview from './js/pages/overview.js';
 import * as deals from './js/pages/deals.js';
+import * as browse from './js/pages/browse.js';
 import * as professions from './js/pages/professions.js';
 import * as item from './js/pages/item.js';
 import * as stats from './js/pages/stats.js';
@@ -26,6 +27,7 @@ const view = document.getElementById('view');
 const ROUTES = [
   { re: /^\/?$/, nav: 'overview', title: 'Overview', fn: overview.render },
   { re: /^\/deals\/?$/, nav: 'deals', title: 'Deals', fn: deals.render },
+  { re: /^\/browse\/?$/, nav: 'browse', title: 'Browse', fn: browse.render },
   { re: /^\/professions\/?$/, nav: 'professions', title: 'Professions', fn: professions.renderList },
   { re: /^\/professions\/(\d+)\/?$/, nav: 'professions', title: 'Profession', fn: professions.renderDetail },
   { re: /^\/my\/?$/, nav: 'my', title: 'My Professions', fn: my.render },
