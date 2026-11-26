@@ -117,6 +117,41 @@ check(json.loads(tt[11287]).get("sell_price") == 254, "tooltip shows the game's 
 check("sell_price" not in json.loads(tt[2592]), "sell price 0: no Sell Price line %s" % tt[2592])
 check(tt[2589] == "not json", "broken tooltip data left alone")
 
+# sold only when it could not have run out: a "long" (2-12 h) auction gone after 11 h most likely expired
+row = (7, 0, 1, 500, 400, 0, 3, "Ann")
+check(market.diff_scans([row], [], 11 * 3600)[0][5] == "expired", "long auction gone after 11 h -> expired")
+check(market.diff_scans([row], [], 3600)[0][5] == "sold", "long auction gone after 1 h -> sold")
+check(market.diff_scans([row[:6] + (4, "Ann")], [], 11 * 3600)[0][5] == "sold", "very long gone after 11 h -> sold")
+check(market.diff_scans([row[:6] + (1, "Ann")], [], 600)[0][5] == "expired", "short auction gone -> may have expired")
+
+# incomplete scans: judged by what the game reported and by the items on sale, not by the number of auctions
+cur = conn.cursor()
+rf = conn.execute("SELECT realm, faction FROM ah_scans LIMIT 1").fetchone()
+prev_items = conn.execute("SELECT COUNT(*) FROM ah_scan_items WHERE scan_id=(SELECT MAX(id) FROM ah_scans)").fetchone()[0]
+far = 2 ** 40
+check(not market._is_partial(cur, rf[0], rf[1], far, 10, 10, prev_items), "half the auctions, same items -> complete")
+check(market._is_partial(cur, rf[0], rf[1], far, 10, 20, prev_items), "read fewer auctions than reported -> partial")
+check(market._is_partial(cur, rf[0], rf[1], far, 0, 0, 0), "empty scan -> partial")
+check(market._is_partial(cur, rf[0], rf[1], far, 10, 10, 0) == (prev_items > 0), "far fewer items -> partial")
+
+# vendor flips: every listing of the latest full scan under what a vendor pays (Wool Cloth: game price 0 -> none)
+conn.execute("UPDATE items SET vendor_sell=150 WHERE id=2589")  # Linen: listed at 100/unit in both scans
+vf = market.vendor_flips(conn, cfg)
+it = {e["item_id"]: e for e in vf["items"]}
+check(list(it) == [2589] and it[2589]["qty"] == 20 and it[2589]["listings"] == 1, "vendor flips: one listing %s" % vf)
+check(it[2589]["cost"] == 2000 and it[2589]["revenue"] == 3000 and it[2589]["profit"] == 1000 and it[2589]["game_price"],
+      "vendor flips: cost, revenue, profit %s" % it[2589])
+check(vf["totals"]["profit"] == 1000 and vf["totals"]["profit_game_price"] == 1000 and vf["totals"]["qty"] == 20,
+      "vendor flips totals %s" % vf["totals"])
+from ahtool import analytics  # noqa: E402
+conn.execute("INSERT OR REPLACE INTO price_current VALUES('PvP', 2589, 100, 20, 2511, 1)")
+analytics.invalidate()
+dl = {d["item_id"]: d for d in analytics.deals(conn, cfg, realm="PvP")}
+check(dl.get(2589, {}).get("vendor_profit_total") == 1000 and dl[2589]["vendor_qty"] == 20,
+      "deals row carries the total vendor profit of the scan %s" % dl.get(2589))
+conn.execute("UPDATE items SET vendor_sell=13 WHERE id=2589")
+check(market.vendor_flips(conn, cfg)["totals"]["items"] == 0, "nothing under vendor price -> empty")
+
 # the client's hotfix cache grows while you play (new Forever prices): tooltips are rebuilt when it changes
 from ahtool import staticdata, tooltipdata  # noqa: E402
 conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('tooltip_version', ?)", (tooltipdata.VERSION,))

@@ -82,8 +82,10 @@ export async function render(ctx) {
     });
     table.setRows(rows);
     const potential = rows.reduce((s, d) => s + (isNum(d.baseline) && isNum(d.price) ? Math.max(0, d.baseline - d.price) : 0), 0);
+    const vendorTotal = rows.reduce((s, d) => s + (isNum(d.vendor_profit_total) ? d.vendor_profit_total : 0), 0);
     el.querySelector('#deal-summary').innerHTML = `<span><strong>${num(rows.length)}</strong> of ${num(data.length)} deals</span>
-      <span class="muted">Total discount per unit: ${money(potential)}</span>`;
+      <span class="muted">Total discount per unit: ${money(potential)}</span>${vendorTotal > 0 ? `
+      <span title="Buy every listing below vendor price in the latest full scan and sell it to a vendor">Total vendor profit: <strong class="up">${money(vendorTotal)}</strong></span>` : ''}`;
   };
 
   const load = async () => {
@@ -174,6 +176,9 @@ function columns(getWatched) {
         }`,
     },
     { key: 'vendor_profit', label: 'Vendor profit', align: 'right', hideSm: true, render: (r) => (isNum(r.vendor_profit) && r.vendor_profit > 0 ? money(r.vendor_profit, { signed: true }) : '<span class="muted">–</span>') },
+    { key: 'vendor_profit_total', label: 'Total vendor profit', align: 'right', hideSm: true, defaultDir: 'desc',
+      title: 'Buy every listing below vendor price in the latest full scan and sell it to a vendor',
+      render: (r) => (isNum(r.vendor_profit_total) && r.vendor_profit_total > 0 ? `${money(r.vendor_profit_total, { signed: true })}<div class="cell-sub">${num(r.vendor_qty)} units</div>` : '<span class="muted">–</span>') },
     { key: 'available', label: 'Qty', align: 'right', hideSm: true, render: (r) => num(r.available) },
     { key: 'score', label: 'Score', align: 'right', hideSm: true, render: (r) => (isNum(r.score) ? r.score.toFixed(2) : '–') },
     {

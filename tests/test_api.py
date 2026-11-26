@@ -121,6 +121,7 @@ ids = [x["item_id"] for x in dl]
 check("deals set", ids == [4306, 2453], ids)
 uv = dl[0]
 check("deal under_vendor", uv["reasons"] == ["under_vendor"] and uv["vendor_profit"] == 300, uv)
+check("deal under_vendor: no logger scan -> no total", uv.get("vendor_profit_total") is None and "vendor_qty" in uv, uv)
 bd = dl[1]
 check("deal below_baseline", bd["reasons"] == ["below_baseline", "cheap_reagent"] and bd["baseline"] == 1000
       and abs(bd["discount"] - 0.4) < 1e-9 and bd["professions"] == ["Alchemy"]

@@ -781,6 +781,12 @@ def deals(conn, cfg=None, threshold=None, min_value=0, reason="", realm=None, li
     min_value = int(min_value or 0)
     profs = _item_profs(conn, ctx)
     my_reag = userstate.my_reagent_items(conn)
+    # Buying every listing under vendor price (latest full scan, AH Tool Logger), not just the cheapest one
+    try:
+        from . import market
+        flips = {e["item_id"]: e for e in market.vendor_flips(conn, cfg, realm, limit=10 ** 6)["items"]}
+    except Exception:  # noqa - no logger data
+        flips = {}
     out = []
     for iid, c in ctx.cur.items():
         price, avail, last_day = c
@@ -813,6 +819,8 @@ def deals(conn, cfg=None, threshold=None, min_value=0, reason="", realm=None, li
                      "price": price, "baseline": _round(base, 1), "discount": _round(disc),
                      "available": avail, "days_of_data": ctx.ndays.get(iid, 0),
                      "reasons": reasons, "vendor_profit": vprofit,
+                     "vendor_profit_total": flips[iid]["profit"] if vprofit and iid in flips else None,
+                     "vendor_qty": flips[iid]["qty"] if vprofit and iid in flips else None,
                      "professions": [PROFESSIONS.get(p, (None, "Profession %d" % p))[1] for p in sorted(profs.get(iid, ()))],
                      "score": _round(score), "for_my_crafts": iid in my_reag,
                      "confidence": conf, "price_flag": ctx.flag.get(iid)},
