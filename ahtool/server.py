@@ -1131,6 +1131,18 @@ def make_server(cfg, connect=None, host="127.0.0.1", port=None, web_dir=WEB_DIR,
                                include_low=qs.get("include_low") in ("1", "true"))
             if path == "/api/stats/market":
                 return A.market_stats(conn, cfg, realm)
+            if path == "/api/bnet/compare":
+                from . import bnet
+                try:
+                    enabled = bnet.settings(cfg) is not None
+                except bnet.BnetError:
+                    enabled = False
+                faction = qs.get("faction") or "Alliance"
+                if faction not in ("Alliance", "Horde", "Neutral"):
+                    raise BadRequest("faction must be Alliance, Horde or Neutral")
+                res = bnet.compare(conn, faction)
+                res["enabled"] = enabled
+                return res
             if path == "/api/postings":
                 return A.postings(conn, cfg, realm)
             raise NotFound("unknown endpoint: " + path)

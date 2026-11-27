@@ -273,6 +273,32 @@ untracked. Afterwards run `python -m ahtool.sync --full` on the owner's PC to se
 realm follows the owner's pushes. `sync_url` must be `https://` (plain `http://` only for localhost), and the app
 never follows a redirect with your key.
 
+## Battle.net API (optional): item data and auction house snapshots
+
+Blizzard's Game Data API covers WoW: Forever (namespaces `static-forever-eu` / `dynamic-forever-eu`). With a client
+configured, AH Tool uses it in the background; without one nothing of this runs.
+
+1. Create a client at develop.battle.net (API Access -> Create Client; any redirect URL). Keep the secret private.
+2. Local app: add to config.json `"bnet_client_id": "...", "bnet_client_secret": "..."`. Web version: the environment
+   variables `AHTOOL_BNET_CLIENT_ID` and `AHTOOL_BNET_CLIENT_SECRET` (e.g. `-e AHTOOL_BNET_CLIENT_ID=...` on
+   `docker run`). The host needs to reach `oauth.battle.net` and `eu.api.blizzard.com`.
+3. Optional: `bnet_region` (`eu`), `bnet_ruleset` (1 = PvP, 2 Normal, 3 Roleplay, 15 Roleplay PvP). Each ruleset has
+   its own houses (Alliance / Horde / Blackwater): PvP 110/113/116, Normal 111/114/117, Roleplay 119/120/121,
+   Roleplay PvP 123/124/125. `bnet_houses` overrides them (`{"Alliance": 110}`; environment: `Alliance=110,Horde=113`).
+
+What it does:
+
+- **Item data** – the whole item catalogue (about 17,700 items, 6,600 of them custom Forever items) through the item
+  search, 1000 per request, refreshed weekly: name, quality, vendor sell and buy price. Vendor prices are used where
+  the game itself (AH Tool Logger) has not reported one; it fixes items Forever changed (Lesser Magic Wand 1s 10c, not
+  the Classic Era 5s 8c) without anyone seeing them in game, and names custom items that showed as "Item #id". A few
+  custom items are not in the API and keep what the logger says.
+- **Auction house snapshots** – each configured house about once an hour (the API updates hourly): every listing,
+  summarised per item (listings, units, lowest and median unit price). No seller names - the API has none. They are
+  kept apart from your own scans for now, to compare first: `GET /api/bnet/compare?faction=Alliance` (or
+  `python -m ahtool.bnet compare`) puts the newest snapshot next to your newest full scan: items in both / only one,
+  same lowest price, median difference, and the 50 items that differ most.
+
 ## License
 AH Tool (the app and the AH Tool Logger addon) is free software under the
 [GNU Affero General Public License v3.0](LICENSE). You may use, change and share it, but any copy or modified

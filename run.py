@@ -52,6 +52,12 @@ def main():
     conn.close()
     analytics.invalidate()
 
+    # Optional: Blizzard's Game Data API (bnet_client_id / bnet_client_secret in config.json) - item vendor prices and
+    # hourly auction house snapshots to compare with your scans. Off without a client.
+    from ahtool import bnet
+    if bnet.start(cfg, lambda: db.connect(cfg["db_path"]), on_change=lambda _r: analytics.invalidate()):
+        print("Battle.net API: item data and auction house snapshots (compare: python -m ahtool.bnet compare).")
+
     pusher = None
     if cfg.get("sync_url") and cfg.get("sync_token"):
         from ahtool import sync

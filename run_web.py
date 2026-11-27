@@ -11,6 +11,10 @@ the environment:
   AHTOOL_MAX_PER_IP  concurrent connections/requests per client address (default 16)
   AHTOOL_MAX_SYNC_MB largest unpacked sync batch accepted (default 24)
   AHTOOL_HOST/PORT   listen address (default 0.0.0.0:8642)
+  AHTOOL_BNET_CLIENT_ID / AHTOOL_BNET_CLIENT_SECRET   optional Battle.net API client (develop.battle.net): hourly
+                     snapshots of the auction houses and Blizzard's item vendor prices (ahtool/bnet.py). Off without.
+  AHTOOL_BNET_REGION (eu), AHTOOL_BNET_RULESET (1 = PvP), AHTOOL_BNET_HOUSES ("Alliance=110,Horde=113,Neutral=116"),
+  AHTOOL_BNET_REALM  (realm key of the snapshots; default the ruleset's name)
   AHTOOL_DOWNLOADS   folder with the downloads built by `python -m ahtool.downloads build` (default: downloads/
                      next to this file; the Docker image builds them). Served at /download/, shown on #/download
   AHTOOL_ANALYTICS_SCRIPT / AHTOOL_ANALYTICS_ID   optional Umami tracker (script URL + website id); only counted
@@ -34,6 +38,10 @@ def main():
                analytics_script=os.environ.get("AHTOOL_ANALYTICS_SCRIPT", "").strip(),
                analytics_id=os.environ.get("AHTOOL_ANALYTICS_ID", "").strip(),
                downloads_dir=os.environ.get("AHTOOL_DOWNLOADS", "").strip() or os.path.join(ROOT, "downloads"))
+    for k in ("client_id", "client_secret", "region", "ruleset", "houses", "realm"):
+        v = os.environ.get("AHTOOL_BNET_" + k.upper(), "").strip()
+        if v:
+            cfg["bnet_" + k] = v
     if cfg["public_url"] and server.parse_origin(cfg["public_url"]) is None:
         print("AHTOOL_PUBLIC_URL must look like https://ah.example.net (got %r)." % cfg["public_url"])
         return 2
@@ -59,6 +67,13 @@ def main():
     host = os.environ.get("AHTOOL_HOST", "0.0.0.0")
     port = int(os.environ.get("AHTOOL_PORT", "8642"))
     srv = server.make_server(cfg, connect=lambda: db.connect(db_path), host=host, port=port, web=True)
+    from ahtool import analytics, bnet
+    try:
+        bnet.settings(cfg)
+    except bnet.BnetError as e:
+        print("AHTOOL_BNET_*: %s" % e)
+        return 2
+    bnet.start(cfg, lambda: db.connect(db_path), on_change=lambda _r: analytics.invalidate())
     print("AH Tool web version on http://%s:%d/ (owner token %s, %d active key(s) - manage with: ahkey)"
           % (host, port, "set" if cfg["sync_token"] else "not set", n_keys), flush=True)
     try:
