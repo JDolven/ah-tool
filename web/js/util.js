@@ -1,5 +1,14 @@
 // Shared helpers: escaping, formatting, small UI components.
 
+// Text typed or pasted into a filter box, as matched against item names: a chat item link becomes its item id and
+// the brackets of a copied [Item Name] are dropped (same rule as analytics.search_text on the server).
+export function searchText(v) {
+  const s = String(v ?? '');
+  const m = s.match(/\|Hitem:(\d{1,10})[:|]/);
+  if (m) return m[1];
+  return s.replace(/[[\]]/g, ' ').split(/\s+/).filter(Boolean).join(' ').toLowerCase();
+}
+
 export function esc(v) {
   if (v === null || v === undefined) return '';
   return String(v)

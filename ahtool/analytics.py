@@ -6,6 +6,7 @@ All prices are copper. Fields named *_pct are percentages (12.5 == 12.5 %),
 import bisect
 import datetime
 import math
+import re
 import statistics
 import threading
 
@@ -499,9 +500,23 @@ def _row(ctx, iid):
     }
 
 
+_ITEM_LINK = re.compile(r"\|Hitem:(\d{1,10})[:|]")
+
+
+def search_text(q):
+    """What was typed or pasted into a search box, as searched for: an item link from the game's chat
+    (|cff..|Hitem:1265:..|h[Scorpion Sting]|h|r) becomes its item id, and the brackets around a copied
+    [Item Name] are dropped - no item name has brackets in it."""
+    q = q or ""
+    m = _ITEM_LINK.search(q)
+    if m:
+        return m.group(1)
+    return " ".join(q.replace("[", " ").replace("]", " ").split())
+
+
 def search(conn, cfg=None, q="", limit=50, realm=None):
     ctx = _ctx(conn, cfg, realm)
-    q = (q or "").strip()
+    q = search_text(q)
     limit = max(1, min(int(limit or 50), 500))
     if not q:
         ids = sorted((i for i, c in ctx.cur.items() if c[0] and not _is_stale(ctx, i)),

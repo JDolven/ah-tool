@@ -110,7 +110,7 @@ def browse(conn, cfg=None, realm=None, cls=None, sub=None, slot=None, q="", min_
     cls, sub = _num(cls), _num(sub)
     min_level, max_level, quality = _num(min_level), _num(max_level), _num(quality)
     limit = max(1, min(_num(limit) or 500, MAX_LIMIT))
-    q = (q or "").strip().lower()
+    q = analytics.search_text(q).lower()
     qid = _num(q) if q.isdigit() else None
 
     def keep(iid, m):

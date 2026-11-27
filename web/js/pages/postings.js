@@ -1,7 +1,7 @@
 import { api } from '../api.js';
 import {
   esc, money, num, pctRaw, itemLink, tsFmt, relTime, debounce,
-  errorState, skeletonRows, skeletonTiles, emptyState, tile, isNum, diffClass,
+  errorState, skeletonRows, skeletonTiles, emptyState, tile, isNum, diffClass, searchText
 } from '../util.js';
 import { DataTable } from '../table.js';
 
@@ -67,7 +67,7 @@ export async function render(ctx) {
   let text = '';
   let onlyUnder = false;
   const apply = () => {
-    const t = text.trim().toLowerCase();
+    const t = searchText(text);
     table.setRows(rows.filter((r) => {
       if (onlyUnder && !(isNum(r.diff_pct) && r.diff_pct > 0.5)) return false;
       if (t && !(String(r.name || '').toLowerCase().includes(t) || String(r.item_id) === t)) return false;

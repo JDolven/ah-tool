@@ -1,6 +1,6 @@
 import { api, WEB, loadState, replaceState } from '../api.js';
 import {
-  esc, money, num, skillRange, debounce, errorState, skeletonRows, emptyState, isNum, confBadge,
+  esc, money, num, skillRange, debounce, errorState, skeletonRows, emptyState, isNum, confBadge, searchText
 } from '../util.js';
 import { DataTable } from '../table.js';
 import { toast, emit, addShopCtl } from '../ui.js';
@@ -217,7 +217,7 @@ export async function render(ctx) {
       </div>`;
   };
   const applyKnown = () => {
-    const t = state.text.trim().toLowerCase();
+    const t = searchText(state.text);
     knownTable.setRows(recipes.filter((r) => {
       if (state.show === 'craft' && !r.can_craft) return false;
       if (state.show === 'no' && r.can_craft) return false;

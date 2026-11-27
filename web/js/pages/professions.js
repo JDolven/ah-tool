@@ -2,7 +2,7 @@ import { api } from '../api.js';
 import {
   esc, money, num, pct, itemLink, skillRange, sourceLabel, reasonBadge, debounce,
   noData, errorState, skeletonRows, emptyState, isNum, qClass,
-  confBadge, flagChip, sparkline, trendPctHtml, moneyText, dateLong, dateShort,
+  confBadge, flagChip, sparkline, trendPctHtml, moneyText, dateLong, dateShort, searchText
 } from '../util.js';
 import { DataTable } from '../table.js';
 import { addShopCtl } from '../ui.js';
@@ -180,7 +180,7 @@ export async function renderDetail(ctx) {
 
   let data = [];
   const apply = () => {
-    const t = detailState.text.trim().toLowerCase();
+    const t = searchText(detailState.text);
     let lowHidden = 0;
     const rows = data.filter((r) => {
       if (detailState.hideLow && r.confidence === 'low') {
@@ -321,7 +321,7 @@ async function renderGather(ctx, id, getProf) {
     const p = getProf();
     const mySkill = p && p.mine && isNum(p.my_skill) ? p.my_skill : null;
     box.querySelector('#g-mine-wrap').hidden = mySkill === null;
-    const t = gatherState.text.trim().toLowerCase();
+    const t = searchText(gatherState.text);
     const shown = rows.filter((r) => {
       if (gatherState.upToSkill && mySkill !== null && isNum(r.skill) && r.skill > mySkill) return false;
       return !t || `${r.name || ''} ${r.where || ''}`.toLowerCase().includes(t);

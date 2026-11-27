@@ -1,7 +1,7 @@
 import { api } from '../api.js';
 import {
   esc, money, num, pct, itemLink, reasonBadge, discountBar, REASONS, debounce,
-  noData, errorState, skeletonRows, emptyState, isNum, confBadge, flagChip,
+  noData, errorState, skeletonRows, emptyState, isNum, confBadge, flagChip, searchText
 } from '../util.js';
 import { DataTable } from '../table.js';
 import { watchBtn } from '../ui.js';
@@ -72,7 +72,7 @@ export async function render(ctx) {
   let data = [];
   const apply = () => {
     const minC = (Number(state.minGold) || 0) * 10000;
-    const t = state.text.trim().toLowerCase();
+    const t = searchText(state.text);
     const rows = data.filter((d) => {
       if (state.reasons.size && !(d.reasons || []).some((r) => state.reasons.has(r))) return false;
       const ref = isNum(d.baseline) ? d.baseline : d.price;

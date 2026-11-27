@@ -72,6 +72,13 @@ check("status", s["realm"] == "PvP" and s["items_priced"] == 10 and s["latest_da
 r = j("/api/items/search?q=linen")
 check("search name", [x["id"] for x in r][:2] == [2589, 2996] or {x["id"] for x in r} == {2589, 2996, 2576}, r)
 check("search id", j("/api/items/search?q=284712")[0]["id"] == 284712)
+from urllib.parse import quote as _q  # noqa: E402
+check("search ignores the brackets of a copied [Item Name]",
+      {x["id"] for x in j("/api/items/search?q=" + _q("[Linen Cloth]"))} >= {2589}, "")
+check("search takes a chat item link as its id",
+      [x["id"] for x in j("/api/items/search?q=" + _q("|cffffffff|Hitem:2589::::::::60:::::|h[Linen Cloth]|h|r"))] == [2589], "")
+check("browse ignores brackets too",
+      2589 in [x["item_id"] for x in j("/api/browse?listed=0&q=" + _q("[linen cloth]"))["items"]], "")
 r = j("/api/items/search?limit=3")
 check("search empty = most valuable", r[0]["id"] == 19019 and len(r) == 3, r)
 bw = j("/api/items/search?q=bruise")[0]

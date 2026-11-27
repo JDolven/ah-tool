@@ -1,6 +1,6 @@
 // Market Activity: estimated sales across the AH, sellers, scans (AH Tool Logger data).
 import { api } from '../api.js';
-import { esc, money, num, pct, isNum, itemLink, relTime, tsFmt, tile, errorState, skeletonRows, skeletonTiles, emptyState, debounce } from '../util.js';
+import { esc, money, num, pct, isNum, itemLink, relTime, tsFmt, tile, errorState, skeletonRows, skeletonTiles, emptyState, debounce, searchText } from '../util.js';
 import { DataTable } from '../table.js';
 import { noScans, scanAge } from '../market.js';
 
@@ -81,7 +81,7 @@ export async function render(ctx) {
 
   let text = '';
   const apply = () => {
-    const q = text.trim().toLowerCase();
+    const q = searchText(text);
     items.setRows(a.items.filter((r) => !q || String(r.name || '').toLowerCase().includes(q) || String(r.item_id) === q));
   };
   el.querySelector('#ma-txt').addEventListener('input', debounce((e) => { text = e.target.value; apply(); }, 150));
