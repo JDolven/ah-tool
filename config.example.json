@@ -17,5 +17,7 @@
   "sync_token": "",
   "sync_hide_sellers": [],
   "sync_pull": true,
-  "sync_pull_minutes": 5
+  "sync_pull_minutes": 5,
+  "bnet_client_id": "",
+  "bnet_client_secret": ""
 }

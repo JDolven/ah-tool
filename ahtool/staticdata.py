@@ -282,6 +282,10 @@ def ensure(conn, cfg, force=False):
     from . import market
     if market.apply_sell(conn) + market.apply_class(conn):
         conn.commit()
+    # Blizzard's item data (optional, ahtool/bnet.py) where the game itself gave no price; before the builtin vendor
+    # list below is priced from items.vendor_buy.
+    from . import bnet
+    bnet.apply_items(conn)
     n_builtin = conn.execute("SELECT COUNT(*) FROM vendor_items WHERE source='builtin'").fetchone()[0]
     if force or n_builtin == 0:
         build_vendor_builtin(conn)
