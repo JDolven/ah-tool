@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS ah_sales(scan_id INTEGER, prev_scan_id INTEGER, ts IN
     suffix INTEGER, count INTEGER, unit_price INTEGER, owner TEXT, kind TEXT);
 CREATE INDEX IF NOT EXISTS idx_ah_sales_item ON ah_sales(item_id, ts);
 CREATE INDEX IF NOT EXISTS idx_ah_sales_ts ON ah_sales(ts);
+CREATE INDEX IF NOT EXISTS idx_ah_sales_scan ON ah_sales(scan_id);
 CREATE TABLE IF NOT EXISTS my_mail(key TEXT PRIMARY KEY, ts INTEGER, kind TEXT, item_name TEXT, item_id INTEGER,
     count INTEGER, price INTEGER, buyout INTEGER, deposit INTEGER, fee INTEGER, player TEXT, char TEXT, realm TEXT);
 CREATE INDEX IF NOT EXISTS idx_my_mail_ts ON my_mail(ts);
