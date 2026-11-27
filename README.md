@@ -282,17 +282,17 @@ configured, AH Tool uses it in the background; without one nothing of this runs.
 2. Local app: add to config.json `"bnet_client_id": "...", "bnet_client_secret": "..."`. Web version: the environment
    variables `AHTOOL_BNET_CLIENT_ID` and `AHTOOL_BNET_CLIENT_SECRET` (e.g. `-e AHTOOL_BNET_CLIENT_ID=...` on
    `docker run`). The host needs to reach `oauth.battle.net` and `eu.api.blizzard.com`.
-3. Optional: `bnet_region` (`eu`), `bnet_ruleset` (1 = PvP, 2 Normal, 3 Roleplay, 15 Roleplay PvP), `bnet_houses`
-   (`{"Alliance": 110, "Horde": 113, "Neutral": 116}`; environment: `Alliance=110,Horde=113,Neutral=116`). EU PvP has
-   five sets of houses (110/113/116, 111/114/117, 119/120/121, 123/124/125, and an empty 112/115/118); 110/113/116 is
-   the one that matched the auction house in game.
+3. Optional: `bnet_region` (`eu`), `bnet_ruleset` (1 = PvP, 2 Normal, 3 Roleplay, 15 Roleplay PvP). Each ruleset has
+   its own houses (Alliance / Horde / Blackwater): PvP 110/113/116, Normal 111/114/117, Roleplay 119/120/121,
+   Roleplay PvP 123/124/125. `bnet_houses` overrides them (`{"Alliance": 110}`; environment: `Alliance=110,Horde=113`).
 
 What it does:
 
-- **Item data** – Blizzard's vendor sell and buy price of every item used in a recipe or priced on the AH, refreshed
-  weekly. Used where the game itself (AH Tool Logger) has not reported a price; it fixes items Forever changed (Lesser
-  Magic Wand 1s 10c, not the Classic Era 5s 8c) without anyone seeing them in game. Custom Forever items are mostly
-  missing from the API and keep what the logger says.
+- **Item data** – the whole item catalogue (about 17,700 items, 6,600 of them custom Forever items) through the item
+  search, 1000 per request, refreshed weekly: name, quality, vendor sell and buy price. Vendor prices are used where
+  the game itself (AH Tool Logger) has not reported one; it fixes items Forever changed (Lesser Magic Wand 1s 10c, not
+  the Classic Era 5s 8c) without anyone seeing them in game, and names custom items that showed as "Item #id". A few
+  custom items are not in the API and keep what the logger says.
 - **Auction house snapshots** – each configured house about once an hour (the API updates hourly): every listing,
   summarised per item (listings, units, lowest and median unit price). No seller names - the API has none. They are
   kept apart from your own scans for now, to compare first: `GET /api/bnet/compare?faction=Alliance` (or

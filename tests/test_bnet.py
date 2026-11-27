@@ -31,9 +31,11 @@ s = bnet.settings({"bnet_client_id": "a", "bnet_client_secret": "b", "bnet_house
                    "bnet_ruleset": "1"})
 check(s["houses"] == {"Alliance": 110, "Neutral": 116} and s["ruleset"] == 1 and s["host"] == "eu.api.blizzard.com",
       "settings from environment strings %s" % s)
-check(bnet.settings({"bnet_client_id": "a", "bnet_client_secret": "b"})["houses"] == bnet.DEFAULT_HOUSES,
-      "default houses")
-for bad in ({"bnet_region": "mars"}, {"bnet_houses": {"Pirates": 1}}):
+check(bnet.settings({"bnet_client_id": "a", "bnet_client_secret": "b"})["houses"] == {"Alliance": 110, "Horde": 113,
+                                                                                      "Neutral": 116}, "default houses: PvP")
+check(bnet.settings({"bnet_client_id": "a", "bnet_client_secret": "b", "bnet_ruleset": "2"})["houses"]["Alliance"] == 111,
+      "ruleset 2 (Normal) -> its own houses")
+for bad in ({"bnet_region": "mars"}, {"bnet_houses": {"Pirates": 1}}, {"bnet_ruleset": 9}):
     try:
         bnet.settings(dict({"bnet_client_id": "a", "bnet_client_secret": "b"}, **bad))
         check(False, "refused %s" % bad)
@@ -59,17 +61,20 @@ class Fake:
     def token(self):
         return "t"
 
-    def get(self, path, namespace, if_modified_since=None, timeout=120):
-        self.calls.append((path, namespace))
-        if path.startswith("/data/wow/item/"):
-            iid = int(path.rsplit("/", 1)[1])
-            if iid == 2589:
-                return 200, {"id": iid, "name": "Linen Cloth", "sell_price": 7, "purchase_price": 0,
-                             "purchase_quantity": 1}, None
-            if iid == 2604:
-                return 200, {"id": iid, "name": "Red Dye", "sell_price": 99, "purchase_price": 250,
-                             "purchase_quantity": 5}, None
-            return 404, None, None
+    CATALOGUE = [{"id": 2589, "name": {"en_GB": "Linen Cloth"}, "quality": {"type": "COMMON"}, "sell_price": 7,
+                  "purchase_price": 0, "purchase_quantity": 1},
+                 {"id": 2604, "name": {"en_GB": "Red Dye"}, "quality": {"type": "COMMON"}, "sell_price": 99,
+                  "purchase_price": 250, "purchase_quantity": 5},
+                 {"id": 281657, "name": {"en_US": "Corrupted Riverglades Pendant"}, "quality": {"type": "RARE"},
+                  "sell_price": 4912, "purchase_price": 0, "purchase_quantity": 1}]
+    PAGE = 2
+
+    def get(self, path, namespace, if_modified_since=None, timeout=120, params=None):
+        self.calls.append((path, namespace, dict(params or {})))
+        if path == "/data/wow/search/item":
+            lo = int(params["id"].strip("[,]"))
+            res = [{"data": x} for x in self.CATALOGUE if x["id"] >= lo][:self.PAGE]
+            return 200, {"results": res}, None
         if path == "/data/wow/ruleset/1":
             return 200, {"id": 1, "name": "PvP"}, None
         if path.endswith("/commodities"):
@@ -96,10 +101,16 @@ with conn:
     conn.execute("INSERT OR REPLACE INTO item_tooltip(id, icon, data) VALUES(2589, 'x', '{\"id\":2589,\"sell_price\":13}')")
 
 fake = Fake()
-res = bnet.refresh_items(conn, fake, workers=2)
-check(res["fetched"] >= 2 and res["found"] == 2, "items fetched %s" % res)
-check(bnet.refresh_items(conn, fake)["fetched"] == 0, "fresh item data is not fetched again")
+bnet.ITEM_PAGE = fake.PAGE
+with conn:
+    conn.execute("INSERT OR REPLACE INTO price_current VALUES('PvP', 281657, 90000, 1, 2511, 1)")
+res = bnet.refresh_items(conn, fake)
+check(res == {"pages": 2, "items": 3}, "whole catalogue in id-ordered pages %s" % res)
+check([c[2]["id"] for c in fake.calls] == ["[1,]", "[2605,]"], "next page starts after the last id %s" % fake.calls)
+check(bnet.refresh_items(conn, fake).get("skipped"), "fresh item data is not fetched again")
 bnet.apply_items(conn)
+nm = conn.execute("SELECT name, quality, vendor_sell FROM items WHERE id=281657").fetchone()
+check(tuple(nm) == ("Corrupted Riverglades Pendant", 3, 4912), "custom AH item named and priced %s" % (tuple(nm),))
 vs = {r[0]: (r[1], r[2]) for r in conn.execute("SELECT id, vendor_sell, vendor_buy FROM items WHERE id IN (2589, 2604)")}
 check(vs[2589][0] == 7, "Blizzard sell price used where the game gave none %s" % vs)
 check(vs[2604][0] == 12, "the game's own price (item_sell) is not overwritten by Blizzard's %s" % vs)

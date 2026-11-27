@@ -3,16 +3,16 @@
 Nothing here runs unless a client is configured (develop.battle.net -> API Access -> Create Client):
   local app: config.json  "bnet_client_id", "bnet_client_secret"
   web version: environment AHTOOL_BNET_CLIENT_ID, AHTOOL_BNET_CLIENT_SECRET (run_web.py)
-Optional: "bnet_region" (eu), "bnet_ruleset" (1 = PvP; 2 Normal, 3 Roleplay, 15 Roleplay PvP),
-"bnet_houses" ({"Alliance": 110, "Horde": 113, "Neutral": 116} - one set of houses of the ruleset; EU PvP has five
-sets, of which 110/113/116 matched the AH in game), "bnet_realm" (realm key the snapshots are compared under; default
-the ruleset's name, e.g. "PvP").
+Optional: "bnet_region" (eu), "bnet_ruleset" (1 = PvP; 2 Normal, 3 Roleplay, 15 Roleplay PvP), "bnet_houses"
+(default: the ruleset's own houses, see RULESET_HOUSES - every ruleset lists all of them, but each house belongs to
+one ruleset), "bnet_realm" (realm key the snapshots are compared under; default the ruleset's name, e.g. "PvP").
 
 What it does (a background thread, see start()):
-* Item data (static-forever-<region>): vendor sell and buy price of every item used in a recipe or seen on the AH,
-  refreshed weekly -> bnet_items. Applied to items.vendor_sell / vendor_buy where the game itself (AH Tool Logger,
-  item_sell) has no price: the logger is what the client shows right now, the API is the fallback. Custom Forever
-  items are mostly missing from the API (404) and keep what the logger or the hotfix cache says.
+* Item data (static-forever-<region>): the whole item catalogue through the item search (1000 items per request,
+  about 18 requests), refreshed weekly -> bnet_items: name, quality, vendor sell and buy price. Applied to
+  items.vendor_sell / vendor_buy where the game itself (AH Tool Logger, item_sell) has no price - the logger is what
+  the client shows right now, the API is the fallback - and names custom Forever items the static data lacks. A few
+  custom items are missing from the API and keep what the logger or the hotfix cache says.
 * Auction houses (dynamic-forever-<region>): an hourly snapshot of each configured house (items + commodities),
   summarised per item -> bnet_ah_snapshots / bnet_ah_items. No seller names: the API has none. These are kept apart
   from your own scans (ah_scans) for now; compare() puts the newest snapshot next to your newest full scan.
@@ -29,16 +29,23 @@ import urllib.request
 API_HOSTS = {"eu": "eu.api.blizzard.com", "us": "us.api.blizzard.com", "kr": "kr.api.blizzard.com",
              "tw": "tw.api.blizzard.com"}
 TOKEN_URL = "https://oauth.battle.net/token"
-DEFAULT_HOUSES = {"Alliance": 110, "Horde": 113, "Neutral": 116}
+# Alliance / Horde / Blackwater (neutral) house of each ruleset. 110/113 matched the PvP auction house in game; the
+# neutral ones follow the same pattern in the API's house list (112/115/118 are always empty).
+RULESET_HOUSES = {1: {"Alliance": 110, "Horde": 113, "Neutral": 116},
+                  2: {"Alliance": 111, "Horde": 114, "Neutral": 117},
+                  3: {"Alliance": 119, "Horde": 120, "Neutral": 121},
+                  15: {"Alliance": 123, "Horde": 124, "Neutral": 125}}
+DEFAULT_HOUSES = RULESET_HOUSES[1]
 TIME_LEFT = {"SHORT": 1, "MEDIUM": 2, "LONG": 3, "VERY_LONG": 4}
 ITEM_MAX_AGE_S = 7 * 86400
-ITEM_RATE = 20                # item requests per second (Blizzard allows 100)
+ITEM_PAGE = 1000              # the item search's largest page
+QUALITY = {"POOR": 0, "COMMON": 1, "UNCOMMON": 2, "RARE": 3, "EPIC": 4, "LEGENDARY": 5, "ARTIFACT": 6, "HEIRLOOM": 7}
 SNAPSHOT_CHECK_S = 600        # look for a new house snapshot every 10 minutes (they change about hourly)
 KEEP_SNAPSHOTS = 72           # per house
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS bnet_items(id INTEGER PRIMARY KEY, status INTEGER, sell INTEGER, buy INTEGER,
-    buy_qty INTEGER, name TEXT, ts INTEGER);
+CREATE TABLE IF NOT EXISTS bnet_items(id INTEGER PRIMARY KEY, name TEXT, quality INTEGER, sell INTEGER,
+    buy INTEGER, buy_qty INTEGER, ts INTEGER);
 CREATE TABLE IF NOT EXISTS bnet_ah_snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, realm TEXT,
     faction TEXT, house INTEGER, last_modified TEXT, auctions INTEGER, units INTEGER, items INTEGER);
 CREATE INDEX IF NOT EXISTS idx_bnet_snap ON bnet_ah_snapshots(realm, faction, ts);
@@ -68,7 +75,10 @@ def settings(cfg):
     region = str(cfg.get("bnet_region") or "eu").strip().lower()
     if region not in API_HOSTS:
         raise BnetError("bnet_region must be one of %s" % ", ".join(sorted(API_HOSTS)))
-    houses = cfg.get("bnet_houses") or DEFAULT_HOUSES
+    ruleset = int(cfg.get("bnet_ruleset") or 1)
+    houses = cfg.get("bnet_houses") or RULESET_HOUSES.get(ruleset)
+    if not houses:
+        raise BnetError("bnet_ruleset %d has no known houses - set bnet_houses" % ruleset)
     if isinstance(houses, str):  # "Alliance=110,Horde=113,Neutral=116" (environment variable)
         houses = dict(p.split("=", 1) for p in houses.split(",") if "=" in p)
     houses = {str(f).strip(): int(h) for f, h in houses.items() if str(h).strip()}
@@ -76,7 +86,7 @@ def settings(cfg):
         if f not in ("Alliance", "Horde", "Neutral"):
             raise BnetError("bnet_houses: faction must be Alliance, Horde or Neutral (got %r)" % f)
     return {"client_id": cid, "client_secret": secret, "region": region, "host": API_HOSTS[region],
-            "ruleset": int(cfg.get("bnet_ruleset") or 1), "houses": houses,
+            "ruleset": ruleset, "houses": houses,
             "realm": str(cfg.get("bnet_realm") or "").strip()}
 
 
@@ -111,9 +121,10 @@ class Client:
         self._token, self._exp = d["access_token"], time.time() + int(d.get("expires_in") or 3600)
         return self._token
 
-    def get(self, path, namespace, if_modified_since=None, timeout=120):
+    def get(self, path, namespace, if_modified_since=None, timeout=120, params=None):
         """-> (status, json | None, last_modified). 404 and 304 are answers, not errors."""
-        q = urllib.parse.urlencode({"namespace": "%s-forever-%s" % (namespace, self.s["region"]), "locale": "en_GB"})
+        q = urllib.parse.urlencode(dict({"namespace": "%s-forever-%s" % (namespace, self.s["region"]),
+                                         "locale": "en_GB"}, **(params or {})))
         url = "https://%s%s?%s" % (self.s["host"], path, q)
         for attempt in range(4):
             headers = {"Authorization": "Bearer " + self.token(), "Accept-Encoding": "gzip"}
@@ -146,53 +157,45 @@ class Client:
 
 # ---------------------------------------------------------------- item data
 
-def wanted_items(conn):
-    """Items worth knowing the vendor prices of: recipe products and reagents, and everything priced on the AH."""
-    ids = {r[0] for r in conn.execute("SELECT created_item_id FROM recipes WHERE created_item_id IS NOT NULL")}
-    ids |= {r[0] for r in conn.execute("SELECT item_id FROM recipe_reagents")}
-    ids |= {r[0] for r in conn.execute("SELECT DISTINCT item_id FROM price_current")}
-    return sorted(i for i in ids if i and i > 0)
+def _en(v):
+    """A localised name: the plain string (locale=en_GB) or the en_GB/en_US entry of a {locale: name} dict."""
+    if isinstance(v, dict):
+        v = v.get("en_GB") or v.get("en_US")
+    return v[:255] if isinstance(v, str) and v else None
 
 
-def refresh_items(conn, cli, max_age_s=ITEM_MAX_AGE_S, limit=None, now=None, workers=8):
-    """Fetch item data that is missing or older than max_age_s, `workers` requests at a time and ITEM_RATE per second
-    in total. Returns {"fetched", "found", "missing"}."""
-    from concurrent.futures import ThreadPoolExecutor
+def refresh_items(conn, cli, max_age_s=ITEM_MAX_AGE_S, now=None, force=False):
+    """The whole item catalogue through the item search, ITEM_PAGE items per request in id order, when it is older
+    than max_age_s (or force). Returns {"pages", "items"} ({"skipped": True} when fresh)."""
     ensure_schema(conn)
     now = int(now or time.time())
-    known = {r[0]: r[1] for r in conn.execute("SELECT id, ts FROM bnet_items")}
-    todo = [i for i in wanted_items(conn) if now - known.get(i, 0) >= max_age_s]
-    if limit:
-        todo = todo[:limit]
-    cli.token()  # once, before the workers start
-    gap = float(workers) / ITEM_RATE
-
-    def one(iid):
-        t0 = time.time()
-        try:
-            st, d, _lm = cli.get("/data/wow/item/%d" % iid, "static")
-        except BnetError as e:
-            log("item %d: %s" % (iid, e))
-            return None
-        finally:
-            wait = gap - (time.time() - t0)
-            if wait > 0:
-                time.sleep(wait)
-        if st == 200 and isinstance(d, dict):
-            qty = max(_int(d.get("purchase_quantity")) or 1, 1)
-            return (iid, 200, _int(d.get("sell_price")), _int(d.get("purchase_price")), qty,
-                    d.get("name") if isinstance(d.get("name"), str) else None, now)
-        return (iid, st, None, None, None, None, now)
-
-    found = missing = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for start in range(0, len(todo), 200):
-            rows = [r for r in ex.map(one, todo[start:start + 200]) if r]
-            found += sum(1 for r in rows if r[1] == 200)
-            missing += sum(1 for r in rows if r[1] != 200)
-            with conn:
-                conn.executemany("INSERT OR REPLACE INTO bnet_items VALUES(?,?,?,?,?,?,?)", rows)
-    return {"fetched": len(todo), "found": found, "missing": missing}
+    last_ts = conn.execute("SELECT MIN(ts) FROM bnet_items").fetchone()[0]
+    if not force and last_ts and now - last_ts < max_age_s:
+        return {"skipped": True}
+    last, pages, rows = 0, 0, []
+    while pages < 1000:
+        st, d, _ = cli.get("/data/wow/search/item", "static", params={
+            "orderby": "id", "_pageSize": ITEM_PAGE, "id": "[%d,]" % (last + 1)})
+        res = (d or {}).get("results") if st == 200 else None
+        if not res:
+            break
+        pages += 1
+        for x in res:
+            it = x.get("data") if isinstance(x, dict) else None
+            iid = _int((it or {}).get("id"))
+            if not iid:
+                continue
+            last = max(last, iid)
+            rows.append((iid, _en(it.get("name")), QUALITY.get((it.get("quality") or {}).get("type")),
+                         _int(it.get("sell_price")), _int(it.get("purchase_price")),
+                         max(_int(it.get("purchase_quantity")) or 1, 1), now))
+        if len(res) < ITEM_PAGE:
+            break
+    if rows:
+        with conn:
+            conn.execute("DELETE FROM bnet_items")
+            conn.executemany("INSERT OR REPLACE INTO bnet_items VALUES(?,?,?,?,?,?,?)", rows)
+    return {"pages": pages, "items": len(rows)}
 
 
 def _int(v):
@@ -204,18 +207,26 @@ def _int(v):
 
 
 def apply_items(conn):
-    """Blizzard's vendor prices into items (and the tooltip), where the game itself (item_sell) has none. Vendor buy
-    prices also re-price the builtin vendor list (thread, vials, ...). Returns the number of items changed."""
+    """Blizzard's item data into items (and the tooltip): names of unnamed items, vendor sell prices where the game
+    itself (item_sell) has none, vendor buy prices - which also re-price the builtin vendor list (thread, vials, ...).
+    Returns the number of items changed."""
     try:
         ensure_schema(conn)
         have_sell = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='item_sell'").fetchone()
         skip = "AND id NOT IN (SELECT id FROM item_sell)" if have_sell else ""
         before = conn.execute("SELECT total_changes()").fetchone()[0]
+        # custom Forever items the static data has no name for (in recipes or on the AH): Blizzard's name
+        conn.execute("INSERT OR IGNORE INTO items(id, name, quality) SELECT b.id, b.name, b.quality FROM bnet_items b "
+                     "WHERE b.name IS NOT NULL AND (b.id IN (SELECT item_id FROM price_current) OR b.id IN "
+                     "(SELECT item_id FROM recipe_reagents) OR b.id IN (SELECT created_item_id FROM recipes))")
+        conn.execute("UPDATE items SET name=(SELECT b.name FROM bnet_items b WHERE b.id=items.id), "
+                     "quality=COALESCE(quality, (SELECT b.quality FROM bnet_items b WHERE b.id=items.id)) "
+                     "WHERE (name IS NULL OR name='') AND id IN (SELECT id FROM bnet_items WHERE name IS NOT NULL)")
         conn.execute("UPDATE items SET vendor_sell=(SELECT b.sell FROM bnet_items b WHERE b.id=items.id) "
-                     "WHERE id IN (SELECT id FROM bnet_items WHERE status=200 AND sell IS NOT NULL) %s AND vendor_sell "
+                     "WHERE id IN (SELECT id FROM bnet_items WHERE sell IS NOT NULL) %s AND vendor_sell "
                      "IS NOT (SELECT b.sell FROM bnet_items b WHERE b.id=items.id)" % skip)
         conn.execute("UPDATE items SET vendor_buy=(SELECT b.buy / b.buy_qty FROM bnet_items b WHERE b.id=items.id) "
-                     "WHERE id IN (SELECT id FROM bnet_items WHERE status=200 AND buy > 0 AND buy_qty > 0) AND "
+                     "WHERE id IN (SELECT id FROM bnet_items WHERE buy > 0 AND buy_qty > 0) AND "
                      "vendor_buy IS NOT (SELECT b.buy / b.buy_qty FROM bnet_items b WHERE b.id=items.id)")
         changed = conn.execute("SELECT total_changes()").fetchone()[0] - before
         conn.execute("UPDATE vendor_items SET price=(SELECT i.vendor_buy FROM items i WHERE i.id=vendor_items.item_id) "
@@ -225,7 +236,7 @@ def apply_items(conn):
                      "THEN json_set(item_tooltip.data, '$.sell_price', b.sell) "
                      "ELSE json_remove(item_tooltip.data, '$.sell_price') END FROM bnet_items b "
                      "WHERE b.id=item_tooltip.id) "
-                     "WHERE id IN (SELECT id FROM bnet_items WHERE status=200 AND sell IS NOT NULL) %s AND "
+                     "WHERE id IN (SELECT id FROM bnet_items WHERE sell IS NOT NULL) %s AND "
                      "json_valid(data) AND COALESCE(json_extract(data, '$.sell_price'), 0) IS NOT "
                      "(SELECT b.sell FROM bnet_items b WHERE b.id=item_tooltip.id)" % skip)
         conn.commit()
@@ -403,7 +414,7 @@ def start(cfg, connect, on_change=None):
                     res = run_once(conn, cli, s, items=do_items)
                     if do_items:
                         next_items = time.time() + 6 * 3600
-                        if res.get("items", {}).get("fetched"):
+                        if res.get("items", {}).get("items"):
                             log("item data: %s, %d item(s) re-priced" % (res["items"], res.get("applied", 0)))
                     if on_change and (res.get("snapshots") or res.get("applied")):
                         on_change(res)
@@ -440,7 +451,7 @@ def main(argv=None):
         return 1
     cli = Client(s)
     if a.cmd == "items":
-        print(refresh_items(conn, cli), "re-priced:", apply_items(conn))
+        print(refresh_items(conn, cli, force=True), "re-priced:", apply_items(conn))
     else:
         print("snapshots stored:", snapshot_houses(conn, cli, s))
     return 0
