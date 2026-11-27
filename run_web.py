@@ -15,6 +15,9 @@ the environment:
                      snapshots of the auction houses and Blizzard's item vendor prices (ahtool/bnet.py). Off without.
   AHTOOL_BNET_REGION (eu), AHTOOL_BNET_RULESET (1 = PvP), AHTOOL_BNET_HOUSES ("Alliance=110,Horde=113,Neutral=116"),
   AHTOOL_BNET_REALM  (realm key of the snapshots; default the ruleset's name)
+  AHTOOL_REALM_ALIASES  "Old key=Canonical key;..." - realm keys that are the same auction house (Auctionator's old
+                     key, the game's realm name in logger prices). Pushed prices are stored under the canonical key,
+                     and what is already stored under an alias is merged into it at start (sync.merge_realm_aliases)
   AHTOOL_DOWNLOADS   folder with the downloads built by `python -m ahtool.downloads build` (default: downloads/
                      next to this file; the Docker image builds them). Served at /download/, shown on #/download
   AHTOOL_ANALYTICS_SCRIPT / AHTOOL_ANALYTICS_ID   optional Umami tracker (script URL + website id); only counted
@@ -58,9 +61,19 @@ def main():
               "  docker run --rm -v <volume>:/data alpine chown -R %d:%d /data"
               % (db_path, os.getuid(), os.getuid(), os.getgid()))
         return 2
+    try:
+        cfg["realm_aliases"] = sync.realm_aliases(os.environ.get("AHTOOL_REALM_ALIASES", "").strip())
+    except ValueError as e:
+        print("AHTOOL_REALM_ALIASES: %s" % e)
+        return 2
     conn = db.connect(db_path)
     sync.ensure_schema(conn)
     sync.load_pushed_cfg(conn, cfg)
+    merged = sync.merge_realm_aliases(conn, cfg["realm_aliases"])
+    if merged:
+        print("Realm aliases: merged %s into their canonical realm (%d price rows changed)."
+              % (", ".join("%s (%d rows)" % kv for kv in sorted(merged["aliases"].items())), merged["changed"]),
+              flush=True)
     n_keys = conn.execute("SELECT COUNT(*) FROM sync_keys WHERE revoked_at IS NULL").fetchone()[0]
     conn.close()
 

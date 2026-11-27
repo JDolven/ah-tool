@@ -1124,6 +1124,112 @@ _CURRENT_NEWER = ("(COALESCE(excluded.last_day,0), COALESCE(excluded.updated_at,
                   "OR COALESCE({t}.last_day,0) > %d OR COALESCE({t}.updated_at,0) > %d")
 
 
+# ---------------------------------------------------------------- realm aliases (web version)
+# One auction house can reach the server under several realm keys: Auctionator's old key next to its new one ("PvP"
+# next to "PvP Alliance" after it began to key by faction), and AH Tool Logger prices under the game's realm name
+# ("CAMWOW EU5 Realm 4 PvP Alliance"), which the PC cannot match to Auctionator's by name. AHTOOL_REALM_ALIASES maps
+# such keys to one canonical key: pushed rows are stored under it, and merge_realm_aliases() folds what is already
+# stored into it with the normal merge rules. Scans keep their own realm: they are not price keys.
+
+def realm_aliases(value):
+    """"Old=New;Other=New" (or a dict) -> {alias: canonical}. ValueError on anything ambiguous."""
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        pairs = list(value.items())
+    else:
+        pairs = []
+        for part in str(value).split(";"):
+            if not part.strip():
+                continue
+            if "=" not in part:
+                raise ValueError("realm alias %r: expected Alias=Canonical" % part.strip()[:80])
+            a, c = part.split("=", 1)
+            pairs.append((a, c))
+    out = {}
+    for a, c in pairs:
+        a, c = str(a).strip(), str(c).strip()
+        if not a or not c or len(a) > MAX_STR or len(c) > MAX_STR:
+            raise ValueError("realm alias %r=%r: names must be 1-%d characters" % (a[:80], c[:80], MAX_STR))
+        if a == c:
+            raise ValueError("realm alias %r points to itself" % a)
+        if a in out and out[a] != c:
+            raise ValueError("realm alias %r is given twice" % a)
+        out[a] = c
+    chained = set(out) & set(out.values())
+    if chained:
+        raise ValueError("realm aliases cannot chain: %s is both an alias and a target" % ", ".join(sorted(chained)))
+    return out
+
+
+def _canon(rows, aliases):
+    """Rows whose first column is a realm key -> the same rows under their canonical key (in place)."""
+    if aliases:
+        for r in rows:
+            r[0] = aliases.get(r[0], r[0])
+    return rows
+
+
+def merge_realm_aliases(conn, aliases):
+    """Fold every alias key's stored prices into its canonical key (server start). Idempotent: returns {} when there
+    is nothing under an alias. Merged rows get a new seq, so every PC pulls them under the canonical key."""
+    if not aliases:
+        return {}
+    ensure_schema(conn)
+    tables = ("price_daily_src", "price_current_src", "price_daily", "price_current", "snapshots", "ingests")
+    found = {}
+    for a in aliases:
+        n = sum(conn.execute("SELECT COUNT(*) FROM main.%s WHERE realm=?" % t, (a,)).fetchone()[0] for t in tables)
+        if n:
+            found[a] = n
+    if not found:
+        return {}
+    lim = _limits()
+    cur = conn.cursor()
+    cur.execute("BEGIN IMMEDIATE")
+    try:
+        seq = _next_seq(cur)
+        _touch_reset(cur)
+        for a in found:
+            c = aliases[a]
+            # every key the alias had, under both names: the recompute rebuilds the canonical row and deletes the
+            # alias's merged row once it has no per-key rows left
+            for t, keys, cols in (("price_daily", "_pd_keys", "item_id, day"), ("price_current", "_pc_keys", "item_id")):
+                for src_t in (t + "_src", t):
+                    cur.execute("INSERT OR IGNORE INTO temp.%s SELECT realm, %s FROM main.%s WHERE realm=?"
+                                % (keys, cols, src_t), (a,))
+                    cur.execute("INSERT OR IGNORE INTO temp.%s SELECT ?, %s FROM main.%s WHERE realm=?"
+                                % (keys, cols, src_t), (c, a))
+            cur.execute(
+                "INSERT INTO main.price_daily_src(realm,item_id,day,low,high,available,src_key) "
+                "SELECT ?, item_id, day, low, high, available, src_key FROM main.price_daily_src WHERE realm=? "
+                "ON CONFLICT(realm,item_id,day,src_key) DO UPDATE SET %s"
+                % MERGE_DAILY.replace("price_daily.", "price_daily_src."), (c, a))
+            cur.execute(
+                "INSERT INTO main.price_current_src(realm,item_id,price,available,last_day,updated_at,src_key) "
+                "SELECT ?, item_id, price, available, last_day, updated_at, src_key FROM main.price_current_src "
+                "WHERE realm=? ON CONFLICT(realm,item_id,src_key) DO UPDATE SET price=excluded.price, "
+                "available=excluded.available, last_day=excluded.last_day, updated_at=excluded.updated_at WHERE "
+                + _CURRENT_NEWER.format(t="price_current_src") % (lim["today"], lim["ts"]), (c, a))
+            cur.execute("DELETE FROM main.price_daily_src WHERE realm=?", (a,))
+            cur.execute("DELETE FROM main.price_current_src WHERE realm=?", (a,))
+            cur.execute("UPDATE OR IGNORE main.snapshots SET realm=? WHERE realm=?", (c, a))
+            cur.execute("DELETE FROM main.snapshots WHERE realm=?", (a,))
+            cur.execute("UPDATE main.ingests SET realm=? WHERE realm=?", (c, a))
+        changed = _recompute_daily(cur, seq) + _recompute_current(cur, seq, lim)
+        for k in ("sync_owner_realm",):
+            r = cur.execute("SELECT value FROM main.meta WHERE key=?", (k,)).fetchone()
+            if r and r[0] in aliases:
+                cur.execute("INSERT OR REPLACE INTO main.meta(key,value) VALUES(?,?)", (k, aliases[r[0]]))
+        if cur.execute("SELECT 1 FROM main.meta WHERE key='sync_owner_realms'").fetchone():
+            _set_owner_realms(cur, {aliases.get(r, r) for r in _owner_realms(cur)})
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"aliases": found, "changed": changed}
+
+
 def apply(conn, cfg, payload, source):
     """Apply one pushed batch atomically, merged with what other pushers sent.
 
@@ -1138,6 +1244,7 @@ def apply(conn, cfg, payload, source):
     lim = _limits()
     owner = bool(source.get("owner"))
     src = _src(source)
+    aliases = (cfg or {}).get("realm_aliases") or {}
     ensure_schema(conn)
     applied = {}
     new_cfg = None
@@ -1193,7 +1300,7 @@ def apply(conn, cfg, payload, source):
         newest = {}  # realm -> newest day in this push (price_current last_day, price_daily day)
         _touch_reset(cur)
         if "price_current" in payload:
-            rows = _checked(payload["price_current"], "price_current", lim)
+            rows = _canon(_checked(payload["price_current"], "price_current", lim), aliases)
             for r in rows:
                 if r[5] is not None and r[5] > lim["now"]:
                     r[5] = lim["now"]  # "observed in the future" is clamped to when the server received it
@@ -1209,7 +1316,7 @@ def apply(conn, cfg, payload, source):
                 realms[r[0]] = realms.get(r[0], 0) + 1
                 newest[r[0]] = max(newest.get(r[0], 0), r[4] or 0)
         if "price_daily" in payload:
-            rows = _checked(payload["price_daily"], "price_daily", lim)
+            rows = _canon(_checked(payload["price_daily"], "price_daily", lim), aliases)
             cur.executemany(
                 "INSERT INTO main.price_daily_src(realm,item_id,day,low,high,available,src_key) "
                 "VALUES(?,?,?,?,?,?,%d) ON CONFLICT(realm,item_id,day,src_key) DO UPDATE SET %s"
@@ -1221,7 +1328,7 @@ def apply(conn, cfg, payload, source):
                 realms.setdefault(r[0], 0)
                 newest[r[0]] = max(newest.get(r[0], 0), r[2] or 0)
         if "snapshots" in payload:
-            rows = _checked(payload["snapshots"], "snapshots", lim)
+            rows = _canon(_checked(payload["snapshots"], "snapshots", lim), aliases)
             n0 = _changes(cur)
             _ins(cur, "snapshots", SNAPSHOTS + ("src_key",), [r + [src] for r in rows], "INSERT OR IGNORE")
             changed += _changes(cur) - n0

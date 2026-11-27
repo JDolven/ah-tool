@@ -138,6 +138,29 @@ def get_realm(conn, realm=None):
     return r[0] if r and r[0] else None
 
 
+STALE_REALM_DAYS = 7
+
+
+def _usable_realms(conn, realms, keep=None):
+    """The realms worth offering: they have current prices, a name, and daily prices no more than STALE_REALM_DAYS
+    behind the newest realm's. Drops an old Auctionator key that stopped updating, the realm name of scans (not a
+    price key) and the empty one. `keep` (the realm shown) always stays."""
+    priced = {r[0] for r in conn.execute("SELECT DISTINCT realm FROM price_current") if r[0]}
+    days = {r[0]: r[1] for r in conn.execute("SELECT realm, MAX(day) FROM price_daily GROUP BY realm")}
+    newest = max((d for d in days.values() if d is not None), default=None)
+    out = set()
+    for r in realms:
+        if not r or r not in priced:
+            continue
+        d = days.get(r)
+        if newest is not None and d is not None and d < newest - STALE_REALM_DAYS:
+            continue
+        out.add(r)
+    if keep:
+        out.add(keep)
+    return sorted(out)
+
+
 def list_realms(conn):
     # web version: only realms the owner pushed data for - contributors cannot add entries (sync.owner_realms)
     if _is_web_db(conn):
@@ -145,12 +168,12 @@ def list_realms(conn):
         owned = sync.owner_realms(conn)
         if owned is not None:
             d = _web_default_realm(conn)
-            return sorted(set(owned) | ({d} if d else set()))
+            return _usable_realms(conn, set(owned) | ({d} if d else set()), keep=d)
     rs = [r[0] for r in conn.execute("SELECT DISTINCT realm FROM price_current ORDER BY realm")]
     for r in conn.execute("SELECT DISTINCT realm FROM ingests WHERE items > 0"):
         if r[0] and r[0] not in rs:
             rs.append(r[0])
-    return rs
+    return _usable_realms(conn, rs, keep=get_realm(conn))
 
 
 class _Ctx:
