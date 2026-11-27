@@ -974,6 +974,70 @@ try:
           "a negative auctions_from is refused")
     big_pc.close()
     cw.close()
+
+    # ---- a scan with more sales than one batch: sent in parts (sales_parts), or cut for an older server
+    sp_pc = db.connect(os.path.join(tmp, "sales_pc.db"))
+    market.ensure_schema(sp_pc)
+    for ts_ in (NOW - 7200, NOW - 600):
+        sp_pc.execute("INSERT INTO ah_scans(ts,realm,faction,char,source,total,n,partial,raw_kept,diffed) "
+                      "VALUES(?, 'Home', 'Alliance', 'Me', 'full', 1, 1, 0, 0, 1)", (ts_,))
+    p_id, s_id = [r[0] for r in sp_pc.execute("SELECT id FROM ah_scans ORDER BY ts")]
+    sp_pc.executemany("INSERT INTO ah_sales VALUES(?,?,?,?,0,1,?,'x',?)",
+                      [(s_id, p_id, NOW - 600, 2589, 100 + i, "sold" if i < 20 else "expired") for i in range(170)])
+    sp_pc.commit()
+    sw, ids = fresh_web("sales_web.db")
+    n_sales = lambda: sw.execute("SELECT COUNT(*) FROM ah_sales WHERE ts=?", (NOW - 600,)).fetchone()[0]  # noqa
+    st = sync.remote_state(sw, src(ids, "Own"))
+    check("sales_parts" in st["features"], "the server announces sales_parts")
+    sb, _ = sync.build_batches(sp_pc, {}, st)
+    check(all(sync._count_rows(b) <= 2 * sync.MAX_BATCH_ROWS for b in sb), "every batch of a scan's sales stays small")
+    check(any("more_sales" in u for b in sb for u in b.get("scan_updates") or []), "sales sent in parts")
+    first_part = next(i for i, b in enumerate(sb) if any("more_sales" in u for u in b.get("scan_updates") or []))
+    for b in sb[:first_part + 1]:  # the scan and its first sales part arrive, then the push fails
+        sync.apply(sw, {}, b, src(ids, "Own"))
+    half = n_sales()
+    check(0 < half < 170, "half the sales stored (%d)" % half)
+    again = [u for b in sb[:first_part + 1] for u in b.get("scan_updates") or [] if "more_sales" in u]
+    if again:
+        sync.apply(sw, {}, {"protocol": sync.PROTOCOL, "scan_updates": again[-1:]}, src(ids, "Own"))
+    check(n_sales() == half, "a sales part sent twice is skipped")
+    for b in sync.build_batches(sp_pc, {}, sync.remote_state(sw, src(ids, "Own")))[0]:
+        sync.apply(sw, {}, b, src(ids, "Own"))
+    check(n_sales() == 170, "the next push completes the sales (%d of 170)" % n_sales())
+    check(q(sw, "SELECT COUNT(DISTINCT unit_price) FROM ah_sales WHERE ts=%d" % (NOW - 600)) == [(170,)],
+          "no sale stored twice")
+    r = sync.apply(sw, {}, {"protocol": sync.PROTOCOL, "scan_updates": [
+        {"key": ["Home", "Alliance", NOW - 600], "sales_from": 170, "more_sales": [[None, 2589, 0, 1, 5, "m", "sold"]]}]},
+        src(ids, "Mal"))
+    check(n_sales() == 170, "another key's sales part is not taken (%s)" % r)
+    check(refused(lambda: sync.apply(sw, {}, {"protocol": sync.PROTOCOL, "scan_updates": [
+        {"key": ["Home", "Alliance", NOW - 600], "sales_from": "x", "more_sales": []}]}, src(ids, "Own"))),
+          "a bad sales_from is refused")
+    sw.close()
+
+    # an older server (no sales_parts, cap of 100 rows here): sold rows go, expired ones are cut to fit
+    orig_cap = sync.SERVER_MAX_ROWS
+    sync.SERVER_MAX_ROWS = 100
+    try:
+        ow, ido = fresh_web("sales_old_web.db")
+        st = sync.remote_state(ow, src(ido, "Own"))
+        st.pop("features")
+        ob, _ = sync.build_batches(sp_pc, {}, st)
+        check(all(sync._count_rows(b) <= sync.SERVER_MAX_ROWS for b in ob), "older server: no batch over its cap")
+        check(not any("more_sales" in u for b in ob for u in b.get("scan_updates") or []), "older server: no parts")
+        for b in ob:
+            sync.apply(ow, {}, b, src(ido, "Own"))
+        kinds = dict(q(ow, "SELECT kind, COUNT(*) FROM ah_sales WHERE ts=%d GROUP BY kind" % (NOW - 600)))
+        check(kinds.get("sold") == 20 and 0 < kinds.get("expired", 0) < 150, "older server: all sold, some expired %s" % kinds)
+        # the server is upgraded: the next push sends the expired rows that were cut
+        for b in sync.build_batches(sp_pc, {}, sync.remote_state(ow, src(ido, "Own")))[0]:
+            sync.apply(ow, {}, b, src(ido, "Own"))
+        check(q(ow, "SELECT COUNT(*) FROM ah_sales WHERE ts=%d" % (NOW - 600)) == [(170,)],
+              "after the upgrade the rest of the sales arrive")
+        ow.close()
+    finally:
+        sync.SERVER_MAX_ROWS = orig_cap
+    sp_pc.close()
 finally:
     sync.MAX_BATCH_ROWS = orig_batch
 

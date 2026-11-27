@@ -51,6 +51,9 @@ from .ingest import MERGE_DAILY
 from .schema import add_column
 
 PROTOCOL = 2
+# Additions a server announces in /api/sync/state; a PC only uses them when listed (older servers refuse them).
+#   sales_parts: scan_updates with sales_from + more_sales - the sales of a scan in several batches
+FEATURES = ("sales_parts",)
 MAX_BATCH_ROWS = 150000
 DAY_OVERLAP = 3  # days of price_daily that are always resent (Auctionator updates today and recent days)
 
@@ -364,7 +367,11 @@ def build_batches(conn, cfg, remote, full=False, mine=None):
 
     # --- AH Tool Logger scans
     # (raw_kept, diffed, stored auction count - None from a server that does not report it)
-    have = {(r[0], r[1], r[2]): (r[3], r[4], r[5] if len(r) > 5 else None) for r in remote.get("scans") or []}
+    have = {(r[0], r[1], r[2]): (r[3], r[4], r[5] if len(r) > 5 else None, r[6] if len(r) > 6 else None)
+            for r in remote.get("scans") or []}
+    # A server with sales_parts takes a scan's sales in several batches; an older one only all at once, so a scan with
+    # more sales than one batch can hold sends its sold/relisted rows and as many expired ones as fit.
+    sales_parts = "sales_parts" in (remote.get("features") or [])
     # only your own scans: pulled ones (source 'web') came from the server and belong to whoever scanned them
     scans = [s for s in conn.execute("SELECT id, %s FROM ah_scans WHERE COALESCE(source,'')<>'web' ORDER BY ts"
                                      % ",".join(SCAN)).fetchall() if _bad_row(list(s[1:]), SPEC["scan"], lim) is None]
@@ -374,9 +381,11 @@ def build_batches(conn, cfg, remote, full=False, mine=None):
     scans = [s for s in scans if s[1] <= lim["now"] + SCAN_TS_SLACK]
 
     def sales_for(sid):
+        # a fixed order (sold and relisted first, then expired; rowid within): parts sent in several batches line up
+        # between pushes, and a cut for an older server drops expired rows first
         out = []
         for r in conn.execute("SELECT prev_scan_id, item_id, suffix, count, unit_price, owner, kind FROM ah_sales "
-                              "WHERE scan_id=?", (sid,)):
+                              "WHERE scan_id=? ORDER BY kind='expired', rowid", (sid,)):
             prev = key_of.get(r[0])
             out.append([prev[2] if prev else None, r[1], r[2], r[3], r[4], _mask(r[5], own), r[6]])
         return _valid_rows(out, "sales", lim)
@@ -392,6 +401,15 @@ def build_batches(conn, cfg, remote, full=False, mine=None):
         return [{"key": list(key), "auctions_from": i, "more_auctions": auctions[i:i + MAX_BATCH_ROWS]}
                 for i in range(frm, len(auctions), MAX_BATCH_ROWS)]
 
+    def sales_split(key, sales, room):
+        """-> (the sales that go with the scan or its update, later parts). Without sales_parts on the server the
+        rest is dropped: whatever fits under the server's row cap goes in one piece."""
+        if sales_parts:
+            room = max(0, room)
+            return sales[:room], [{"key": list(key), "sales_from": i, "more_sales": sales[i:i + MAX_BATCH_ROWS]}
+                                  for i in range(room, len(sales), MAX_BATCH_ROWS)]
+        return sales[:max(0, SERVER_MAX_ROWS - 1 - (MAX_BATCH_ROWS - room))], []
+
     cur, cur_rows = [], 0
     updates = []
     parts = []
@@ -400,7 +418,7 @@ def build_batches(conn, cfg, remote, full=False, mine=None):
         key = (row[1], row[2], row[0])
         raw_kept, diffed = row[7], row[8]
         if key in have and not full:
-            r_raw, r_diffed, r_count = have[key]
+            r_raw, r_diffed, r_count, r_sales = have[key]
             if raw_kept and r_raw and r_count is not None:
                 # a big scan whose later parts did not arrive (a push that failed half way): send the rest
                 auctions = auctions_for(sid)
@@ -410,7 +428,12 @@ def build_batches(conn, cfg, remote, full=False, mine=None):
             if r_raw and not raw_kept:
                 upd["drop_raw"] = True
             if diffed and not r_diffed:
-                upd["sales"] = sales_for(sid)
+                upd["sales"], more = sales_split(key, sales_for(sid), MAX_BATCH_ROWS - 1)
+                parts.extend(more)
+            elif diffed and sales_parts and r_sales is not None and r_sales < conn.execute(
+                    "SELECT COUNT(*) FROM ah_sales WHERE scan_id=?", (sid,)).fetchone()[0]:
+                # sales whose later parts did not arrive (a push that failed half way, or cut by an older server)
+                parts.extend(sales_split(key, sales_for(sid), r_sales)[1])
             if upd:
                 upd["key"] = list(key)
                 updates.append(upd)
@@ -418,13 +441,15 @@ def build_batches(conn, cfg, remote, full=False, mine=None):
         item = {"scan": row,
                 "items": _valid_rows(_rows(conn, "SELECT %s FROM ah_scan_items WHERE scan_id=?" % ",".join(SCAN_ITEMS),
                                            (sid,)), "scan items", lim),
-                "auctions": [], "sales": sales_for(sid)}
+                "auctions": [], "sales": []}
+        item["sales"], more = sales_split(key, sales_for(sid), MAX_BATCH_ROWS - 1 - len(item["items"]))
         if raw_kept:
             auctions = auctions_for(sid)
             # A scan larger than one batch goes in parts: as many auctions as fit with the scan, the rest after it.
             room = max(0, MAX_BATCH_ROWS - len(item["items"]) - len(item["sales"]))
             item["auctions"] = auctions[:room]
             parts.extend(more_parts(key, auctions, room))
+        parts.extend(more)  # sales parts after the auction parts: the server appends each only in order
         n = len(item["items"]) + len(item["auctions"]) + len(item["sales"])
         if cur and (cur_rows + n > MAX_BATCH_ROWS or len(cur) >= MAX_SCANS_PER_BATCH):
             batches.append({"scans": cur})
@@ -435,7 +460,7 @@ def build_batches(conn, cfg, remote, full=False, mine=None):
         batches.append({"scans": cur})
     cur, cur_rows = [], 0
     for u in updates + parts:
-        n = len(u.get("sales") or []) + len(u.get("more_auctions") or []) + 1
+        n = len(u.get("sales") or []) + len(u.get("more_auctions") or []) + len(u.get("more_sales") or []) + 1
         if cur and cur_rows + n > MAX_BATCH_ROWS:
             batches.append({"scan_updates": cur})
             cur, cur_rows = [], 0
@@ -1023,13 +1048,14 @@ def remote_state(conn, source):
     ensure_schema(conn)
     meta = dict(conn.execute("SELECT key, value FROM main.meta WHERE key IN "
                              "('sync_static_hash','sync_push_ts','sync_epoch')"))
-    return {"protocol": PROTOCOL, "epoch": meta.get("sync_epoch"), "you": source["name"],
+    return {"protocol": PROTOCOL, "features": list(FEATURES), "epoch": meta.get("sync_epoch"), "you": source["name"],
             "static_hash": meta.get("sync_static_hash"),
             "accept_static": bool(source["owner"]), "accept_cfg": bool(source["owner"]),
             "last_push_ts": int(meta["sync_push_ts"]) if str(meta.get("sync_push_ts") or "").isdigit() else None,
             "scans": [list(r) for r in conn.execute(
                 "SELECT realm, faction, ts, raw_kept, diffed, (SELECT COUNT(*) FROM main.ah_auctions a "
-                "WHERE a.scan_id=ah_scans.id) FROM main.ah_scans WHERE src_key IS ? OR src_key IS NULL "
+                "WHERE a.scan_id=ah_scans.id), (SELECT COUNT(*) FROM main.ah_sales s WHERE s.scan_id=ah_scans.id) "
+                "FROM main.ah_scans WHERE src_key IS ? OR src_key IS NULL "
                 "ORDER BY ts", (_src(source),))]}
 
 
@@ -1068,8 +1094,9 @@ def _count_rows(payload):
         _keys_ok(s, ("scan", "items", "auctions", "sales"), "scans")
         n += 1 + sum(len(_list(s.get(k), k)) for k in ("items", "auctions", "sales"))
     for u in _list(payload.get("scan_updates"), "scan_updates"):
-        _keys_ok(u, ("key", "drop_raw", "sales", "auctions_from", "more_auctions"), "scan_updates")
-        n += 1 + len(_list(u.get("sales"), "sales")) + len(_list(u.get("more_auctions"), "more_auctions"))
+        _keys_ok(u, ("key", "drop_raw", "sales", "auctions_from", "more_auctions", "sales_from", "more_sales"),
+                 "scan_updates")
+        n += 1 + sum(len(_list(u.get(k), k)) for k in ("sales", "more_auctions", "more_sales"))
     return n
 
 
@@ -1254,6 +1281,14 @@ def apply(conn, cfg, payload, source):
             applied["scans"] = applied.get("scans", 0) + 1
             applied["auctions"] = applied.get("auctions", 0) + len(auctions)
             realms.setdefault(realm, 0)
+        def add_sales(sid, realm, faction, ts, rows):
+            out = []
+            for prev_ts, iid, suffix, count, unit, owner_, kind in rows:
+                prev = scan_row([realm, faction, prev_ts]) if prev_ts is not None else None
+                out.append((sid, prev[0] if prev else None, ts, iid, suffix, count, unit, owner_ or "", kind))
+            cur.executemany("INSERT INTO main.ah_sales(scan_id,prev_scan_id,ts,item_id,suffix,count,unit_price,owner,"
+                            "kind) VALUES(?,?,?,?,?,?,?,?,?)", out)
+
         for u in _list(payload.get("scan_updates"), "scan_updates"):
             sales = _checked(u["sales"], "sales", lim) if "sales" in u else None
             r = scan_row(u.get("key"))
@@ -1271,6 +1306,20 @@ def apply(conn, cfg, payload, source):
             if sales is not None:
                 put_sales(sid, realm, faction, ts, sales)
                 cur.execute("UPDATE main.ah_scans SET diffed=1, seq=? WHERE id=?", (seq, sid))
+            if "more_sales" in u:
+                # The rest of a scan's sales (more than fit in one batch), in order. Taken only when it continues
+                # exactly where the stored sales end, so a part sent twice (a retried push) is never stored twice.
+                more = _checked(_list(u["more_sales"], "more_sales"), "sales", lim)
+                frm = u.get("sales_from")
+                if not isinstance(frm, int) or isinstance(frm, bool) or frm < 0:
+                    raise BadPayload("sales_from must be a non-negative integer")
+                have_n = cur.execute("SELECT COUNT(*) FROM main.ah_sales WHERE scan_id=?", (sid,)).fetchone()[0]
+                if have_n != frm:
+                    applied["sales_parts_skipped"] = applied.get("sales_parts_skipped", 0) + 1
+                else:
+                    add_sales(sid, realm, faction, ts, more)
+                    cur.execute("UPDATE main.ah_scans SET diffed=1, seq=? WHERE id=?", (seq, sid))
+                    applied["sales"] = applied.get("sales", 0) + len(more)
             if "more_auctions" in u:
                 # The rest of a scan too big for one batch, in order. Taken only when it continues exactly where the
                 # stored auctions end, so a part sent twice (a retried push) is never stored twice.
